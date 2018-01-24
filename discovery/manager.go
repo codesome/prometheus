@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -127,6 +128,13 @@ func (m *Manager) startProvider(ctx context.Context, poolKey poolKey, worker Dis
 
 func (m *Manager) runProvider(ctx context.Context, poolKey poolKey, updates chan []*targetgroup.Group) {
 	for {
+		// Throttle syncing to once per five seconds.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+
 		select {
 		case <-ctx.Done():
 			return
