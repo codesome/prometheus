@@ -1223,7 +1223,7 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 
 	blockQueriers := make([]Querier, 0, len(blocks))
 	for _, b := range blocks {
-		q, err := NewBlockQuerier(b, mint, maxt)
+		q, err := NewBlockQuerier(b, mint, maxt, db.chunkPool)
 		if err == nil {
 			blockQueriers = append(blockQueriers, q)
 			continue

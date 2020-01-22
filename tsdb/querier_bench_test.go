@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
@@ -136,11 +137,13 @@ func BenchmarkQuerierSelect(b *testing.B) {
 	}
 	testutil.Ok(b, app.Commit())
 
+	pool := chunkenc.NewPool()
+
 	bench := func(b *testing.B, br BlockReader) {
 		matcher := labels.MustNewMatcher(labels.MatchEqual, "foo", "bar")
 		for s := 1; s <= numSeries; s *= 10 {
 			b.Run(fmt.Sprintf("%dof%d", s, numSeries), func(b *testing.B) {
-				q, err := NewBlockQuerier(br, 0, int64(s-1))
+				q, err := NewBlockQuerier(br, 0, int64(s-1), pool)
 				testutil.Ok(b, err)
 
 				b.ResetTimer()
@@ -167,7 +170,7 @@ func BenchmarkQuerierSelect(b *testing.B) {
 	}()
 
 	blockdir := createBlockFromHead(b, tmpdir, h)
-	block, err := OpenBlock(nil, blockdir, nil)
+	block, err := OpenBlock(nil, blockdir, pool)
 	testutil.Ok(b, err)
 	defer func() {
 		testutil.Ok(b, block.Close())

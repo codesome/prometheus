@@ -828,7 +828,7 @@ func TestSeriesIterator(t *testing.T) {
 				tsdbutil.ChunkFromSamples(tc.b),
 				tsdbutil.ChunkFromSamples(tc.c),
 			}
-			res := newChunkSeriesIterator(chkMetas, nil, tc.mint, tc.maxt)
+			res := newChunkSeriesIterator(chkMetas, nil, tc.mint, tc.maxt, chunkenc.NewPool())
 
 			smplValid := make([]tsdbutil.Sample, 0)
 			for _, s := range tc.exp {
@@ -899,7 +899,7 @@ func TestSeriesIterator(t *testing.T) {
 					tsdbutil.ChunkFromSamples(tc.b),
 					tsdbutil.ChunkFromSamples(tc.c),
 				}
-				res := newChunkSeriesIterator(chkMetas, nil, tc.mint, tc.maxt)
+				res := newChunkSeriesIterator(chkMetas, nil, tc.mint, tc.maxt, chunkenc.NewPool())
 
 				smplValid := make([]tsdbutil.Sample, 0)
 				for _, s := range tc.exp {
@@ -1050,7 +1050,7 @@ func TestChunkSeriesIterator_DoubleSeek(t *testing.T) {
 		tsdbutil.ChunkFromSamples([]tsdbutil.Sample{sample{4, 4}, sample{5, 5}}),
 	}
 
-	res := newChunkSeriesIterator(chkMetas, nil, 2, 8)
+	res := newChunkSeriesIterator(chkMetas, nil, 2, 8, chunkenc.NewPool())
 	testutil.Assert(t, res.Seek(1) == true, "")
 	testutil.Assert(t, res.Seek(2) == true, "")
 	ts, v := res.At()
@@ -1067,7 +1067,7 @@ func TestChunkSeriesIterator_SeekInCurrentChunk(t *testing.T) {
 		tsdbutil.ChunkFromSamples([]tsdbutil.Sample{}),
 	}
 
-	it := newChunkSeriesIterator(metas, nil, 1, 7)
+	it := newChunkSeriesIterator(metas, nil, 1, 7, chunkenc.NewPool())
 
 	testutil.Assert(t, it.Next() == true, "")
 	ts, v := it.At()
@@ -1087,7 +1087,7 @@ func TestChunkSeriesIterator_NextWithMinTime(t *testing.T) {
 		tsdbutil.ChunkFromSamples([]tsdbutil.Sample{sample{1, 6}, sample{5, 6}, sample{7, 8}}),
 	}
 
-	it := newChunkSeriesIterator(metas, nil, 2, 4)
+	it := newChunkSeriesIterator(metas, nil, 2, 4, chunkenc.NewPool())
 	testutil.Assert(t, it.Next() == false, "")
 }
 
@@ -1483,6 +1483,7 @@ func BenchmarkQueryIterator(b *testing.B) {
 				c.numBlocks, c.numSeries, c.numSamplesPerSeriesPerBlock, overlapPercentage)
 
 			b.Run(benchMsg, func(b *testing.B) {
+				pool := chunkenc.NewPool()
 				dir, err := ioutil.TempDir("", "bench_query_iterator")
 				testutil.Ok(b, err)
 				defer func() {
@@ -1507,7 +1508,7 @@ func BenchmarkQueryIterator(b *testing.B) {
 					} else {
 						generatedSeries = populateSeries(prefilledLabels, mint, maxt)
 					}
-					block, err := OpenBlock(nil, createBlock(b, dir, generatedSeries), nil)
+					block, err := OpenBlock(nil, createBlock(b, dir, generatedSeries), pool)
 					testutil.Ok(b, err)
 					blocks = append(blocks, block)
 					defer block.Close()
@@ -1517,7 +1518,7 @@ func BenchmarkQueryIterator(b *testing.B) {
 					blocks: make([]Querier, 0, len(blocks)),
 				}
 				for _, blk := range blocks {
-					q, err := NewBlockQuerier(blk, math.MinInt64, math.MaxInt64)
+					q, err := NewBlockQuerier(blk, math.MinInt64, math.MaxInt64, pool)
 					testutil.Ok(b, err)
 					que.blocks = append(que.blocks, q)
 				}
@@ -1557,6 +1558,7 @@ func BenchmarkQuerySeek(b *testing.B) {
 				c.numBlocks, c.numSeries, c.numSamplesPerSeriesPerBlock, overlapPercentage)
 
 			b.Run(benchMsg, func(b *testing.B) {
+				pool := chunkenc.NewPool()
 				dir, err := ioutil.TempDir("", "bench_query_iterator")
 				testutil.Ok(b, err)
 				defer func() {
@@ -1581,7 +1583,7 @@ func BenchmarkQuerySeek(b *testing.B) {
 					} else {
 						generatedSeries = populateSeries(prefilledLabels, mint, maxt)
 					}
-					block, err := OpenBlock(nil, createBlock(b, dir, generatedSeries), nil)
+					block, err := OpenBlock(nil, createBlock(b, dir, generatedSeries), pool)
 					testutil.Ok(b, err)
 					blocks = append(blocks, block)
 					defer block.Close()
@@ -1591,7 +1593,7 @@ func BenchmarkQuerySeek(b *testing.B) {
 					blocks: make([]Querier, 0, len(blocks)),
 				}
 				for _, blk := range blocks {
-					q, err := NewBlockQuerier(blk, math.MinInt64, math.MaxInt64)
+					q, err := NewBlockQuerier(blk, math.MinInt64, math.MaxInt64, pool)
 					testutil.Ok(b, err)
 					que.blocks = append(que.blocks, q)
 				}
@@ -1704,6 +1706,7 @@ func BenchmarkSetMatcher(b *testing.B) {
 	}
 
 	for _, c := range cases {
+		pool := chunkenc.NewPool()
 		dir, err := ioutil.TempDir("", "bench_postings_for_matchers")
 		testutil.Ok(b, err)
 		defer func() {
@@ -1726,7 +1729,7 @@ func BenchmarkSetMatcher(b *testing.B) {
 			} else {
 				generatedSeries = populateSeries(prefilledLabels, mint, maxt)
 			}
-			block, err := OpenBlock(nil, createBlock(b, dir, generatedSeries), nil)
+			block, err := OpenBlock(nil, createBlock(b, dir, generatedSeries), pool)
 			testutil.Ok(b, err)
 			blocks = append(blocks, block)
 			defer block.Close()
@@ -1736,7 +1739,7 @@ func BenchmarkSetMatcher(b *testing.B) {
 			blocks: make([]Querier, 0, len(blocks)),
 		}
 		for _, blk := range blocks {
-			q, err := NewBlockQuerier(blk, math.MinInt64, math.MaxInt64)
+			q, err := NewBlockQuerier(blk, math.MinInt64, math.MaxInt64, pool)
 			testutil.Ok(b, err)
 			que.blocks = append(que.blocks, q)
 		}
@@ -2133,6 +2136,7 @@ func BenchmarkQueries(b *testing.B) {
 	for title, selectors := range cases {
 		for _, nSeries := range []int{10} {
 			for _, nSamples := range []int64{1000, 10000, 100000} {
+				pool := chunkenc.NewPool()
 				dir, err := ioutil.TempDir("", "test_persisted_query")
 				testutil.Ok(b, err)
 				defer func() {
@@ -2165,9 +2169,9 @@ func BenchmarkQueries(b *testing.B) {
 
 				qs := []Querier{}
 				for x := 0; x <= 10; x++ {
-					block, err := OpenBlock(nil, createBlock(b, dir, series), nil)
+					block, err := OpenBlock(nil, createBlock(b, dir, series), pool)
 					testutil.Ok(b, err)
-					q, err := NewBlockQuerier(block, 1, int64(nSamples))
+					q, err := NewBlockQuerier(block, 1, int64(nSamples), pool)
 					testutil.Ok(b, err)
 					qs = append(qs, q)
 				}
@@ -2176,7 +2180,7 @@ func BenchmarkQueries(b *testing.B) {
 				queryTypes["_10-Blocks"] = &querier{blocks: qs}
 
 				head := createHead(b, series)
-				qHead, err := NewBlockQuerier(head, 1, int64(nSamples))
+				qHead, err := NewBlockQuerier(head, 1, int64(nSamples), pool)
 				testutil.Ok(b, err)
 				queryTypes["_Head"] = qHead
 

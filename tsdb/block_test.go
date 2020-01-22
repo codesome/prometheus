@@ -28,6 +28,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
@@ -199,7 +200,7 @@ func TestCorruptedChunk(t *testing.T) {
 			}
 			defer func() { testutil.Ok(t, b.Close()) }()
 
-			querier, err := NewBlockQuerier(b, 0, 1)
+			querier, err := NewBlockQuerier(b, 0, 1, chunkenc.NewPool())
 			testutil.Ok(t, err)
 			defer func() { testutil.Ok(t, querier.Close()) }()
 			set, err := querier.Select(labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
@@ -287,12 +288,12 @@ func TestReadIndexFormatV1(t *testing.T) {
 	block, err := OpenBlock(nil, blockDir, nil)
 	testutil.Ok(t, err)
 
-	q, err := NewBlockQuerier(block, 0, 1000)
+	q, err := NewBlockQuerier(block, 0, 1000, chunkenc.NewPool())
 	testutil.Ok(t, err)
 	testutil.Equals(t, query(t, q, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar")),
 		map[string][]tsdbutil.Sample{`{foo="bar"}`: []tsdbutil.Sample{sample{t: 1, v: 2}}})
 
-	q, err = NewBlockQuerier(block, 0, 1000)
+	q, err = NewBlockQuerier(block, 0, 1000, chunkenc.NewPool())
 	testutil.Ok(t, err)
 	testutil.Equals(t, query(t, q, labels.MustNewMatcher(labels.MatchNotRegexp, "foo", "^.?$")),
 		map[string][]tsdbutil.Sample{

@@ -163,7 +163,7 @@ func (q *verticalQuerier) sel(qs []Querier, ms []*labels.Matcher) (SeriesSet, er
 }
 
 // NewBlockQuerier returns a querier against the reader.
-func NewBlockQuerier(b BlockReader, mint, maxt int64) (Querier, error) {
+func NewBlockQuerier(b BlockReader, mint, maxt int64, pool chunkenc.Pool) (Querier, error) {
 	indexr, err := b.Index()
 	if err != nil {
 		return nil, errors.Wrapf(err, "open index reader")
@@ -185,6 +185,7 @@ func NewBlockQuerier(b BlockReader, mint, maxt int64) (Querier, error) {
 		index:      indexr,
 		chunks:     chunkr,
 		tombstones: tombsr,
+		pool:       pool,
 	}, nil
 }
 
@@ -196,6 +197,7 @@ type blockQuerier struct {
 
 	closed bool
 
+	pool       chunkenc.Pool
 	mint, maxt int64
 }
 
@@ -212,6 +214,7 @@ func (q *blockQuerier) Select(ms ...*labels.Matcher) (SeriesSet, error) {
 			maxt:   q.maxt,
 		},
 
+		pool: q.pool,
 		mint: q.mint,
 		maxt: q.maxt,
 	}, nil
@@ -832,6 +835,7 @@ type blockSeriesSet struct {
 	cur Series
 
 	mint, maxt int64
+	pool       chunkenc.Pool
 }
 
 func (s *blockSeriesSet) Next() bool {
@@ -844,6 +848,7 @@ func (s *blockSeriesSet) Next() bool {
 			maxt:   s.maxt,
 
 			intervals: dranges,
+			pool:      s.pool,
 		}
 		return true
 	}
@@ -863,6 +868,7 @@ type chunkSeries struct {
 	chunks []chunks.Meta // in-order chunk refs
 
 	mint, maxt int64
+	pool       chunkenc.Pool
 
 	intervals tombstones.Intervals
 }
@@ -872,7 +878,7 @@ func (s *chunkSeries) Labels() labels.Labels {
 }
 
 func (s *chunkSeries) Iterator() SeriesIterator {
-	return newChunkSeriesIterator(s.chunks, s.intervals, s.mint, s.maxt)
+	return newChunkSeriesIterator(s.chunks, s.intervals, s.mint, s.maxt, s.pool)
 }
 
 // SeriesIterator iterates over the data of a time series.
@@ -1064,17 +1070,19 @@ type chunkSeriesIterator struct {
 	bufDelIter *deletedIterator
 
 	maxt, mint int64
+	pool       chunkenc.Pool
 
 	intervals tombstones.Intervals
 }
 
-func newChunkSeriesIterator(cs []chunks.Meta, dranges tombstones.Intervals, mint, maxt int64) *chunkSeriesIterator {
+func newChunkSeriesIterator(cs []chunks.Meta, dranges tombstones.Intervals, mint, maxt int64, pool chunkenc.Pool) *chunkSeriesIterator {
 	csi := &chunkSeriesIterator{
 		chunks: cs,
 		i:      0,
 
 		mint: mint,
 		maxt: maxt,
+		pool: pool,
 
 		intervals: dranges,
 	}
@@ -1108,6 +1116,19 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 	}
 
 	for ; it.chunks[it.i].MaxTime < t; it.i++ {
+		if it.i == len(it.chunks)-1 {
+			// Set the cur properly so that Next() call returns false thereafter.
+			it.resetCurIterator()
+			for it.cur.Next() {
+			}
+		}
+
+		// Putting back into the pool is best effort, hence the error is not checked.
+		// In case of Head, the chunk should not be put back into the pool;
+		// this is take care automatically as Head wraps the chunk which is
+		// ignored by the 'Put' method called below.
+		_ = it.pool.Put(it.chunks[it.i].Chunk)
+
 		if it.i == len(it.chunks)-1 {
 			return false
 		}
