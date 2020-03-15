@@ -106,6 +106,8 @@ type Head struct {
 	// chunkReadWriter is used to write and ready Head chunks to/from disk.
 	chunkReadWriter *chunks.HeadReadWriter
 
+	chunkSnapshotMtx sync.Mutex
+
 	wg     sync.WaitGroup
 	closed chan struct{}
 }
@@ -387,7 +389,7 @@ func (h *Head) updateMinMaxTime(mint, maxt int64) {
 	}
 }
 
-func (h *Head) loadSeries(r *wal.Reader, multiRef map[uint64]uint64, refSeries map[uint64]*memSeries) (err error) {
+func (h *Head) processSeriesFromWAL(r *wal.Reader, multiRef map[uint64]uint64, refSeries map[uint64]*memSeries) (err error) {
 	var (
 		dec        record.Decoder
 		decoded    = make(chan []record.RefSeries, 10)
@@ -451,7 +453,7 @@ func (h *Head) loadSeries(r *wal.Reader, multiRef map[uint64]uint64, refSeries m
 	return nil
 }
 
-func (h *Head) loadWAL(r *wal.Reader, multiRef map[uint64]uint64, refSeries map[uint64]*memSeries) (err error) {
+func (h *Head) processWAL(r *wal.Reader, multiRef map[uint64]uint64, refSeries map[uint64]*memSeries) (err error) {
 	// Track number of samples that referenced a series we don't know about
 	// for error reporting.
 	var unknownRefs uint64
@@ -508,6 +510,11 @@ func (h *Head) loadWAL(r *wal.Reader, multiRef map[uint64]uint64, refSeries map[
 				return []tombstones.Stone{}
 			},
 		}
+		seriesPool = sync.Pool{
+			New: func() interface{} {
+				return []record.RefSeries{}
+			},
+		}
 	)
 	go func() {
 		defer close(decoded)
@@ -539,8 +546,17 @@ func (h *Head) loadWAL(r *wal.Reader, multiRef map[uint64]uint64, refSeries map[
 				}
 				decoded <- tstones
 			case record.Series:
-				// This should be already loaded, ignore it.
-				continue
+				series := seriesPool.Get().([]record.RefSeries)[:0]
+				series, err = dec.Series(rec, series)
+				if err != nil {
+					errCh <- &wal.CorruptionErr{
+						Err:     errors.Wrap(err, "decode series"),
+						Segment: r.Segment(),
+						Offset:  r.Offset(),
+					}
+					return
+				}
+				decoded <- series
 			default:
 				errCh <- &wal.CorruptionErr{
 					Err:     errors.Errorf("invalid record type %v", dec.Type(rec)),
@@ -602,6 +618,22 @@ func (h *Head) loadWAL(r *wal.Reader, multiRef map[uint64]uint64, refSeries map[
 			}
 			//lint:ignore SA6002 relax staticcheck verification.
 			tstonesPool.Put(v)
+		case []record.RefSeries:
+			for _, s := range v {
+				series, created := h.getOrCreateWithID(s.Ref, s.Labels.Hash(), s.Labels)
+				refSeries[s.Ref] = series
+				if !created {
+					// There's already a different ref for this series.
+					refSeries[series.ref] = series
+					multiRef[s.Ref] = series.ref
+				}
+
+				if h.lastSeriesID < s.Ref {
+					h.lastSeriesID = s.Ref
+				}
+			}
+			//lint:ignore SA6002 relax staticcheck verification.
+			seriesPool.Put(v)
 		default:
 			panic(fmt.Errorf("unexpected decoded type: %T", d))
 		}
@@ -649,17 +681,17 @@ func (h *Head) Init(minValidTime int64) error {
 	multiRef := map[uint64]uint64{}
 
 	start := time.Now()
-	level.Info(h.logger).Log("msg", "creating series from WAL")
-	if err := h.loadSeriesFromWAL(refSeries, multiRef); err != nil {
-		// TODO(codesome): If corruption is found here and repaired, we still need to load the WAL.
-		return err
-	}
+	snapIdx, snapOffset, err := h.loadChunkSnapshot(refSeries, multiRef)
+	if err != nil {
+		level.Error(h.logger).Log("msg", "loading chunk snapshot failed", "err", err)
+		snapIdx, snapOffset = -1, -1
 
-	totalSize := 0
-	for i := 0; i < h.series.size; i++ {
-		h.series.locks[i].RLock()
-		totalSize += len(h.series.series[i])
-		h.series.locks[i].RUnlock()
+		// If loading chunk snapshot failed, we create the series using the WAL.
+		level.Info(h.logger).Log("msg", "creating series from WAL")
+		if err := h.loadSeriesFromWAL(refSeries, multiRef); err != nil {
+			// TODO(codesome): If corruption is found here and repaired, we still need to load the WAL.
+			return err
+		}
 	}
 
 	level.Info(h.logger).Log("msg", "m-mapping the on-disk chunks")
@@ -672,44 +704,16 @@ func (h *Head) Init(minValidTime int64) error {
 		h.repairMmappedChunks(err, refSeries, multiRef)
 	}
 
-	totalSize = 0
-	for i := 0; i < h.series.size; i++ {
-		h.series.locks[i].RLock()
-		totalSize += len(h.series.series[i])
-		h.series.locks[i].RUnlock()
-	}
-
-	snapIdx, snapOffset, err := h.loadChunkSnapshot(refSeries)
-	if err != nil {
-		level.Error(h.logger).Log("msg", "loading chunk snapshot failed", "err", err)
-		snapIdx, snapOffset = -1, -1
-	}
-
-	totalSize = 0
-	for i := 0; i < h.series.size; i++ {
-		h.series.locks[i].RLock()
-		totalSize += len(h.series.series[i])
-		h.series.locks[i].RUnlock()
-	}
-
-	// snapIdx, snapOffset := -1, -1
 	level.Info(h.logger).Log("msg", "adding remaining samples")
-	if err := h.loadSamplesFromWAL(snapIdx, snapOffset, refSeries, multiRef); err != nil {
+	if err := h.loadWAL(snapIdx, snapOffset, refSeries, multiRef); err != nil {
 		return err
-	}
-
-	totalSize = 0
-	for i := 0; i < h.series.size; i++ {
-		h.series.locks[i].RLock()
-		totalSize += len(h.series.series[i])
-		h.series.locks[i].RUnlock()
 	}
 
 	level.Info(h.logger).Log("msg", "finished replaying WAL", "duration", time.Since(start).String())
 	return nil
 }
 
-func (h *Head) loadChunkSnapshot(refSeries map[uint64]*memSeries) (int, int, error) {
+func (h *Head) loadChunkSnapshot(refSeries map[uint64]*memSeries, multiRef map[uint64]uint64) (int, int, error) {
 	dir, snapIdx, snapOffset, err := LastChunkSnapshot(h.wal.Dir())
 	if err != nil {
 		if err == record.ErrNotFound {
@@ -730,47 +734,43 @@ func (h *Head) loadChunkSnapshot(refSeries map[uint64]*memSeries) (int, int, err
 	}()
 
 	var (
-		count       = 0
-		unknownRefs = int64(0)
-		n           = runtime.GOMAXPROCS(0)
-		wg          sync.WaitGroup
-		recordChan  = make(chan chunkSnapshotRecord, 5*n)
+		count            = 0
+		unknownRefs      = int64(0)
+		n                = runtime.GOMAXPROCS(0)
+		wg               sync.WaitGroup
+		recordChan       = make(chan chunkSnapshotRecord, 5*n)
+		shardedRefSeries = make([]map[uint64]*memSeries, n)
 	)
 
-	// currT := timestamp.FromTime(time.Now())
 	wg.Add(n)
 	for i := 0; i < n; i++ {
-		go func(rc <-chan chunkSnapshotRecord) {
+		go func(idx int, rc <-chan chunkSnapshotRecord) {
 			defer wg.Done()
+
+			shardedRefSeries[idx] = make(map[uint64]*memSeries)
+			localRefSeries := shardedRefSeries[idx]
+
 			for csr := range rc {
-				ms := refSeries[csr.ref]
-				if ms == nil {
-					atomic.AddInt64(&unknownRefs, 1)
-					continue
+				series, _ := h.getOrCreateWithID(csr.ref, csr.lset.Hash(), csr.lset)
+				localRefSeries[csr.ref] = series
+				if h.lastSeriesID < series.ref {
+					h.lastSeriesID = series.ref
 				}
 
-				if len(ms.mmappedChunks) > 0 && ms.mmappedChunks[len(ms.mmappedChunks)-1].maxTime >= csr.mc.minTime {
-					// The partial chunk was completed and was mmapped after taking the snapshot.
-					// Hence skip this chunk.
-					continue
-				}
+				series.chunkRange = csr.chunkRange
+				series.nextAt = csr.mc.maxTime // This will create a new chunk on append.
+				series.headChunk = csr.mc
 
-				ms.chunkRange = csr.chunkRange
-				ms.nextAt = csr.mc.maxTime // This will create a new chunk on append.
-				ms.headChunk = csr.mc
-
-				app, err := ms.headChunk.chunk.Appender()
+				app, err := series.headChunk.chunk.Appender()
 				if err != nil {
+					// TODO(codesome): return this.
 					panic(err)
 				}
-				ms.app = app
+				series.app = app
 
 				h.updateMinMaxTime(csr.mc.minTime, csr.mc.maxTime)
-
-				// Starting a new chunk.
-				// ms.cut(currT, h.chunkReadWriter)
 			}
-		}(recordChan)
+		}(i, recordChan)
 	}
 
 	r := wal.NewReader(sr)
@@ -778,7 +778,7 @@ func (h *Head) loadChunkSnapshot(refSeries map[uint64]*memSeries) (int, int, err
 	for r.Next() {
 		count++
 
-		csr, err := decodeLastChunk(r.Record())
+		csr, err := decodeSeriesWithLastChunk(r.Record())
 		if err != nil {
 			loopErr = errors.Wrap(err, "decode last chunk")
 			break
@@ -788,6 +788,12 @@ func (h *Head) loadChunkSnapshot(refSeries map[uint64]*memSeries) (int, int, err
 	}
 	close(recordChan)
 	wg.Wait()
+
+	for _, shard := range shardedRefSeries {
+		for k, v := range shard {
+			refSeries[k] = v
+		}
+	}
 
 	if loopErr != nil {
 		return -1, -1, loopErr
@@ -807,7 +813,7 @@ func (h *Head) loadSeriesFromWAL(refSeries map[uint64]*memSeries, multiRef map[u
 	if err := h.executeOnCheckpointReader(func(checkpointReader *wal.Reader) error {
 		// A corrupted checkpoint is a hard error for now and requires user
 		// intervention. There's likely little data that can be recovered anyway.
-		if err := h.loadSeries(checkpointReader, multiRef, refSeries); err != nil {
+		if err := h.processSeriesFromWAL(checkpointReader, multiRef, refSeries); err != nil {
 			return errors.Wrap(err, "load series from checkpoint")
 		}
 		return nil
@@ -816,7 +822,7 @@ func (h *Head) loadSeriesFromWAL(refSeries map[uint64]*memSeries, multiRef map[u
 	}
 	// Backfill series from the remaining WAL.
 	if err := h.executeOnWALSegmentReader(-1, -1, func(segmentReader *wal.Reader) error {
-		if err := h.loadSeries(segmentReader, multiRef, refSeries); err != nil {
+		if err := h.processSeriesFromWAL(segmentReader, multiRef, refSeries); err != nil {
 			return errors.Wrap(err, "load series from WAL")
 		}
 		return nil
@@ -827,13 +833,13 @@ func (h *Head) loadSeriesFromWAL(refSeries map[uint64]*memSeries, multiRef map[u
 	return nil
 }
 
-func (h *Head) loadSamplesFromWAL(snapIdx, snapOffset int, refSeries map[uint64]*memSeries, multiRef map[uint64]uint64) error {
+func (h *Head) loadWAL(snapIdx, snapOffset int, refSeries map[uint64]*memSeries, multiRef map[uint64]uint64) error {
 	if snapIdx < 0 {
 		// Backfill the checkpoint first if it exists.
 		if err := h.executeOnCheckpointReader(func(checkpointReader *wal.Reader) error {
 			// A corrupted checkpoint is a hard error for now and requires user
 			// intervention. There's likely little data that can be recovered anyway.
-			if err := h.loadWAL(checkpointReader, multiRef, refSeries); err != nil {
+			if err := h.processWAL(checkpointReader, multiRef, refSeries); err != nil {
 				return errors.Wrap(err, "backfill checkpoint")
 			}
 			level.Info(h.logger).Log("msg", "WAL checkpoint loaded")
@@ -844,7 +850,7 @@ func (h *Head) loadSamplesFromWAL(snapIdx, snapOffset int, refSeries map[uint64]
 	}
 	// Backfill the remaining WAL.
 	if err := h.executeOnWALSegmentReader(snapIdx, snapOffset, func(segmentReader *wal.Reader) error {
-		if err := h.loadWAL(segmentReader, multiRef, refSeries); err != nil {
+		if err := h.processWAL(segmentReader, multiRef, refSeries); err != nil {
 			return errors.Wrap(err, "backfill WAL")
 		}
 		return nil
@@ -876,6 +882,14 @@ func (h *Head) loadMmappedChunks(refSeries map[uint64]*memSeries, multiRef map[u
 			maxTime: maxt,
 		})
 		h.updateMinMaxTime(mint, maxt)
+
+		if ms.headChunk != nil && maxt >= ms.headChunk.minTime {
+			// The head chunk was completed and was mmapped after taking the snapshot.
+			// Hence remove this chunk.
+			ms.nextAt = 0
+			ms.headChunk = nil
+			ms.app = nil
+		}
 
 		return nil
 	}); err != nil {
@@ -988,6 +1002,9 @@ func (h *Head) executeOnWALSegmentReader(startFrom, startOffset int, f func(*wal
 
 // Truncate removes old data before mint from the head.
 func (h *Head) Truncate(mint int64) (err error) {
+	h.chunkSnapshotMtx.Lock()
+	defer h.chunkSnapshotMtx.Unlock()
+
 	defer func() {
 		if err != nil {
 			h.metrics.headTruncateFail.Inc()
@@ -2362,15 +2379,21 @@ func (mc *mmappedChunk) OverlapsClosedInterval(mint, maxt int64) bool {
 
 type chunkSnapshotRecord struct {
 	ref        uint64
+	lset       labels.Labels
 	chunkRange int64
 	nextAt     int64
 	mc         *memChunk
 }
 
-func (s *memSeries) encodeLastChunk(b []byte) []byte {
+func (s *memSeries) encodeSeriesWithLastChunk(b []byte) []byte {
 	buf := encoding.Encbuf{B: b}
 
 	buf.PutBE64(s.ref)
+	buf.PutUvarint(len(s.lset))
+	for _, l := range s.lset {
+		buf.PutUvarintStr(l.Name)
+		buf.PutUvarintStr(l.Value)
+	}
 	buf.PutBE64int64(s.chunkRange)
 
 	s.Lock()
@@ -2383,10 +2406,18 @@ func (s *memSeries) encodeLastChunk(b []byte) []byte {
 	return buf.Get()
 }
 
-func decodeLastChunk(b []byte) (csr chunkSnapshotRecord, err error) {
+func decodeSeriesWithLastChunk(b []byte) (csr chunkSnapshotRecord, err error) {
 	dec := encoding.Decbuf{B: b}
 
 	csr.ref = dec.Be64()
+
+	// The label set written to the disk is already sorted.
+	csr.lset = make(labels.Labels, dec.Uvarint())
+	for i := range csr.lset {
+		csr.lset[i].Name = dec.UvarintStr()
+		csr.lset[i].Value = dec.UvarintStr()
+	}
+
 	csr.chunkRange = dec.Be64int64()
 	csr.nextAt = dec.Be64int64()
 
@@ -2494,6 +2525,9 @@ const chunkSnapshotPrefix = "chunk_snapshot."
 // segmented format as the original WAL itself.
 // This makes it easy to read it through the WAL package.
 func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
+	h.chunkSnapshotMtx.Lock()
+	defer h.chunkSnapshotMtx.Unlock()
+
 	stats := &ChunkSnapshotStats{}
 
 	wlast, woffset, err := h.wal.LastSegmentAndOffset()
@@ -2541,7 +2575,7 @@ func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 
 		for _, s := range h.series.series[i] {
 			start := len(buf)
-			buf = s.encodeLastChunk(buf)
+			buf = s.encodeSeriesWithLastChunk(buf)
 			if len(buf[start:]) == 0 {
 				continue // All contents discarded.
 			}
@@ -2587,7 +2621,7 @@ func (h *Head) chunkSnapshotLoop() {
 
 	for {
 		select {
-		case <-time.After(10 * time.Minute):
+		case <-time.After(1 * time.Minute):
 			h.performChunkSnapshot()
 		case <-h.closed:
 			return
