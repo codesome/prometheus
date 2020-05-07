@@ -692,6 +692,22 @@ func (w *WAL) Segments() (first, last int, err error) {
 	return refs[0].index, refs[len(refs)-1].index, nil
 }
 
+// LastSegmentAndOffset returns the last segment number of the WAL
+// and the offset in that file upto which the segment has been filled.
+func (w *WAL) LastSegmentAndOffset() (seg, offset int, err error) {
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+
+	_, seg, err = w.Segments()
+	if err != nil {
+		return
+	}
+
+	offset = (w.donePages * pageSize) + w.page.alloc
+
+	return
+}
+
 // Truncate drops all segments before i.
 func (w *WAL) Truncate(i int) (err error) {
 	w.metrics.truncateTotal.Inc()
@@ -832,22 +848,30 @@ func NewSegmentsRangeReader(sr ...SegmentRange) (io.ReadCloser, error) {
 // corruption reporting.  We have to be careful not to increment curr too
 // early, as it is used by Reader.Err() to tell Repair which segment is corrupt.
 // As such we pad the end of non-page align segments with zeros.
-type segmentBufReader struct {
+type SegmentBufReader struct {
 	buf  *bufio.Reader
 	segs []*Segment
 	cur  int // Index into segs.
 	off  int // Offset of read data into current segment.
 }
 
-// nolint:golint // TODO: Consider exporting segmentBufReader
-func NewSegmentBufReader(segs ...*Segment) *segmentBufReader {
-	return &segmentBufReader{
+func NewSegmentBufReader(segs ...*Segment) *SegmentBufReader {
+	return &SegmentBufReader{
 		buf:  bufio.NewReaderSize(segs[0], 16*pageSize),
 		segs: segs,
 	}
 }
 
-func (r *segmentBufReader) Close() (err error) {
+func NewSegmentBufReaderWithOffset(offset int, segs ...*Segment) (*SegmentBufReader, error) {
+	sbr := &SegmentBufReader{
+		buf:  bufio.NewReaderSize(segs[0], 16*pageSize),
+		segs: segs,
+	}
+	_, err := sbr.buf.Discard(offset)
+	return sbr, err
+}
+
+func (r *SegmentBufReader) Close() (err error) {
 	for _, s := range r.segs {
 		if e := s.Close(); e != nil {
 			err = e
@@ -857,7 +881,7 @@ func (r *segmentBufReader) Close() (err error) {
 }
 
 // Read implements io.Reader.
-func (r *segmentBufReader) Read(b []byte) (n int, err error) {
+func (r *SegmentBufReader) Read(b []byte) (n int, err error) {
 	n, err = r.buf.Read(b)
 	r.off += n
 

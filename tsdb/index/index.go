@@ -556,10 +556,10 @@ func (w *Writer) writeLabelIndices() error {
 	values := []uint32{}
 	for d.Err() == nil && cnt > 0 {
 		cnt--
-		d.Uvarint()                           // Keycount.
-		name := d.UvarintBytes()              // Label name.
-		value := yoloString(d.UvarintBytes()) // Label value.
-		d.Uvarint64()                         // Offset.
+		d.Uvarint()                              // Keycount.
+		name := d.UvarintBytes(nil)              // Label name.
+		value := yoloString(d.UvarintBytes(nil)) // Label value.
+		d.Uvarint64()                            // Offset.
 		if len(name) == 0 {
 			continue // All index is ignored.
 		}
@@ -716,10 +716,10 @@ func (w *Writer) writePostingsOffsetTable() error {
 	cnt := w.cntPO
 	for d.Err() == nil && cnt > 0 {
 		w.buf1.Reset()
-		w.buf1.PutUvarint(d.Uvarint())                     // Keycount.
-		w.buf1.PutUvarintStr(yoloString(d.UvarintBytes())) // Label name.
-		w.buf1.PutUvarintStr(yoloString(d.UvarintBytes())) // Label value.
-		w.buf1.PutUvarint64(d.Uvarint64() + adjustment)    // Offset.
+		w.buf1.PutUvarint(d.Uvarint())                        // Keycount.
+		w.buf1.PutUvarintStr(yoloString(d.UvarintBytes(nil))) // Label name.
+		w.buf1.PutUvarintStr(yoloString(d.UvarintBytes(nil))) // Label value.
+		w.buf1.PutUvarint64(d.Uvarint64() + adjustment)       // Offset.
 		w.buf1.WriteToHash(w.crc32)
 		if err := w.write(w.buf1.Get()); err != nil {
 			return err
@@ -1253,7 +1253,7 @@ func NewSymbols(bs ByteSlice, version int, off int) (*Symbols, error) {
 		if s.seen%symbolFactor == 0 {
 			s.offsets = append(s.offsets, basePos+origLen-d.Len())
 		}
-		d.UvarintBytes() // The symbol.
+		d.UvarintBytes(nil) // The symbol.
 		s.seen++
 	}
 	if d.Err() != nil {
@@ -1274,7 +1274,7 @@ func (s Symbols) Lookup(o uint32) (string, error) {
 		d.Skip(s.offsets[int(o/symbolFactor)])
 		// Walk until we find the one we want.
 		for i := o - (o / symbolFactor * symbolFactor); i > 0; i-- {
-			d.UvarintBytes()
+			d.UvarintBytes(nil)
 		}
 	} else {
 		d.Skip(int(o))
@@ -1297,7 +1297,7 @@ func (s Symbols) ReverseLookup(sym string) (uint32, error) {
 			B: s.bs.Range(0, s.bs.Len()),
 		}
 		d.Skip(s.offsets[i])
-		return yoloString(d.UvarintBytes()) > sym
+		return yoloString(d.UvarintBytes(nil)) > sym
 	})
 	d := encoding.Decbuf{
 		B: s.bs.Range(0, s.bs.Len()),
@@ -1311,7 +1311,7 @@ func (s Symbols) ReverseLookup(sym string) (uint32, error) {
 	var lastSymbol string
 	for d.Err() == nil && res <= s.seen {
 		lastLen = d.Len()
-		lastSymbol = yoloString(d.UvarintBytes())
+		lastSymbol = yoloString(d.UvarintBytes(nil))
 		if lastSymbol >= sym {
 			break
 		}
@@ -1354,7 +1354,7 @@ func (s *symbolsIter) Next() bool {
 	if s.cnt == 0 || s.err != nil {
 		return false
 	}
-	s.cur = yoloString(s.d.UvarintBytes())
+	s.cur = yoloString(s.d.UvarintBytes(nil))
 	s.cnt--
 	if s.d.Err() != nil {
 		s.err = s.d.Err()
@@ -1454,13 +1454,13 @@ func (r *Reader) LabelValues(name string) ([]string, error) {
 			// These are always the same number of bytes,
 			// and it's faster to skip than parse.
 			skip = d.Len()
-			d.Uvarint()      // Keycount.
-			d.UvarintBytes() // Label name.
+			d.Uvarint()         // Keycount.
+			d.UvarintBytes(nil) // Label name.
 			skip -= d.Len()
 		} else {
 			d.Skip(skip)
 		}
-		s := yoloString(d.UvarintBytes()) //Label value.
+		s := yoloString(d.UvarintBytes(nil)) //Label value.
 		values = append(values, s)
 		if s == lastVal {
 			break
@@ -1551,13 +1551,13 @@ func (r *Reader) Postings(name string, values ...string) (Postings, error) {
 				// These are always the same number of bytes,
 				// and it's faster to skip than parse.
 				skip = d.Len()
-				d.Uvarint()      // Keycount.
-				d.UvarintBytes() // Label name.
+				d.Uvarint()         // Keycount.
+				d.UvarintBytes(nil) // Label name.
 				skip -= d.Len()
 			} else {
 				d.Skip(skip)
 			}
-			v := d.UvarintBytes()       // Label value.
+			v := d.UvarintBytes(nil)    // Label value.
 			postingsOff = d.Uvarint64() // Offset.
 			for string(v) >= value {
 				if string(v) == value {
