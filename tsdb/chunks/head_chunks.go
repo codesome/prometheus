@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"hash"
 	"io"
 	"io/ioutil"
@@ -188,7 +189,7 @@ func (cdm *ChunkDiskMapper) openMMapFiles() (returnErr error) {
 	for seq, fn := range files {
 		f, err := fileutil.OpenMmapFile(fn)
 		if err != nil {
-			return errors.Wrap(err, "mmap files")
+			return errors.Wrapf(err, "mmap files, file: %s", fn)
 		}
 		cdm.closers[seq] = f
 		cdm.mmappedChunkFiles[seq] = &mmappedChunkFile{byteSlice: realByteSlice(f.Bytes())}
@@ -326,6 +327,21 @@ func chunkRef(seq, offset uint64) (chunkRef uint64) {
 // Size retention: because depending on the system architecture, there is a limit on how big of a file we can m-map.
 // Time retention: so that we can delete old chunks with some time guarantee in low load environments.
 func (cdm *ChunkDiskMapper) shouldCutNewFile(chunkSize int, maxt int64) bool {
+	if cdm.curFileNumBytes == 0 {
+		fmt.Println("level=info", "cutting_mmap_file", "reason=firstFile")
+	} else if maxt-cdm.curFileMint > cdm.maxFileTime && cdm.curFileNumBytes > HeadChunkFileHeaderSize {
+		fmt.Println("level=info", "cutting_mmap_file", "reason=timeLimit",
+			fmt.Sprintf("maxt=%d", maxt),
+			fmt.Sprintf("fileMint=%d", cdm.curFileMint),
+			fmt.Sprintf("maxLimit=%d", cdm.maxFileTime),
+		)
+	} else if cdm.curFileNumBytes+int64(chunkSize+MaxHeadChunkMetaSize) > MaxHeadChunkFileSize {
+		fmt.Println("level=info", "cutting_mmap_file", "reason=sizeLimit",
+			fmt.Sprintf("curSize=%d", cdm.curFileNumBytes),
+			fmt.Sprintf("newChunkSize=%d", chunkSize+MaxHeadChunkMetaSize),
+			fmt.Sprintf("fileLimit=%d", MaxHeadChunkFileSize),
+		)
+	}
 	return cdm.curFileNumBytes == 0 || // First head chunk file.
 		(maxt-cdm.curFileMint > cdm.maxFileTime && cdm.curFileNumBytes > HeadChunkFileHeaderSize) || // Time duration reached for the existing file.
 		cdm.curFileNumBytes+int64(chunkSize+MaxHeadChunkMetaSize) > MaxHeadChunkFileSize // Exceeds the max head chunk file size.
