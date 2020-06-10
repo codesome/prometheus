@@ -1,6 +1,14 @@
+## 2.18.2 / 2020-06-09
+
+* [BUGFIX] TSDB: Fix incorrect query results when using Prometheus with remote reads configured #7361
+
+## 2.18.1 / 2020-05-07
+
+* [BUGFIX] TSDB: Fixed snapshot API. #7217
+
 ## 2.18.0 / 2020-05-05
 
-* [CHANGE] Federation: Only use local TSDB for federation (ignore remote read). #7077
+* [CHANGE] Federation: Only use local TSDB for federation (ignore remote read). #7096
 * [CHANGE] Rules: `rule_evaluations_total` and `rule_evaluation_failures_total` have a `rule_group` label now. #7094
 * [FEATURE] Tracing: Added experimental Jaeger support #7148
 * [ENHANCEMENT] TSDB: Significantly reduce WAL size kept around after a block cut. #7098

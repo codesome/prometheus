@@ -35,7 +35,7 @@ func BenchmarkPostingsForMatchers(b *testing.B) {
 	defer func() {
 		testutil.Ok(b, os.RemoveAll(chunkDir))
 	}()
-	h, err := NewHead(nil, nil, nil, 1000, chunkDir, nil, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 1000, chunkDir, nil, DefaultStripeSize, nil)
 	testutil.Ok(b, err)
 	defer func() {
 		testutil.Ok(b, h.Close())
@@ -136,7 +136,7 @@ func BenchmarkQuerierSelect(b *testing.B) {
 	defer func() {
 		testutil.Ok(b, os.RemoveAll(chunkDir))
 	}()
-	h, err := NewHead(nil, nil, nil, 1000, chunkDir, nil, DefaultStripeSize)
+	h, err := NewHead(nil, nil, nil, 1000, chunkDir, nil, DefaultStripeSize, nil)
 	testutil.Ok(b, err)
 	defer h.Close()
 	app := h.Appender()
@@ -155,8 +155,7 @@ func BenchmarkQuerierSelect(b *testing.B) {
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					ss, _, err := q.Select(sorted, nil, matcher)
-					testutil.Ok(b, err)
+					ss := q.Select(sorted, nil, matcher)
 					for ss.Next() {
 					}
 					testutil.Ok(b, ss.Err())

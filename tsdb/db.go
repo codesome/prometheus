@@ -114,6 +114,10 @@ type Options struct {
 	// Unit agnostic as long as unit is consistent with MinBlockDuration and RetentionDuration.
 	// Typically it is in milliseconds.
 	MaxBlockDuration int64
+
+	// SeriesLifecycleCallback specifies a list of callbacks that will be called during a lifecycle of a series.
+	// It is always a no-op in Prometheus and mainly meant for external users who import TSDB.
+	SeriesLifecycleCallback SeriesLifecycleCallback
 }
 
 // DB handles reads and writes of time series falling into
@@ -309,7 +313,7 @@ func (db *DBReadOnly) FlushWAL(dir string) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	head, err := NewHead(nil, db.logger, w, 1, db.dir, nil, DefaultStripeSize)
+	head, err := NewHead(nil, db.logger, w, 1, db.dir, nil, DefaultStripeSize, nil)
 	if err != nil {
 		return err
 	}
@@ -368,7 +372,7 @@ func (db *DBReadOnly) Querier(ctx context.Context, mint, maxt int64) (storage.Qu
 		blocks[i] = b
 	}
 
-	head, err := NewHead(nil, db.logger, nil, 1, db.dir, nil, DefaultStripeSize)
+	head, err := NewHead(nil, db.logger, nil, 1, db.dir, nil, DefaultStripeSize, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +390,7 @@ func (db *DBReadOnly) Querier(ctx context.Context, mint, maxt int64) (storage.Qu
 		if err != nil {
 			return nil, err
 		}
-		head, err = NewHead(nil, db.logger, w, 1, db.dir, nil, DefaultStripeSize)
+		head, err = NewHead(nil, db.logger, w, 1, db.dir, nil, DefaultStripeSize, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -599,8 +603,7 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 		}
 	}
 
-	db.head, err = NewHead(r, l, wlog, rngs[0], dir, db.chunkPool, opts.StripeSize)
-
+	db.head, err = NewHead(r, l, wlog, rngs[0], dir, db.chunkPool, opts.StripeSize, opts.SeriesLifecycleCallback)
 	if err != nil {
 		return nil, err
 	}
@@ -747,7 +750,7 @@ func (db *DB) Compact() (err error) {
 		// consistently, we explicitly remove the last value
 		// from the block interval here.
 		head := NewRangeHead(db.head, mint, maxt-1)
-		if err := db.compactHead(head, mint, maxt); err != nil {
+		if err := db.compactHead(head); err != nil {
 			return err
 		}
 	}
@@ -756,17 +759,20 @@ func (db *DB) Compact() (err error) {
 }
 
 // CompactHead compacts the given the RangeHead.
-func (db *DB) CompactHead(head *RangeHead, mint, maxt int64) (err error) {
+func (db *DB) CompactHead(head *RangeHead) (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
-	return db.compactHead(head, mint, maxt)
+	return db.compactHead(head)
 }
 
 // compactHead compacts the given the RangeHead.
 // The compaction mutex should be held before calling this method.
-func (db *DB) compactHead(head *RangeHead, mint, maxt int64) (err error) {
-	uid, err := db.compactor.Write(db.dir, head, mint, maxt, nil)
+func (db *DB) compactHead(head *RangeHead) (err error) {
+	// Add +1 millisecond to block maxt because block intervals are half-open: [b.MinTime, b.MaxTime).
+	// Because of this block intervals are always +1 than the total samples it includes.
+	maxt := head.MaxTime() + 1
+	uid, err := db.compactor.Write(db.dir, head, head.MinTime(), maxt, nil)
 	if err != nil {
 		return errors.Wrap(err, "persist head block")
 	}

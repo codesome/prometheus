@@ -1140,7 +1140,7 @@ loop:
 
 		if ok {
 			err = app.AddFast(ce.ref, t, v)
-			sampleAdded, err = sl.checkAddError(ce, met, tp, err, &sampleLimitErr, appErrs)
+			_, err = sl.checkAddError(ce, met, tp, err, &sampleLimitErr, &appErrs)
 			// In theory this should never happen.
 			if err == storage.ErrNotFound {
 				ok = false
@@ -1169,7 +1169,7 @@ loop:
 
 			var ref uint64
 			ref, err = app.Add(lset, t, v)
-			sampleAdded, err = sl.checkAddError(nil, met, tp, err, &sampleLimitErr, appErrs)
+			sampleAdded, err = sl.checkAddError(nil, met, tp, err, &sampleLimitErr, &appErrs)
 			if err != nil {
 				if err != storage.ErrNotFound {
 					level.Debug(sl.l).Log("msg", "Unexpected error", "series", string(met), "err", err)
@@ -1187,10 +1187,10 @@ loop:
 			}
 		}
 
-		// Increment added even if there's a sampleLimitErr so we correctly report the number of samples scraped.
-		if sampleAdded || sampleLimitErr != nil {
-			added++
-		}
+		// Increment added even if there's an error so we correctly report the
+		// number of samples remaining after relabelling.
+		added++
+
 	}
 	if sampleLimitErr != nil {
 		if err == nil {
@@ -1231,7 +1231,7 @@ func yoloString(b []byte) string {
 // Adds samples to the appender, checking the error, and then returns the # of samples added,
 // whether the caller should continue to process more samples, and any sample limit errors.
 
-func (sl *scrapeLoop) checkAddError(ce *cacheEntry, met []byte, tp *int64, err error, sampleLimitErr *error, appErrs appendErrors) (bool, error) {
+func (sl *scrapeLoop) checkAddError(ce *cacheEntry, met []byte, tp *int64, err error, sampleLimitErr *error, appErrs *appendErrors) (bool, error) {
 	switch errors.Cause(err) {
 	case nil:
 		if tp == nil && ce != nil {
@@ -1275,7 +1275,7 @@ const (
 	scrapeSeriesAddedMetricName  = "scrape_series_added" + "\xff"
 )
 
-func (sl *scrapeLoop) report(start time.Time, duration time.Duration, scraped, appended, seriesAdded int, scrapeErr error) (err error) {
+func (sl *scrapeLoop) report(start time.Time, duration time.Duration, scraped, added, seriesAdded int, scrapeErr error) (err error) {
 	sl.scraper.Report(start, duration, scrapeErr)
 
 	ts := timestamp.FromTime(start)
@@ -1302,7 +1302,7 @@ func (sl *scrapeLoop) report(start time.Time, duration time.Duration, scraped, a
 	if err = sl.addReportSample(app, scrapeSamplesMetricName, ts, float64(scraped)); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, samplesPostRelabelMetricName, ts, float64(appended)); err != nil {
+	if err = sl.addReportSample(app, samplesPostRelabelMetricName, ts, float64(added)); err != nil {
 		return
 	}
 	if err = sl.addReportSample(app, scrapeSeriesAddedMetricName, ts, float64(seriesAdded)); err != nil {
