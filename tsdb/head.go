@@ -15,8 +15,6 @@ package tsdb
 
 import (
 	"fmt"
-	"github.com/prometheus/prometheus/tsdb/encoding"
-	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"io/ioutil"
 	"math"
 	"os"
@@ -38,7 +36,9 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/encoding"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
@@ -333,9 +333,6 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, chunkRange int
 	if err != nil {
 		return nil, err
 	}
-
-	h.wg.Add(1)
-	go h.chunkSnapshotLoop()
 
 	return h, nil
 }
@@ -1597,6 +1594,7 @@ func (h *Head) Close() error {
 	h.wg.Wait()
 
 	var merr tsdb_errors.MultiError
+	merr.Add(h.performChunkSnapshot())
 	merr.Add(h.chunkDiskMapper.Close())
 	if h.wal != nil {
 		merr.Add(h.wal.Close())
@@ -2727,27 +2725,13 @@ func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 	return stats, errors.Wrap(err, "delete chunk snapshot")
 }
 
-func (h *Head) chunkSnapshotLoop() {
-	defer h.wg.Done()
-
-	for {
-		select {
-		case <-time.After(10 * time.Minute):
-			h.performChunkSnapshot()
-		case <-h.closed:
-			return
-		}
-	}
-}
-
-func (h *Head) performChunkSnapshot() {
+func (h *Head) performChunkSnapshot() error {
 	level.Info(h.logger).Log("msg", "creating chunk snapshot")
 	startTime := time.Now()
 	stats, err := h.ChunkSnapshot()
 	elapsed := time.Since(startTime)
-	if err != nil {
-		level.Error(h.logger).Log("msg", "chunk snapshot failed", "err", err)
-		return
+	if err == nil {
+		level.Info(h.logger).Log("msg", "chunk snapshot complete", "duration", elapsed.String(), "num_series", stats.TotalSeries, "dir", stats.Dir)
 	}
-	level.Info(h.logger).Log("msg", "chunk snapshot complete", "duration", elapsed.String(), "num_series", stats.TotalSeries, "dir", stats.Dir)
+	return errors.Wrap(err, "chunk snapshot")
 }
