@@ -529,51 +529,34 @@ Outer:
 					// There's already a different ref for this series.
 					multiRef[s.Ref] = series.ref
 				}
-				mmc := mmappedChunks[series.ref]
-				if len(series.mmappedChunks) == 0 && len(mmc) > 0 {
-					// This is the first set of m-mapped chunks for this series.
-					series.mmappedChunks = mmc
-
-					h.metrics.chunks.Add(float64(len(series.mmappedChunks)))
-					h.metrics.chunksCreated.Add(float64(len(series.mmappedChunks)))
-
-					if len(series.mmappedChunks) > 0 {
-						h.updateMinMaxTime(series.minTime(), series.maxTime())
-					}
-				} else if len(mmc) > 0 && len(series.mmappedChunks) > 0 &&
-					series.mmappedChunks[len(series.mmappedChunks)-1].maxTime > mmc[len(mmc)-1].maxTime {
-					// These new m-mapped chunks in the future for the same series.
-					// Hence replace the old m-mapped chunks with new chunks.
-
-					if overlapsClosedInterval(
-						series.mmappedChunks[0].minTime,
-						series.mmappedChunks[len(series.mmappedChunks)-1].maxTime,
-						mmc[0].minTime,
-						mmc[len(mmc)-1].maxTime,
-					) {
-						seriesCreationErr = errors.Errorf("overlapping m-mapped chunks, ref=%d", series.ref)
-						break Outer
-					}
-
-					h.metrics.chunksCreated.Add(float64(len(mmc)))
-					h.metrics.chunksRemoved.Add(float64(len(series.mmappedChunks)))
-					h.metrics.chunks.Add(float64(len(mmc) - len(series.mmappedChunks)))
-
-					series.mmappedChunks = mmc
-
-					if series.headChunk != nil && mmc[len(mmc)-1].maxTime >= series.headChunk.maxTime {
-						// Samples loaded till now are in the m-mapped chunks. Hence clear the head chunk.
-						// A new series record is only possible when the old samples were already compacted into a block.
-						// Hence we can discard all the samples replayed till now for this series.
-						series.nextAt = 0
-						series.headChunk = nil
-						series.app = nil
-					}
-
-				}
-
 				if h.lastSeriesID < s.Ref {
 					h.lastSeriesID = s.Ref
+				}
+
+				// A new series record is only possible when the old samples were already compacted into a block.
+				// Hence we can discard all the samples and m-mapped chunks replayed till now for this series.
+				mmc := mmappedChunks[series.ref]
+				if len(mmc) == 0 {
+					// We continue with the old data if there is nothing to overwrite.
+					// Stale data will be removed during garbage collection.
+					continue
+				}
+
+				h.metrics.chunksCreated.Add(float64(len(mmc)))
+				h.metrics.chunksRemoved.Add(float64(len(series.mmappedChunks)))
+				h.metrics.chunks.Add(float64(len(mmc) - len(series.mmappedChunks)))
+
+				series.mmappedChunks = mmc
+
+				if series.headChunk != nil && mmc[len(mmc)-1].maxTime >= series.headChunk.maxTime {
+					// Samples loaded till now are in the m-mapped chunks. Hence clear the head chunk.
+					series.nextAt = 0
+					series.headChunk = nil
+					series.app = nil
+				}
+
+				if len(series.mmappedChunks) > 0 {
+					h.updateMinMaxTime(series.minTime(), series.maxTime())
 				}
 			}
 			//lint:ignore SA6002 relax staticcheck verification.
