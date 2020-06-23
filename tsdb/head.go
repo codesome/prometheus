@@ -525,10 +525,14 @@ Outer:
 					break Outer
 				}
 
-				if created {
-					// If this series gets a duplicate record, we don't restore its mmapped chunks,
-					// and instead restore everything from WAL records.
-					series.mmappedChunks = mmappedChunks[series.ref]
+				if !created {
+					// There's already a different ref for this series.
+					multiRef[s.Ref] = series.ref
+				}
+				mmc := mmappedChunks[series.ref]
+				if len(series.mmappedChunks) == 0 && len(mmc) > 0 {
+					// This is the first set of m-mapped chunks for this series.
+					series.mmappedChunks = mmc
 
 					h.metrics.chunks.Add(float64(len(series.mmappedChunks)))
 					h.metrics.chunksCreated.Add(float64(len(series.mmappedChunks)))
@@ -536,11 +540,36 @@ Outer:
 					if len(series.mmappedChunks) > 0 {
 						h.updateMinMaxTime(series.minTime(), series.maxTime())
 					}
-				} else {
-					// TODO(codesome) Discard old samples and mmapped chunks and use mmap chunks for the new series ID.
+				} else if len(mmc) > 0 && len(series.mmappedChunks) > 0 &&
+					series.mmappedChunks[len(series.mmappedChunks)-1].maxTime > mmc[len(mmc)-1].maxTime {
+					// These new m-mapped chunks in the future for the same series.
+					// Hence replace the old m-mapped chunks with new chunks.
 
-					// There's already a different ref for this series.
-					multiRef[s.Ref] = series.ref
+					if overlapsClosedInterval(
+						series.mmappedChunks[0].minTime,
+						series.mmappedChunks[len(series.mmappedChunks)-1].maxTime,
+						mmc[0].minTime,
+						mmc[len(mmc)-1].maxTime,
+					) {
+						seriesCreationErr = errors.Errorf("overlapping m-mapped chunks, ref=%d", series.ref)
+						break Outer
+					}
+
+					h.metrics.chunksCreated.Add(float64(len(mmc)))
+					h.metrics.chunksRemoved.Add(float64(len(series.mmappedChunks)))
+					h.metrics.chunks.Add(float64(len(mmc) - len(series.mmappedChunks)))
+
+					series.mmappedChunks = mmc
+
+					if series.headChunk != nil && mmc[len(mmc)-1].maxTime >= series.headChunk.maxTime {
+						// Samples loaded till now are in the m-mapped chunks. Hence clear the head chunk.
+						// A new series record is only possible when the old samples were already compacted into a block.
+						// Hence we can discard all the samples replayed till now for this series.
+						series.nextAt = 0
+						series.headChunk = nil
+						series.app = nil
+					}
+
 				}
 
 				if h.lastSeriesID < s.Ref {
@@ -2268,7 +2297,11 @@ type memChunk struct {
 
 // OverlapsClosedInterval returns true if the chunk overlaps [mint, maxt].
 func (mc *memChunk) OverlapsClosedInterval(mint, maxt int64) bool {
-	return mc.minTime <= maxt && mint <= mc.maxTime
+	return overlapsClosedInterval(mc.minTime, mc.maxTime, mint, maxt)
+}
+
+func overlapsClosedInterval(mint1, maxt1, mint2, maxt2 int64) bool {
+	return mint1 <= maxt2 && mint2 <= maxt1
 }
 
 type stopIterator struct {
@@ -2338,7 +2371,7 @@ type mmappedChunk struct {
 
 // Returns true if the chunk overlaps [mint, maxt].
 func (mc *mmappedChunk) OverlapsClosedInterval(mint, maxt int64) bool {
-	return mc.minTime <= maxt && mint <= mc.maxTime
+	return overlapsClosedInterval(mc.minTime, mc.maxTime, mint, maxt)
 }
 
 // SeriesLifecycleCallback specifies a list of callbacks that will be called during a lifecycle of a series.
