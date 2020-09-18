@@ -145,6 +145,44 @@ func WriteFile(logger log.Logger, dir string, tr Reader) (int64, error) {
 	return int64(size), fileutil.Replace(tmp, path)
 }
 
+func Encode(tr Reader) ([]byte, error) {
+	buf := encoding.Encbuf{}
+	buf.PutByte(tombstoneFormatV1)
+	err := tr.Iter(func(ref uint64, ivs Intervals) error {
+		for _, iv := range ivs {
+			buf.PutUvarint64(ref)
+			buf.PutVarint64(iv.Mint)
+			buf.PutVarint64(iv.Maxt)
+		}
+		return nil
+	})
+	return buf.Get(), errors.Wrap(err, "encoding tombstones")
+}
+
+func Decode(b []byte) (Reader, error) {
+	d := &encoding.Decbuf{B: b}
+	if flag := d.Byte(); flag != tombstoneFormatV1 {
+		return nil, errors.Errorf("invalid tombstone format %x", flag)
+	}
+
+	if d.Err() != nil {
+		return nil, d.Err()
+	}
+
+	stonesMap := NewMemTombstones()
+	for d.Len() > 0 {
+		k := d.Uvarint64()
+		mint := d.Varint64()
+		maxt := d.Varint64()
+		if d.Err() != nil {
+			return nil, d.Err()
+		}
+
+		stonesMap.AddInterval(k, Interval{mint, maxt})
+	}
+	return stonesMap, nil
+}
+
 // Stone holds the information on the posting and time-range
 // that is deleted.
 type Stone struct {

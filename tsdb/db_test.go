@@ -195,6 +195,7 @@ func TestDataAvailableOnlyAfterCommit(t *testing.T) {
 // https://github.com/prometheus/prometheus/issues/7548
 func TestNoPanicAfterWALCorrutpion(t *testing.T) {
 	db := openTestDB(t, &Options{WALSegmentSize: 32 * 1024}, nil)
+	chunkDirRoot := db.head.chunkDirRoot
 
 	// Append until the the first mmaped head chunk.
 	// This is to ensure that all samples can be read from the mmaped chunks when the WAL is corrupted.
@@ -217,6 +218,9 @@ func TestNoPanicAfterWALCorrutpion(t *testing.T) {
 		}
 		testutil.Ok(t, db.Close())
 	}
+
+	// Delete the chunks snapshot to not interfere with replay.
+	testutil.Ok(t, DeleteChunkSnapshots(chunkDirRoot, math.MaxInt64, math.MaxInt64))
 
 	// Corrupt the WAL after the first sample of the series so that it has at least one sample and
 	// it is not garbage collected.
@@ -2099,7 +2103,7 @@ func TestDBReadOnly(t *testing.T) {
 		w, err := wal.New(logger, nil, filepath.Join(dbDir, "wal"), true)
 		testutil.Ok(t, err)
 		h := createHead(t, w, genSeries(1, 1, 16, 18), dbDir)
-		testutil.Ok(t, h.Close())
+		testutil.Ok(t, h.CloseWithoutSnapshot())
 	}
 
 	// Open a normal db to use for a comparison.

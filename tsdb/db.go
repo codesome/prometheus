@@ -336,7 +336,7 @@ func (db *DBReadOnly) FlushWAL(dir string) (returnErr error) {
 	defer func() {
 		var merr tsdb_errors.MultiError
 		merr.Add(returnErr)
-		merr.Add(errors.Wrap(head.Close(), "closing Head"))
+		merr.Add(errors.Wrap(head.CloseWithoutSnapshot(), "closing Head"))
 		returnErr = merr.Err()
 	}()
 	// Set the min valid time for the ingested wal samples
@@ -393,7 +393,7 @@ func (db *DBReadOnly) loadDataAsQueryable(maxt int64) (storage.SampleAndChunkQue
 
 	// Also add the WAL if the current blocks don't cover the requests time range.
 	if maxBlockTime <= maxt {
-		if err := head.Close(); err != nil {
+		if err := head.CloseWithoutSnapshot(); err != nil {
 			return nil, err
 		}
 		w, err := wal.Open(db.logger, filepath.Join(db.dir, "wal"))
@@ -414,13 +414,24 @@ func (db *DBReadOnly) loadDataAsQueryable(maxt int64) (storage.SampleAndChunkQue
 		head.wal = nil
 	}
 
-	db.closers = append(db.closers, head)
+	db.closers = append(db.closers, &customCloser{closer: head.CloseWithoutSnapshot})
 	return &DB{
 		dir:    db.dir,
 		logger: db.logger,
 		blocks: blocks,
 		head:   head,
 	}, nil
+}
+
+type customCloser struct {
+	closer func() error
+}
+
+func (cc *customCloser) Close() error {
+	if cc.closer == nil {
+		return nil
+	}
+	return cc.closer()
 }
 
 // Querier loads the blocks and wal and returns a new querier over the data partition for the given time range.
@@ -1300,21 +1311,38 @@ func (db *DB) Close() error {
 	db.mtx.Lock()
 	defer db.mtx.Unlock()
 
-	var g errgroup.Group
+	var merr tsdb_errors.MultiError
+	merr.Add(db.close())
+	merr.Add(db.head.Close())
+	return merr.Err()
+}
 
+func (db *DB) CloseWithoutSnapshot() error {
+	close(db.stopc)
+	db.compactCancel()
+	<-db.donec
+
+	db.mtx.Lock()
+	defer db.mtx.Unlock()
+
+	var merr tsdb_errors.MultiError
+	merr.Add(db.close())
+	merr.Add(db.head.CloseWithoutSnapshot())
+	return merr.Err()
+}
+
+func (db *DB) close() error {
+	var g errgroup.Group
 	// blocks also contains all head blocks.
 	for _, pb := range db.blocks {
 		g.Go(pb.Close)
 	}
 
 	var merr tsdb_errors.MultiError
-
 	merr.Add(g.Wait())
-
 	if db.lockf != nil {
 		merr.Add(db.lockf.Release())
 	}
-	merr.Add(db.head.Close())
 	return merr.Err()
 }
 

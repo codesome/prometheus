@@ -306,7 +306,7 @@ func createBlock(tb testing.TB, dir string, series []storage.Series) string {
 	testutil.Ok(tb, err)
 	defer func() { testutil.Ok(tb, os.RemoveAll(chunkDir)) }()
 	head := createHead(tb, nil, series, chunkDir)
-	defer func() { testutil.Ok(tb, head.Close()) }()
+	defer func() { testutil.Ok(tb, head.CloseWithoutSnapshot()) }()
 	return createBlockFromHead(tb, dir, head)
 }
 

@@ -680,14 +680,13 @@ func (h *Head) Init(minValidTime int64) error {
 	level.Info(h.logger).Log("msg", "Replaying on-disk memory mappable chunks if any")
 	start := time.Now()
 
-	s := time.Now()
 	snapIdx, snapOffset, refSeries, err := h.loadChunkSnapshot()
 	if err != nil {
 		return nil
 	}
-	level.Info(h.logger).Log("msg", "chunk snapshot loading time", "duration", time.Since(s).String())
+	level.Info(h.logger).Log("msg", "chunk snapshot loading time", "duration", time.Since(start).String())
 
-	s = time.Now()
+	mmapChunkReplayStart := time.Now()
 	mmappedChunks, err := h.loadMmappedChunks(refSeries)
 	if err != nil {
 		level.Error(h.logger).Log("msg", "Loading on-disk chunks failed", "err", err)
@@ -699,7 +698,7 @@ func (h *Head) Init(minValidTime int64) error {
 		mmappedChunks = h.removeCorruptedMmappedChunks(err, refSeries)
 	}
 
-	level.Info(h.logger).Log("msg", "On-disk memory mappable chunks replay completed", "duration", time.Since(start).String())
+	level.Info(h.logger).Log("msg", "On-disk memory mappable chunks replay completed", "duration", time.Since(mmapChunkReplayStart).String())
 	if h.wal == nil {
 		level.Info(h.logger).Log("msg", "WAL not found")
 		return nil
@@ -830,6 +829,9 @@ func (h *Head) loadChunkSnapshot() (int, int, map[uint64]*memSeries, error) {
 				}
 
 				series.chunkRange = csr.chunkRange
+				if csr.mc == nil {
+					continue
+				}
 				series.nextAt = csr.mc.maxTime // This will create a new chunk on append.
 				series.headChunk = csr.mc
 
@@ -847,16 +849,35 @@ func (h *Head) loadChunkSnapshot() (int, int, map[uint64]*memSeries, error) {
 
 	r := wal.NewReader(sr)
 	var loopErr error
+Outer:
 	for r.Next() {
 		count++
+		rec := r.Record()
+		switch rec[0] {
+		case chunkSnapshotRecord_Series:
+			csr, err := decodeSeriesFromChunkSnapshot(rec)
+			if err != nil {
+				loopErr = errors.Wrap(err, "decode series record")
+				break Outer
+			}
+			recordChan <- csr
 
-		csr, err := decodeSeriesWithLastChunk(r.Record())
-		if err != nil {
-			loopErr = errors.Wrap(err, "decode last chunk")
-			break
+		case chunkSnapshotRecord_Tombstones:
+			tr, err := decodeTombstonesSnapshotRecord(rec)
+			if err != nil {
+				loopErr = errors.Wrap(err, "decode tombstones")
+				break Outer
+			}
+
+			if err = tr.Iter(func(ref uint64, ivs tombstones.Intervals) error {
+				h.tombstones.AddInterval(ref, ivs...)
+				return nil
+			}); err != nil {
+				loopErr = errors.Wrap(err, "iterate tombstones")
+				break Outer
+			}
 		}
 
-		recordChan <- csr
 	}
 	close(recordChan)
 	wg.Wait()
@@ -887,7 +908,6 @@ func (h *Head) loadMmappedChunks(refSeries map[uint64]*memSeries) (map[uint64][]
 		if maxt < h.minValidTime.Load() {
 			return nil
 		}
-
 		ms, ok := refSeries[seriesRef]
 		if !ok {
 			slice := mmappedChunks[seriesRef]
@@ -1610,8 +1630,19 @@ func (h *Head) compactable() bool {
 	return h.MaxTime()-h.MinTime() > h.chunkRange.Load()/2*3
 }
 
-// Close flushes the WAL and closes the head.
+// Close flushes the WAL, creates a snapchot, and closes the head.
 func (h *Head) Close() error {
+	if err := h.CloseWithoutSnapshot(); err != nil {
+		return nil
+	}
+
+	h.closedMtx.Lock()
+	defer h.closedMtx.Unlock()
+	return h.performChunkSnapshot()
+}
+
+// Close flushes the WAL and closes the head without creating a snapshot.
+func (h *Head) CloseWithoutSnapshot() error {
 	h.closedMtx.Lock()
 	defer h.closedMtx.Unlock()
 	h.closed = true
@@ -1619,7 +1650,6 @@ func (h *Head) Close() error {
 	var merr tsdb_errors.MultiError
 	merr.Add(h.chunkDiskMapper.Close())
 	if h.wal != nil {
-		merr.Add(h.performChunkSnapshot())
 		merr.Add(h.wal.Close())
 	}
 	return merr.Err()
@@ -2513,8 +2543,13 @@ func (mc *mmappedChunk) OverlapsClosedInterval(mint, maxt int64) bool {
 }
 
 //
-// Partial chunks.
+// Chunk snapshot.
 //
+
+const (
+	chunkSnapshotRecord_Series     uint8 = 1
+	chunkSnapshotRecord_Tombstones uint8 = 2
+)
 
 type chunkSnapshotRecord struct {
 	ref        uint64
@@ -2524,9 +2559,10 @@ type chunkSnapshotRecord struct {
 	mc         *memChunk
 }
 
-func (s *memSeries) encodeSeriesWithLastChunk(b []byte) []byte {
+func (s *memSeries) encodeToSnapshotRecord(b []byte) []byte {
 	buf := encoding.Encbuf{B: b}
 
+	buf.PutByte(chunkSnapshotRecord_Series)
 	buf.PutBE64(s.ref)
 	buf.PutUvarint(len(s.lset))
 	for _, l := range s.lset {
@@ -2536,17 +2572,28 @@ func (s *memSeries) encodeSeriesWithLastChunk(b []byte) []byte {
 	buf.PutBE64int64(s.chunkRange)
 
 	s.Lock()
-	buf.PutBE64int64(s.nextAt)
-	buf.PutBE64int64(s.headChunk.minTime)
-	buf.PutBE64int64(s.headChunk.maxTime)
-	buf.PutUvarintBytes(s.headChunk.chunk.Bytes())
+	if s.headChunk == nil {
+		buf.PutByte(0)
+	} else {
+		buf.PutByte(1)
+		buf.PutBE64int64(s.nextAt)
+		// TODO(codesome): skip headChunk if its nil.
+		buf.PutBE64int64(s.headChunk.minTime)
+		buf.PutBE64int64(s.headChunk.maxTime)
+		buf.PutByte(byte(s.headChunk.chunk.Encoding()))
+		buf.PutUvarintBytes(s.headChunk.chunk.Bytes())
+	}
 	s.Unlock()
 
 	return buf.Get()
 }
 
-func decodeSeriesWithLastChunk(b []byte) (csr chunkSnapshotRecord, err error) {
+func decodeSeriesFromChunkSnapshot(b []byte) (csr chunkSnapshotRecord, err error) {
 	dec := encoding.Decbuf{B: b}
+
+	if flag := dec.Byte(); flag != chunkSnapshotRecord_Series {
+		return csr, errors.Errorf("invalid record type %x", flag)
+	}
 
 	csr.ref = dec.Be64()
 
@@ -2558,12 +2605,16 @@ func decodeSeriesWithLastChunk(b []byte) (csr chunkSnapshotRecord, err error) {
 	}
 
 	csr.chunkRange = dec.Be64int64()
-	csr.nextAt = dec.Be64int64()
+	if dec.Byte() == 0 {
+		return
+	}
 
+	csr.nextAt = dec.Be64int64()
 	csr.mc = &memChunk{}
 	csr.mc.minTime = dec.Be64int64()
 	csr.mc.maxTime = dec.Be64int64()
-	chk, err := chunkenc.FromData(chunkenc.EncXOR, dec.UvarintBytes(nil))
+	enc := chunkenc.Encoding(dec.Byte())
+	chk, err := chunkenc.FromData(enc, dec.UvarintBytes(nil))
 	if err != nil {
 		return csr, errors.Wrap(err, "chunk from data")
 	}
@@ -2575,6 +2626,157 @@ func decodeSeriesWithLastChunk(b []byte) (csr chunkSnapshotRecord, err error) {
 	}
 
 	return
+}
+
+func encodeTombstonesToSnapshotRecord(tr tombstones.Reader) ([]byte, error) {
+	buf := encoding.Encbuf{}
+
+	buf.PutByte(chunkSnapshotRecord_Tombstones)
+	b, err := tombstones.Encode(tr)
+	if err != nil {
+		return nil, errors.Wrap(err, "encode tombstones")
+	}
+	buf.PutBytes(b)
+
+	return buf.Get(), nil
+}
+
+func decodeTombstonesSnapshotRecord(b []byte) (tombstones.Reader, error) {
+	dec := encoding.Decbuf{B: b}
+
+	if flag := dec.Byte(); flag != chunkSnapshotRecord_Tombstones {
+		return nil, errors.Errorf("invalid record type %x", flag)
+	}
+
+	tr, err := tombstones.Decode(dec.Get())
+	return tr, errors.Wrap(err, "decode tombstones")
+}
+
+const chunkSnapshotPrefix = "chunk_snapshot."
+
+// ChunkSnapshot creates a compacted checkpoint of all the series in the head.
+// It deletes the old chunk snapshots if the chunk snapshot creation is successful.
+//
+// The chunk snapshot is stored in a directory named chunk_snapshot.N in the same
+// segmented format as the original WAL itself.
+// This makes it easy to read it through the WAL package.
+func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
+	if h.wal == nil {
+		// If we are not storing any WAL, does not make sense to take a snapshot too.
+		level.Warn(h.logger).Log("msg", "skipping chunk snapshotting as WAL is disabled")
+		return &ChunkSnapshotStats{}, nil
+	}
+	h.chunkSnapshotMtx.Lock()
+	defer h.chunkSnapshotMtx.Unlock()
+
+	stats := &ChunkSnapshotStats{}
+
+	wlast, woffset, err := h.wal.LastSegmentAndOffset()
+	if err != nil && err != record.ErrNotFound {
+		return stats, errors.Wrap(err, "get last wal segment and offset")
+	}
+
+	_, cslast, csoffset, err := LastChunkSnapshot(h.chunkDirRoot)
+	if err != nil && err != record.ErrNotFound {
+		return stats, errors.Wrap(err, "find last chunk snapshot")
+	}
+
+	if wlast == cslast && woffset == csoffset {
+		// Nothing has been written to the WAL/Head since the last snapshot.
+		return stats, nil
+	}
+
+	snapshotName := fmt.Sprintf(chunkSnapshotPrefix+"%06d.%010d", wlast, woffset)
+
+	cpdir := filepath.Join(h.chunkDirRoot, snapshotName)
+	cpdirtmp := cpdir + ".tmp"
+	stats.Dir = cpdir
+
+	if err := os.MkdirAll(cpdirtmp, 0777); err != nil {
+		return stats, errors.Wrap(err, "create chunk snapshot dir")
+	}
+	cp, err := wal.New(nil, nil, cpdirtmp, h.wal.CompressionEnabled())
+	if err != nil {
+		return stats, errors.Wrap(err, "open chunk snapshot")
+	}
+
+	// Ensures that an early return caused by an error doesn't leave any tmp files.
+	defer func() {
+		cp.Close()
+		os.RemoveAll(cpdirtmp)
+	}()
+
+	var (
+		buf  []byte
+		recs [][]byte
+	)
+	stripeSize := h.series.size
+	for i := 0; i < stripeSize; i++ {
+		h.series.locks[i].RLock()
+
+		for _, s := range h.series.series[i] {
+			start := len(buf)
+			buf = s.encodeToSnapshotRecord(buf)
+			if len(buf[start:]) == 0 {
+				continue // All contents discarded.
+			}
+			recs = append(recs, buf[start:])
+			// Flush records in 10 MB increments.
+			if len(buf) > 10*1024*1024 {
+				if err := cp.Log(recs...); err != nil {
+					h.series.locks[i].RUnlock()
+					return stats, errors.Wrap(err, "flush records")
+				}
+				buf, recs = buf[:0], recs[:0]
+			}
+		}
+		stats.TotalSeries += len(h.series.series[i])
+
+		h.series.locks[i].RUnlock()
+	}
+
+	// Add tombstones to the snapshot.
+	tombstonesReader, err := h.Tombstones()
+	if err != nil {
+		return stats, errors.Wrap(err, "get tombstones")
+	}
+	rec, err := encodeTombstonesToSnapshotRecord(tombstonesReader)
+	if err != nil {
+		return stats, errors.Wrap(err, "encode tombstones")
+	}
+	recs = append(recs, rec)
+
+	// Flush remaining records.
+	if err := cp.Log(recs...); err != nil {
+		return stats, errors.Wrap(err, "flush records")
+	}
+	if err := cp.Close(); err != nil {
+		return stats, errors.Wrap(err, "close chunk snapshot")
+	}
+	if err := fileutil.Replace(cpdirtmp, cpdir); err != nil {
+		return stats, errors.Wrap(err, "rename chunk snapshot directory")
+	}
+
+	// h.metrics.checkpointDeleteTotal.Inc()
+	if err = DeleteChunkSnapshots(h.chunkDirRoot, cslast, csoffset); err != nil {
+		// Leftover old chunk snapshots do not cause problems down the line beyond
+		// occupying disk space.
+		// They will just be ignored since a higher chunk snapshot exists.
+		level.Error(h.logger).Log("msg", "delete old chunk snapshots", "err", err)
+		// h.metrics.checkpointDeleteFail.Inc()
+	}
+	return stats, errors.Wrap(err, "delete chunk snapshot")
+}
+
+func (h *Head) performChunkSnapshot() error {
+	level.Info(h.logger).Log("msg", "creating chunk snapshot")
+	startTime := time.Now()
+	stats, err := h.ChunkSnapshot()
+	elapsed := time.Since(startTime)
+	if err == nil {
+		level.Info(h.logger).Log("msg", "chunk snapshot complete", "duration", elapsed.String(), "num_series", stats.TotalSeries, "dir", stats.Dir)
+	}
+	return errors.Wrap(err, "chunk snapshot")
 }
 
 // ChunkSnapshotStats returns stats about a created chunk snapshot.
@@ -2657,117 +2859,6 @@ func DeleteChunkSnapshots(dir string, maxIndex, maxOffset int) error {
 
 	}
 	return errs.Err()
-}
-
-const chunkSnapshotPrefix = "chunk_snapshot."
-
-// ChunkSnapshot creates a compacted checkpoint of all the series in the head.
-// It deletes the old chunk snapshots if the chunk snapshot creation is successful.
-//
-// The chunk snapshot is stored in a directory named chunk_snapshot.N in the same
-// segmented format as the original WAL itself.
-// This makes it easy to read it through the WAL package.
-func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
-	h.chunkSnapshotMtx.Lock()
-	defer h.chunkSnapshotMtx.Unlock()
-
-	stats := &ChunkSnapshotStats{}
-
-	wlast, woffset, err := h.wal.LastSegmentAndOffset()
-	if err != nil && err != record.ErrNotFound {
-		return stats, errors.Wrap(err, "get last wal segment and offset")
-	}
-
-	_, cslast, csoffset, err := LastChunkSnapshot(h.chunkDirRoot)
-	if err != nil && err != record.ErrNotFound {
-		return stats, errors.Wrap(err, "find last chunk snapshot")
-	}
-
-	if wlast == cslast && woffset == csoffset {
-		// Nothing has been written to the WAL/Head since the last snapshot.
-		return stats, nil
-	}
-
-	snapshotName := fmt.Sprintf(chunkSnapshotPrefix+"%06d.%010d", wlast, woffset)
-
-	cpdir := filepath.Join(h.chunkDirRoot, snapshotName)
-	cpdirtmp := cpdir + ".tmp"
-	stats.Dir = cpdir
-
-	if err := os.MkdirAll(cpdirtmp, 0777); err != nil {
-		return stats, errors.Wrap(err, "create chunk snapshot dir")
-	}
-	cp, err := wal.New(nil, nil, cpdirtmp, h.wal.CompressionEnabled())
-	if err != nil {
-		return stats, errors.Wrap(err, "open chunk snapshot")
-	}
-
-	// Ensures that an early return caused by an error doesn't leave any tmp files.
-	defer func() {
-		cp.Close()
-		os.RemoveAll(cpdirtmp)
-	}()
-
-	var (
-		buf  []byte
-		recs [][]byte
-	)
-	stripeSize := h.series.size
-	for i := 0; i < stripeSize; i++ {
-		h.series.locks[i].RLock()
-
-		for _, s := range h.series.series[i] {
-			start := len(buf)
-			buf = s.encodeSeriesWithLastChunk(buf)
-			if len(buf[start:]) == 0 {
-				continue // All contents discarded.
-			}
-			recs = append(recs, buf[start:])
-			// Flush records in 10 MB increments.
-			if len(buf) > 10*1024*1024 {
-				if err := cp.Log(recs...); err != nil {
-					h.series.locks[i].RUnlock()
-					return stats, errors.Wrap(err, "flush records")
-				}
-				buf, recs = buf[:0], recs[:0]
-			}
-		}
-		stats.TotalSeries += len(h.series.series[i])
-
-		h.series.locks[i].RUnlock()
-	}
-
-	// Flush remaining records.
-	if err := cp.Log(recs...); err != nil {
-		return stats, errors.Wrap(err, "flush records")
-	}
-	if err := cp.Close(); err != nil {
-		return stats, errors.Wrap(err, "close chunk snapshot")
-	}
-	if err := fileutil.Replace(cpdirtmp, cpdir); err != nil {
-		return stats, errors.Wrap(err, "rename chunk snapshot directory")
-	}
-
-	// h.metrics.checkpointDeleteTotal.Inc()
-	if err = DeleteChunkSnapshots(h.chunkDirRoot, cslast, csoffset); err != nil {
-		// Leftover old chunk snapshots do not cause problems down the line beyond
-		// occupying disk space.
-		// They will just be ignored since a higher chunk snapshot exists.
-		level.Error(h.logger).Log("msg", "delete old chunk snapshots", "err", err)
-		// h.metrics.checkpointDeleteFail.Inc()
-	}
-	return stats, errors.Wrap(err, "delete chunk snapshot")
-}
-
-func (h *Head) performChunkSnapshot() error {
-	level.Info(h.logger).Log("msg", "creating chunk snapshot")
-	startTime := time.Now()
-	stats, err := h.ChunkSnapshot()
-	elapsed := time.Since(startTime)
-	if err == nil {
-		level.Info(h.logger).Log("msg", "chunk snapshot complete", "duration", elapsed.String(), "num_series", stats.TotalSeries, "dir", stats.Dir)
-	}
-	return errors.Wrap(err, "chunk snapshot")
 }
 
 // SeriesLifecycleCallback specifies a list of callbacks that will be called during a lifecycle of a series.
