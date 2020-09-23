@@ -536,7 +536,7 @@ Outer:
 
 				// A new series record is only possible when the old samples were already compacted into a block.
 				// Hence we can discard all the samples and m-mapped chunks replayed till now for this series.
-				mmc := mmappedChunks[series.ref]
+				mmc := mmappedChunks[s.Ref]
 				if len(mmc) == 0 {
 					// We continue with the old data if there is nothing to overwrite.
 					// Stale data will be removed during garbage collection.
@@ -550,8 +550,9 @@ Outer:
 						mmc[0].minTime,
 						mmc[len(mmc)-1].maxTime,
 					) {
-						// TOOD(codesome) return this instead.
-						panic("overlapping mmapped chunks")
+						// The m-map chunks for the new series ref overlaps with old m-map chunks.
+						seriesCreationErr = errors.Errorf("overlapping m-mapped chunks for series %s", series.lset.String())
+						break Outer
 					}
 				}
 
@@ -567,7 +568,8 @@ Outer:
 
 				if series.headChunk != nil && series.mmappedChunks[len(series.mmappedChunks)-1].maxTime >= series.headChunk.minTime {
 					// The head chunk was completed and was m-mapped after taking the snapshot.
-					// Hence remove this chunk.
+					// This can happen if Prometheus shutdown abruptly and replay picking up
+					// and old snapshot. Hence remove this chunk.
 					series.nextAt = 0
 					series.headChunk = nil
 					series.app = nil
