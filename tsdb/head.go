@@ -676,6 +676,13 @@ func (h *Head) Init(minValidTime int64) error {
 	h.minValidTime.Store(minValidTime)
 	defer h.postings.EnsureOrder()
 	defer h.gc() // After loading the wal remove the obsolete data from the head.
+	defer func() {
+		// Loading of m-mapped chunks and snapshot can make the mint of the Head
+		// to go below minValidTime.
+		if h.MinTime() < h.minValidTime.Load() {
+			h.minTime.Store(h.minValidTime.Load())
+		}
+	}()
 
 	level.Info(h.logger).Log("msg", "Replaying on-disk memory mappable chunks if any")
 	start := time.Now()
@@ -858,7 +865,7 @@ Outer:
 		count++
 		rec := r.Record()
 		switch rec[0] {
-		case chunkSnapshotRecord_Series:
+		case chunkSnapshotRecordTypeSeries:
 			csr, err := decodeSeriesFromChunkSnapshot(rec)
 			if err != nil {
 				loopErr = errors.Wrap(err, "decode series record")
@@ -866,7 +873,7 @@ Outer:
 			}
 			recordChan <- csr
 
-		case chunkSnapshotRecord_Tombstones:
+		case chunkSnapshotRecordTypeTombstones:
 			tr, err := decodeTombstonesSnapshotRecord(rec)
 			if err != nil {
 				loopErr = errors.Wrap(err, "decode tombstones")
@@ -2551,8 +2558,8 @@ func (mc *mmappedChunk) OverlapsClosedInterval(mint, maxt int64) bool {
 //
 
 const (
-	chunkSnapshotRecord_Series     uint8 = 1
-	chunkSnapshotRecord_Tombstones uint8 = 2
+	chunkSnapshotRecordTypeSeries     uint8 = 1
+	chunkSnapshotRecordTypeTombstones uint8 = 2
 )
 
 type chunkSnapshotRecord struct {
@@ -2567,7 +2574,7 @@ type chunkSnapshotRecord struct {
 func (s *memSeries) encodeToSnapshotRecord(b []byte) []byte {
 	buf := encoding.Encbuf{B: b}
 
-	buf.PutByte(chunkSnapshotRecord_Series)
+	buf.PutByte(chunkSnapshotRecordTypeSeries)
 	buf.PutBE64(s.ref)
 	buf.PutUvarint(len(s.lset))
 	for _, l := range s.lset {
@@ -2600,7 +2607,7 @@ func (s *memSeries) encodeToSnapshotRecord(b []byte) []byte {
 func decodeSeriesFromChunkSnapshot(b []byte) (csr chunkSnapshotRecord, err error) {
 	dec := encoding.Decbuf{B: b}
 
-	if flag := dec.Byte(); flag != chunkSnapshotRecord_Series {
+	if flag := dec.Byte(); flag != chunkSnapshotRecordTypeSeries {
 		return csr, errors.Errorf("invalid record type %x", flag)
 	}
 
@@ -2645,7 +2652,7 @@ func decodeSeriesFromChunkSnapshot(b []byte) (csr chunkSnapshotRecord, err error
 func encodeTombstonesToSnapshotRecord(tr tombstones.Reader) ([]byte, error) {
 	buf := encoding.Encbuf{}
 
-	buf.PutByte(chunkSnapshotRecord_Tombstones)
+	buf.PutByte(chunkSnapshotRecordTypeTombstones)
 	b, err := tombstones.Encode(tr)
 	if err != nil {
 		return nil, errors.Wrap(err, "encode tombstones")
@@ -2658,7 +2665,7 @@ func encodeTombstonesToSnapshotRecord(tr tombstones.Reader) ([]byte, error) {
 func decodeTombstonesSnapshotRecord(b []byte) (tombstones.Reader, error) {
 	dec := encoding.Decbuf{B: b}
 
-	if flag := dec.Byte(); flag != chunkSnapshotRecord_Tombstones {
+	if flag := dec.Byte(); flag != chunkSnapshotRecordTypeTombstones {
 		return nil, errors.Errorf("invalid record type %x", flag)
 	}
 
