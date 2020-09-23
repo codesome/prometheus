@@ -1899,3 +1899,66 @@ func TestErrReuseAppender(t *testing.T) {
 	testutil.NotOk(t, app.Commit())
 	testutil.NotOk(t, app.Rollback())
 }
+
+func TestChunkSnapshot(t *testing.T) {
+	head, w := newTestHead(t, DefaultBlockDuration, false)
+	defer func() {
+		testutil.Ok(t, head.CloseWithoutSnapshot())
+	}()
+
+	expSeries := make(map[string][]tsdbutil.Sample)
+	app := head.Appender(context.Background())
+	for i := 1; i <= 10; i++ {
+		lbls := labels.Labels{labels.Label{Name: "foo", Value: fmt.Sprintf("bar%d", i)}}
+		lblStr := lbls.String()
+		for ts := int64(1); ts <= 10; ts++ {
+			val := rand.Float64()
+			expSeries[lblStr] = append(expSeries[lblStr], sample{ts, val})
+			_, err := app.Add(lbls, ts, val)
+			testutil.Ok(t, err)
+		}
+	}
+	testutil.Ok(t, app.Commit())
+
+	testutil.Ok(t, head.Close()) // This will create a snapshot.
+
+	w, err := wal.NewSize(nil, nil, w.Dir(), 32768, false)
+	testutil.Ok(t, err)
+	head, err = NewHead(nil, nil, w, DefaultBlockDuration, head.chunkDirRoot, nil, DefaultStripeSize, nil)
+	testutil.Ok(t, err)
+	testutil.Ok(t, head.Init(math.MinInt64))
+
+	// Test query when everything is replayed from snapshot.
+	q, err := NewBlockQuerier(head, math.MinInt64, math.MaxInt64)
+	testutil.Ok(t, err)
+	series := query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "foo", ".*"))
+	testutil.Equals(t, expSeries, series)
+
+	// Add more samples to only include in WAL and not snapshot.
+	app = head.Appender(context.Background())
+	for i := 1; i <= 10; i++ {
+		lbls := labels.Labels{labels.Label{Name: "foo", Value: fmt.Sprintf("bar%d", i)}}
+		lblStr := lbls.String()
+		for ts := int64(11); ts <= 20; ts++ {
+			val := rand.Float64()
+			expSeries[lblStr] = append(expSeries[lblStr], sample{ts, val})
+			_, err := app.Add(lbls, ts, val)
+			testutil.Ok(t, err)
+		}
+	}
+	testutil.Ok(t, app.Commit())
+
+	testutil.Ok(t, head.CloseWithoutSnapshot()) // This will not create a snapshot.
+
+	w, err = wal.NewSize(nil, nil, w.Dir(), 32768, false)
+	testutil.Ok(t, err)
+	head, err = NewHead(nil, nil, w, DefaultBlockDuration, head.chunkDirRoot, nil, DefaultStripeSize, nil)
+	testutil.Ok(t, err)
+	testutil.Ok(t, head.Init(math.MinInt64))
+
+	// Test query when everything part is replayed from snapshot and part from WAL.
+	q, err = NewBlockQuerier(head, math.MinInt64, math.MaxInt64)
+	testutil.Ok(t, err)
+	series = query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "foo", ".*"))
+	testutil.Equals(t, expSeries, series)
+}

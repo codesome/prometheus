@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"hash"
 	"hash/crc32"
+	"math"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -54,6 +55,10 @@ func (e *Encbuf) PutBE32(x uint32) {
 func (e *Encbuf) PutBE64(x uint64) {
 	binary.BigEndian.PutUint64(e.C[:], x)
 	e.B = append(e.B, e.C[:8]...)
+}
+
+func (e *Encbuf) PutBEFloat64(x float64) {
+	e.PutBE64(math.Float64bits(x))
 }
 
 func (e *Encbuf) PutUvarint64(x uint64) {
@@ -251,6 +256,10 @@ func (d *Decbuf) Be64() uint64 {
 	x := binary.BigEndian.Uint64(d.B)
 	d.B = d.B[8:]
 	return x
+}
+
+func (d *Decbuf) Be64Float64() float64 {
+	return math.Float64frombits(d.Be64())
 }
 
 func (d *Decbuf) Be32() uint32 {

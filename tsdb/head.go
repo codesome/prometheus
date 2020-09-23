@@ -834,6 +834,10 @@ func (h *Head) loadChunkSnapshot() (int, int, map[uint64]*memSeries, error) {
 				}
 				series.nextAt = csr.mc.maxTime // This will create a new chunk on append.
 				series.headChunk = csr.mc
+				for i := range series.sampleBuf {
+					series.sampleBuf[i].t = csr.sampleBuf[i].t
+					series.sampleBuf[i].v = csr.sampleBuf[i].v
+				}
 
 				app, err := series.headChunk.chunk.Appender()
 				if err != nil {
@@ -2557,6 +2561,7 @@ type chunkSnapshotRecord struct {
 	chunkRange int64
 	nextAt     int64
 	mc         *memChunk
+	sampleBuf  [4]sample
 }
 
 func (s *memSeries) encodeToSnapshotRecord(b []byte) []byte {
@@ -2577,11 +2582,15 @@ func (s *memSeries) encodeToSnapshotRecord(b []byte) []byte {
 	} else {
 		buf.PutByte(1)
 		buf.PutBE64int64(s.nextAt)
-		// TODO(codesome): skip headChunk if its nil.
 		buf.PutBE64int64(s.headChunk.minTime)
 		buf.PutBE64int64(s.headChunk.maxTime)
 		buf.PutByte(byte(s.headChunk.chunk.Encoding()))
 		buf.PutUvarintBytes(s.headChunk.chunk.Bytes())
+		// Put the sample buf.
+		for _, smpl := range s.sampleBuf {
+			buf.PutBE64int64(smpl.t)
+			buf.PutBEFloat64(smpl.v)
+		}
 	}
 	s.Unlock()
 
@@ -2619,6 +2628,11 @@ func decodeSeriesFromChunkSnapshot(b []byte) (csr chunkSnapshotRecord, err error
 		return csr, errors.Wrap(err, "chunk from data")
 	}
 	csr.mc.chunk = chk
+
+	for i := range csr.sampleBuf {
+		csr.sampleBuf[i].t = dec.Be64int64()
+		csr.sampleBuf[i].v = dec.Be64Float64()
+	}
 
 	err = dec.Err()
 	if err != nil && len(dec.B) > 0 {
