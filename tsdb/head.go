@@ -689,9 +689,9 @@ func (h *Head) Init(minValidTime int64) error {
 
 	snapIdx, snapOffset, refSeries, err := h.loadChunkSnapshot()
 	if err != nil {
-		return nil
+		return err
 	}
-	level.Info(h.logger).Log("msg", "chunk snapshot loading time", "duration", time.Since(start).String())
+	level.Info(h.logger).Log("msg", "Chunk snapshot loading time", "duration", time.Since(start).String())
 
 	mmapChunkReplayStart := time.Now()
 	mmappedChunks, err := h.loadMmappedChunks(refSeries)
