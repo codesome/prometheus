@@ -2566,7 +2566,6 @@ type chunkSnapshotRecord struct {
 	ref        uint64
 	lset       labels.Labels
 	chunkRange int64
-	nextAt     int64
 	mc         *memChunk
 	sampleBuf  [4]sample
 }
@@ -2588,7 +2587,6 @@ func (s *memSeries) encodeToSnapshotRecord(b []byte) []byte {
 		buf.PutByte(0)
 	} else {
 		buf.PutByte(1)
-		buf.PutBE64int64(s.nextAt)
 		buf.PutBE64int64(s.headChunk.minTime)
 		buf.PutBE64int64(s.headChunk.maxTime)
 		buf.PutByte(byte(s.headChunk.chunk.Encoding()))
@@ -2625,7 +2623,6 @@ func decodeSeriesFromChunkSnapshot(b []byte) (csr chunkSnapshotRecord, err error
 		return
 	}
 
-	csr.nextAt = dec.Be64int64()
 	csr.mc = &memChunk{}
 	csr.mc.minTime = dec.Be64int64()
 	csr.mc.maxTime = dec.Be64int64()

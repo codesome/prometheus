@@ -1906,9 +1906,10 @@ func TestChunkSnapshot(t *testing.T) {
 		testutil.Ok(t, head.CloseWithoutSnapshot())
 	}()
 
+	numSeries := 10
 	expSeries := make(map[string][]tsdbutil.Sample)
 	app := head.Appender(context.Background())
-	for i := 1; i <= 10; i++ {
+	for i := 1; i <= numSeries; i++ {
 		lbls := labels.Labels{labels.Label{Name: "foo", Value: fmt.Sprintf("bar%d", i)}}
 		lblStr := lbls.String()
 		for ts := int64(1); ts <= 10; ts++ {
@@ -1936,7 +1937,7 @@ func TestChunkSnapshot(t *testing.T) {
 
 	// Add more samples to only include in WAL and not snapshot.
 	app = head.Appender(context.Background())
-	for i := 1; i <= 10; i++ {
+	for i := 1; i <= numSeries; i++ {
 		lbls := labels.Labels{labels.Label{Name: "foo", Value: fmt.Sprintf("bar%d", i)}}
 		lblStr := lbls.String()
 		for ts := int64(11); ts <= 20; ts++ {
