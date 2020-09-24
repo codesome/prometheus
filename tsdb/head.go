@@ -759,14 +759,13 @@ func (h *Head) Init(minValidTime int64) error {
 			return errors.Wrap(err, fmt.Sprintf("open WAL segment: %d", i))
 		}
 
-		var sr *wal.SegmentBufReader
+		offset := 0
 		if i == snapIdx {
-			sr, err = wal.NewSegmentBufReaderWithOffset(snapOffset, s)
-			if err != nil {
-				return errors.Wrap(err, "segment reader with offset")
-			}
-		} else {
-			sr = wal.NewSegmentBufReader(s)
+			offset = snapOffset
+		}
+		sr, err := wal.NewSegmentBufReaderWithOffset(offset, s)
+		if err != nil {
+			return errors.Wrapf(err, "segment reader (offset=%d)", offset)
 		}
 
 		err = h.loadWAL(wal.NewReader(sr), multiRef, mmappedChunks)
@@ -811,25 +810,35 @@ func (h *Head) loadChunkSnapshot() (int, int, map[uint64]*memSeries, error) {
 	}()
 
 	var (
-		count            = 0
+		numSeries        = 0
 		unknownRefs      = int64(0)
 		n                = runtime.GOMAXPROCS(0)
 		wg               sync.WaitGroup
 		recordChan       = make(chan chunkSnapshotRecord, 5*n)
 		shardedRefSeries = make([]map[uint64]*memSeries, n)
+		errChan          = make(chan error, n)
 	)
 
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		go func(idx int, rc <-chan chunkSnapshotRecord) {
 			defer wg.Done()
+			defer func() {
+				// If there was an error, drain the channel
+				// to unblock the main thread.
+				for range rc {
+				}
+			}()
 
 			shardedRefSeries[idx] = make(map[uint64]*memSeries)
 			localRefSeries := shardedRefSeries[idx]
 
 			for csr := range rc {
-				// TODO(codesome): dont ignore the error.
-				series, _, _ := h.getOrCreateWithID(csr.ref, csr.lset.Hash(), csr.lset)
+				series, _, err := h.getOrCreateWithID(csr.ref, csr.lset.Hash(), csr.lset)
+				if err != nil {
+					errChan <- err
+					return
+				}
 				localRefSeries[csr.ref] = series
 				if h.lastSeriesID.Load() < series.ref {
 					h.lastSeriesID.Store(series.ref)
@@ -848,8 +857,8 @@ func (h *Head) loadChunkSnapshot() (int, int, map[uint64]*memSeries, error) {
 
 				app, err := series.headChunk.chunk.Appender()
 				if err != nil {
-					// TODO(codesome): return this.
-					panic(err)
+					errChan <- err
+					return
 				}
 				series.app = app
 
@@ -862,10 +871,17 @@ func (h *Head) loadChunkSnapshot() (int, int, map[uint64]*memSeries, error) {
 	var loopErr error
 Outer:
 	for r.Next() {
-		count++
+		select {
+		case err := <-errChan:
+			errChan <- err
+			break Outer
+		default:
+		}
+
 		rec := r.Record()
 		switch rec[0] {
 		case chunkSnapshotRecordTypeSeries:
+			numSeries++
 			csr, err := decodeSeriesFromChunkSnapshot(rec)
 			if err != nil {
 				loopErr = errors.Wrap(err, "decode series record")
@@ -893,11 +909,17 @@ Outer:
 	close(recordChan)
 	wg.Wait()
 
-	if loopErr != nil {
-		return -1, -1, nil, loopErr
+	close(errChan)
+	var merr tsdb_errors.MultiError
+	merr.Add(errors.Wrap(loopErr, "decode loop"))
+	for err := range errChan {
+		merr.Add(errors.Wrap(err, "record processing"))
+	}
+	if err := merr.Err(); err != nil {
+		return -1, -1, nil, err
 	}
 
-	refSeries := make(map[uint64]*memSeries, count)
+	refSeries := make(map[uint64]*memSeries, numSeries)
 	for _, shard := range shardedRefSeries {
 		for k, v := range shard {
 			refSeries[k] = v
@@ -905,7 +927,7 @@ Outer:
 	}
 
 	elapsed := time.Since(start)
-	level.Info(h.logger).Log("msg", "chunk snapshot loaded", "dir", dir, "num_series", count, "duration", elapsed.String())
+	level.Info(h.logger).Log("msg", "chunk snapshot loaded", "dir", dir, "num_series", numSeries, "duration", elapsed.String())
 	if unknownRefs > 0 {
 		level.Warn(h.logger).Log("msg", "unknown series references during chunk snapshot replay", "count", unknownRefs)
 	}
@@ -1657,7 +1679,6 @@ func (h *Head) CloseWithoutSnapshot() error {
 	h.closedMtx.Lock()
 	defer h.closedMtx.Unlock()
 	h.closed = true
-
 	var merr tsdb_errors.MultiError
 	merr.Add(h.chunkDiskMapper.Close())
 	if h.wal != nil {
@@ -2553,10 +2574,6 @@ func (mc *mmappedChunk) OverlapsClosedInterval(mint, maxt int64) bool {
 	return overlapsClosedInterval(mc.minTime, mc.maxTime, mint, maxt)
 }
 
-//
-// Chunk snapshot.
-//
-
 const (
 	chunkSnapshotRecordTypeSeries     uint8 = 1
 	chunkSnapshotRecordTypeTombstones uint8 = 2
@@ -2627,7 +2644,13 @@ func decodeSeriesFromChunkSnapshot(b []byte) (csr chunkSnapshotRecord, err error
 	csr.mc.minTime = dec.Be64int64()
 	csr.mc.maxTime = dec.Be64int64()
 	enc := chunkenc.Encoding(dec.Byte())
-	chk, err := chunkenc.FromData(enc, dec.UvarintBytes(nil))
+
+	// The underlying bytes gets re-used later, so make a copy.
+	chunkBytes := dec.UvarintBytes()
+	chunkBytesCopy := make([]byte, len(chunkBytes))
+	copy(chunkBytesCopy, chunkBytes)
+
+	chk, err := chunkenc.FromData(enc, chunkBytesCopy)
 	if err != nil {
 		return csr, errors.Wrap(err, "chunk from data")
 	}
@@ -2672,12 +2695,12 @@ func decodeTombstonesSnapshotRecord(b []byte) (tombstones.Reader, error) {
 
 const chunkSnapshotPrefix = "chunk_snapshot."
 
-// ChunkSnapshot creates a compacted checkpoint of all the series in the head.
+// ChunkSnapshot creates a snapshot of all the series and tombstones in the head.
 // It deletes the old chunk snapshots if the chunk snapshot creation is successful.
 //
-// The chunk snapshot is stored in a directory named chunk_snapshot.N in the same
-// segmented format as the original WAL itself.
-// This makes it easy to read it through the WAL package.
+// The chunk snapshot is stored in a directory named chunk_snapshot.N.M and is written
+// using the WAL package. N is the last WAL segment present during snapshotting and
+// M is the offset in segment N upto which data was written.
 func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 	if h.wal == nil {
 		// If we are not storing any WAL, does not make sense to take a snapshot too.
@@ -2775,15 +2798,13 @@ func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 		return stats, errors.Wrap(err, "rename chunk snapshot directory")
 	}
 
-	// h.metrics.checkpointDeleteTotal.Inc()
-	if err = DeleteChunkSnapshots(h.chunkDirRoot, cslast, csoffset); err != nil {
+	if err := DeleteChunkSnapshots(h.chunkDirRoot, cslast, csoffset); err != nil {
 		// Leftover old chunk snapshots do not cause problems down the line beyond
 		// occupying disk space.
 		// They will just be ignored since a higher chunk snapshot exists.
 		level.Error(h.logger).Log("msg", "delete old chunk snapshots", "err", err)
-		// h.metrics.checkpointDeleteFail.Inc()
 	}
-	return stats, errors.Wrap(err, "delete chunk snapshot")
+	return stats, nil
 }
 
 func (h *Head) performChunkSnapshot() error {

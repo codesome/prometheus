@@ -1304,20 +1304,14 @@ func (db *DB) Head() *Head {
 
 // Close the partition.
 func (db *DB) Close() error {
-	close(db.stopc)
-	db.compactCancel()
-	<-db.donec
-
-	db.mtx.Lock()
-	defer db.mtx.Unlock()
-
-	var merr tsdb_errors.MultiError
-	merr.Add(db.close())
-	merr.Add(db.head.Close())
-	return merr.Err()
+	return db.close(true)
 }
 
 func (db *DB) CloseWithoutSnapshot() error {
+	return db.close(false)
+}
+
+func (db *DB) close(withHeadSnapshot bool) error {
 	close(db.stopc)
 	db.compactCancel()
 	<-db.donec
@@ -1325,13 +1319,6 @@ func (db *DB) CloseWithoutSnapshot() error {
 	db.mtx.Lock()
 	defer db.mtx.Unlock()
 
-	var merr tsdb_errors.MultiError
-	merr.Add(db.close())
-	merr.Add(db.head.CloseWithoutSnapshot())
-	return merr.Err()
-}
-
-func (db *DB) close() error {
 	var g errgroup.Group
 	// blocks also contains all head blocks.
 	for _, pb := range db.blocks {
@@ -1342,6 +1329,11 @@ func (db *DB) close() error {
 	merr.Add(g.Wait())
 	if db.lockf != nil {
 		merr.Add(db.lockf.Release())
+	}
+	if withHeadSnapshot {
+		merr.Add(db.head.Close())
+	} else {
+		merr.Add(db.head.CloseWithoutSnapshot())
 	}
 	return merr.Err()
 }

@@ -196,27 +196,23 @@ func (d *Decbuf) Skip(l int) {
 }
 
 func (d *Decbuf) UvarintStr() string {
-	return string(d.UvarintBytes(nil))
+	return string(d.UvarintBytes())
 }
 
 // The return value becomes invalid if the byte slice goes away.
 // Compared to UvarintStr, this avoid allocations.
-func (d *Decbuf) UvarintBytes(b []byte) []byte {
+func (d *Decbuf) UvarintBytes() []byte {
 	l := d.Uvarint64()
 	if d.E != nil {
-		return b[:0]
+		return []byte{}
 	}
 	if len(d.B) < int(l) {
 		d.E = ErrInvalidSize
-		return b[:0]
+		return []byte{}
 	}
-	if cap(b) < int(l) {
-		b = make([]byte, 0, l)
-	}
-	b = b[:l]
-	copy(b, d.B[:l])
+	s := d.B[:l]
 	d.B = d.B[l:]
-	return b
+	return s
 }
 
 func (d *Decbuf) Varint64() int64 {

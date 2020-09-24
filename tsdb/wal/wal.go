@@ -848,30 +848,34 @@ func NewSegmentsRangeReader(sr ...SegmentRange) (io.ReadCloser, error) {
 // corruption reporting.  We have to be careful not to increment curr too
 // early, as it is used by Reader.Err() to tell Repair which segment is corrupt.
 // As such we pad the end of non-page align segments with zeros.
-type SegmentBufReader struct {
+type segmentBufReader struct {
 	buf  *bufio.Reader
 	segs []*Segment
 	cur  int // Index into segs.
 	off  int // Offset of read data into current segment.
 }
 
-func NewSegmentBufReader(segs ...*Segment) *SegmentBufReader {
-	return &SegmentBufReader{
+// nolint:golint // TODO: Consider exporting segmentBufReader
+func NewSegmentBufReader(segs ...*Segment) *segmentBufReader {
+	return &segmentBufReader{
 		buf:  bufio.NewReaderSize(segs[0], 16*pageSize),
 		segs: segs,
 	}
 }
 
-func NewSegmentBufReaderWithOffset(offset int, segs ...*Segment) (*SegmentBufReader, error) {
-	sbr := &SegmentBufReader{
+// nolint:golint
+func NewSegmentBufReaderWithOffset(offset int, segs ...*Segment) (sbr *segmentBufReader, err error) {
+	sbr = &segmentBufReader{
 		buf:  bufio.NewReaderSize(segs[0], 16*pageSize),
 		segs: segs,
 	}
-	_, err := sbr.buf.Discard(offset)
+	if offset > 0 {
+		_, err = sbr.buf.Discard(offset)
+	}
 	return sbr, err
 }
 
-func (r *SegmentBufReader) Close() (err error) {
+func (r *segmentBufReader) Close() (err error) {
 	for _, s := range r.segs {
 		if e := s.Close(); e != nil {
 			err = e
@@ -881,7 +885,7 @@ func (r *SegmentBufReader) Close() (err error) {
 }
 
 // Read implements io.Reader.
-func (r *SegmentBufReader) Read(b []byte) (n int, err error) {
+func (r *segmentBufReader) Read(b []byte) (n int, err error) {
 	n, err = r.buf.Read(b)
 	r.off += n
 
