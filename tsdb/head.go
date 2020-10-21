@@ -517,68 +517,66 @@ func (h *Head) loadWAL(r *wal.Reader, multiRef map[uint64]uint64, mmappedChunks 
 		}
 	}()
 
+	// The records are always replayed from the oldest to the newest.
 Outer:
 	for d := range decoded {
 		switch v := d.(type) {
 		case []record.RefSeries:
-			for _, s := range v {
-				series, created, err := h.getOrCreateWithID(s.Ref, s.Labels.Hash(), s.Labels)
+			for _, walSeries := range v {
+				mSeries, created, err := h.getOrCreateWithID(walSeries.Ref, walSeries.Labels.Hash(), walSeries.Labels)
 				if err != nil {
 					seriesCreationErr = err
 					break Outer
 				}
 
-				if h.lastSeriesID.Load() < s.Ref {
-					h.lastSeriesID.Store(s.Ref)
+				if h.lastSeriesID.Load() < walSeries.Ref {
+					h.lastSeriesID.Store(walSeries.Ref)
 				}
 
-				if !created {
-					// There's already a different ref for this series.
-					multiRef[s.Ref] = series.ref
-				}
+				mmc := mmappedChunks[walSeries.Ref]
 
-				// A new series record is only possible when the old samples were already compacted into a block.
-				// Hence we can discard all the samples and m-mapped chunks replayed till now for this series.
-				mmc := mmappedChunks[s.Ref]
-				if len(mmc) == 0 {
-					// We continue with the old data if there is nothing to overwrite.
-					// Stale data will be removed during garbage collection.
+				if created {
+					// This is the first WAL series record for this series.
+					h.metrics.chunksCreated.Add(float64(len(mmc)))
+					h.metrics.chunks.Add(float64(len(mmc)))
+					mSeries.mmappedChunks = mmc
 					continue
 				}
 
-				if len(series.mmappedChunks) > 0 {
+				// There's already a different ref for this series.
+				// A duplicate series record is only possible when the old samples were already compacted into a block.
+				// Hence we can discard all the samples and m-mapped chunks replayed till now for this series.
+
+				multiRef[walSeries.Ref] = mSeries.ref
+
+				// Checking if the new m-mapped chunks overlap with the already existing ones.
+				// This should never happen, but we have a check anyway to detect any
+				// edge cases that we might have missed.
+				if len(mSeries.mmappedChunks) > 0 {
 					if overlapsClosedInterval(
-						series.mmappedChunks[0].minTime,
-						series.mmappedChunks[len(series.mmappedChunks)-1].maxTime,
+						mSeries.mmappedChunks[0].minTime,
+						mSeries.mmappedChunks[len(mSeries.mmappedChunks)-1].maxTime,
 						mmc[0].minTime,
 						mmc[len(mmc)-1].maxTime,
 					) {
 						// The m-map chunks for the new series ref overlaps with old m-map chunks.
-						seriesCreationErr = errors.Errorf("overlapping m-mapped chunks for series %s", series.lset.String())
+						seriesCreationErr = errors.Errorf("overlapping m-mapped chunks for series %s", mSeries.lset.String())
 						break Outer
 					}
 				}
 
-				if len(series.mmappedChunks) == 0 || series.mmappedChunks[len(series.mmappedChunks)-1].maxTime > mmc[len(mmc)-1].maxTime {
-					// These new m-mapped chunks are the first for this series (or) in the future for the same series.
-					// Hence replace the old m-mapped chunks with new chunks.
-					h.metrics.chunksCreated.Add(float64(len(mmc)))
-					h.metrics.chunksRemoved.Add(float64(len(series.mmappedChunks)))
-					h.metrics.chunks.Add(float64(len(mmc) - len(series.mmappedChunks)))
+				// Replacing m-mapped chunks with the new ones (could be empty).
+				h.metrics.chunksCreated.Add(float64(len(mmc)))
+				h.metrics.chunksRemoved.Add(float64(len(mSeries.mmappedChunks)))
+				h.metrics.chunks.Add(float64(len(mmc) - len(mSeries.mmappedChunks)))
+				mSeries.mmappedChunks = mmc
 
-					series.mmappedChunks = mmc
-				}
+				// Any samples replayed till now would already be compacted. Resetting the head chunk.
+				mSeries.nextAt = 0
+				mSeries.headChunk = nil
+				mSeries.app = nil
 
-				if series.headChunk != nil && series.mmappedChunks[len(series.mmappedChunks)-1].maxTime >= series.headChunk.minTime {
-					// The head chunk was completed and was m-mapped after taking the snapshot.
-					// This can happen if Prometheus shutdown abruptly and replay picking up
-					// and old snapshot. Hence remove this chunk.
-					series.nextAt = 0
-					series.headChunk = nil
-					series.app = nil
-				}
-
-				h.updateMinMaxTime(series.minTime(), series.maxTime())
+				h.updateMinMaxTime(mSeries.minTime(), mSeries.maxTime())
 			}
 			//lint:ignore SA6002 relax staticcheck verification.
 			seriesPool.Put(v)
