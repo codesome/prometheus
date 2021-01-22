@@ -550,10 +550,19 @@ Outer:
 
 				multiRef[walSeries.Ref] = mSeries.ref
 
+				// It is possible that some old sample is being processed in processWALSamples that could
+				// get included if we replace the chunks before adding that sample. So we wait for the
+				// goroutine to empty input the buffer.
+				idx := mSeries.ref % uint64(n)
+				inputs[idx] <- []record.RefSample{} // To ensure that all the old samples are processed.
+				for len(inputs[idx]) != 0 {
+					time.Sleep(1 * time.Millisecond)
+				}
+
 				// Checking if the new m-mapped chunks overlap with the already existing ones.
 				// This should never happen, but we have a check anyway to detect any
 				// edge cases that we might have missed.
-				if len(mSeries.mmappedChunks) > 0 {
+				if len(mSeries.mmappedChunks) > 0 && len(mmc) > 0 {
 					if overlapsClosedInterval(
 						mSeries.mmappedChunks[0].minTime,
 						mSeries.mmappedChunks[len(mSeries.mmappedChunks)-1].maxTime,
@@ -576,7 +585,6 @@ Outer:
 				mSeries.nextAt = 0
 				mSeries.headChunk = nil
 				mSeries.app = nil
-
 				h.updateMinMaxTime(mSeries.minTime(), mSeries.maxTime())
 			}
 			//lint:ignore SA6002 relax staticcheck verification.
