@@ -95,41 +95,40 @@ func (ce *CircularExemplarStorage) Querier(ctx context.Context) (storage.Exempla
 }
 
 // Select returns exemplars for a given set of series labels hash.
-func (ce *CircularExemplarStorage) Select(start, end int64, l labels.Labels) ([]exemplar.Exemplar, error) {
-	var (
-		ret []exemplar.Exemplar
-		e   *circularBufferEntry
-		idx *indexEntry
-		ok  bool
-	)
+func (ce *CircularExemplarStorage) Select(start, end int64, matchers ...[]labels.Matcher) ([]exemplar.Exemplar, error) {
+	var ret []exemplar.Exemplar
 
 	ce.lock.RLock()
 	defer ce.lock.RUnlock()
 
-	if idx, ok = ce.index[l.String()]; !ok {
-		return nil, nil
-	}
-
-	e = ce.exemplars[idx.first]
-	for {
-		if e.exemplar.Ts < start {
+	// Checking against all exemplars.
+	for _, idx := range ce.index {
+		e := ce.exemplars[idx.first]
+		for e.exemplar.Ts <= end {
+			if e.exemplar.Ts >= start && matchesSomeMatcherSet(e.seriesLabels, matchers) {
+				ret = append(ret, e.exemplar)
+			}
 			if e.next == -1 {
 				break
 			}
 			e = ce.exemplars[e.next]
-			continue
 		}
-		if e.exemplar.Ts > end {
-			break
-		}
-
-		ret = append(ret, e.exemplar)
-		if e.next == -1 {
-			break
-		}
-		e = ce.exemplars[e.next]
 	}
+
 	return ret, nil
+}
+
+func matchesSomeMatcherSet(lbls labels.Labels, matchers [][]labels.Matcher) bool {
+Outer:
+	for _, ms := range matchers {
+		for _, m := range ms {
+			if !m.Matches(lbls.Get(m.Name)) {
+				continue Outer
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // indexGc takes the circularBufferEntry that will be overwritten and updates the
@@ -209,7 +208,7 @@ func (noopExemplarStorage) ExemplarAppender() storage.ExemplarAppender {
 
 type noopExemplarQuerier struct{}
 
-func (noopExemplarQuerier) Select(_, _ int64, _ labels.Labels) ([]exemplar.Exemplar, error) {
+func (noopExemplarQuerier) Select(_, _ int64, _ ...[]labels.Matcher) ([]exemplar.Exemplar, error) {
 	return nil, nil
 }
 

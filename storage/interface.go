@@ -127,8 +127,9 @@ type ExemplarQueryable interface {
 
 // Querier provides reading access to time series data.
 type ExemplarQuerier interface {
-	// Select returns a set of exemplars that have the given labels for the series they are associated with.
-	Select(start, end int64, l labels.Labels) ([]exemplar.Exemplar, error)
+	// Select all the exemplars that match the matchers.
+	// Within a single slice of matchers, it is an intersection. Between the slices, it is a union.
+	Select(start, end int64, matchers ...[]labels.Matcher) ([]exemplar.Exemplar, error)
 }
 
 // SelectHints specifies hints passed for data selections.
