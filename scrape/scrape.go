@@ -1323,6 +1323,7 @@ loop:
 					e.Ts = t
 				}
 				exemplarErr := app.AddExemplarFast(ce.ref, e)
+				// todo: add a checkAddExemplarError here
 				if exemplarErr == storage.ErrNotFound {
 					ok = false
 				}
@@ -1373,6 +1374,8 @@ loop:
 					e.Ts = t
 				}
 				if exemplarErr := app.AddExemplar(lset, e); exemplarErr != nil {
+					// todo: log the error after calling checkAddExemplarError
+					// maybe don't break, since exemplars are still experimental
 					break loop
 				}
 			}

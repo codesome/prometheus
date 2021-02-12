@@ -24,9 +24,9 @@ range vector selectors, and subqueries. More details can be found [here](queryin
 
 The remote write receiver allows Prometheus to accept remote write requests from other Prometheus servers. More details can be found [here](storage.md#overview).
 
-## In Memory Exemplar Storage
+## In-memory Exemplar Storage
 
 `--enable-feature=exemplar-storage`
 
-This stores the exemplars exposed via OpenMetrics format into a circular queue in the memory. Use `--storage.exemplars.exemplars-limit` to set the limit on number of exemplars.
+This feature stores the exemplars exposed via [OpenMetrics format](https://github.com/OpenObservability/OpenMetrics/blob/master/specification/OpenMetrics.md#exemplars-1) into a circular queue in the memory. Use `--storage.exemplars.exemplars-limit` to set the limit on number of exemplars.
 More details on querying exemplars can be found [here](querying/api.md#querying-exemplars).

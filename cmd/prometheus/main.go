@@ -478,7 +478,6 @@ func main() {
 	cfg.web.TSDBDir = cfg.localStoragePath
 	cfg.web.LocalStorage = localStorage
 	cfg.web.Storage = fanoutStorage
-	// todo: clean up exemplar interfaces and connection of exemplar storage to web api
 	cfg.web.ExemplarStorage = localStorage
 	cfg.web.QueryEngine = queryEngine
 	cfg.web.ScrapeManager = scrapeManager

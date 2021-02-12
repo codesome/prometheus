@@ -123,7 +123,7 @@ type LabelQuerier interface {
 }
 
 type ExemplarQueryable interface {
-	// Querier returns a new ExemplarQuerier on the storage.
+	// ExemplarQuerier returns a new ExemplarQuerier on the storage.
 	ExemplarQuerier(ctx context.Context) (ExemplarQuerier, error)
 }
 
