@@ -316,20 +316,16 @@ func Walk(v Visitor, node Node, path []Node) error {
 	return err
 }
 
-func ExtractSelectors(node Node) ([][]*labels.Matcher, error) {
+func ExtractSelectors(expr Expr) [][]*labels.Matcher {
 	var selectors [][]*labels.Matcher
-
-	visitor := func(node Node, nArr []Node) error {
-		switch n := node.(type) {
-		case *MatrixSelector:
-			selectors = append(selectors, n.VectorSelector.(*VectorSelector).LabelMatchers)
-		case *VectorSelector:
-			selectors = append(selectors, n.LabelMatchers)
+	Inspect(expr, func(node Node, _ []Node) error {
+		vs, ok := node.(*VectorSelector)
+		if ok {
+			selectors = append(selectors, vs.LabelMatchers)
 		}
 		return nil
-	}
-	err := Walk(inspector(visitor), node, nil)
-	return selectors, err
+	})
+	return selectors
 }
 
 type inspector func(Node, []Node) error

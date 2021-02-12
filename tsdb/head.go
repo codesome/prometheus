@@ -140,6 +140,7 @@ type headMetrics struct {
 	samplesAppended          prometheus.Counter
 	outOfBoundSamples        prometheus.Counter
 	outOfOrderSamples        prometheus.Counter
+	outOfOrderExemplars      prometheus.Counter
 	walTruncateDuration      prometheus.Summary
 	walCorruptionsTotal      prometheus.Counter
 	walTotalReplayDuration   prometheus.Gauge
@@ -216,6 +217,10 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 			Name: "prometheus_tsdb_out_of_order_samples_total",
 			Help: "Total number of out of order samples ingestion failed attempts.",
 		}),
+		outOfOrderExemplars: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "prometheus_tsdb_out_of_order_exemplars_total",
+			Help: "Total number of out of order exemplars ingestion failed attempts.",
+		}),
 		headTruncateFail: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "prometheus_tsdb_head_truncations_failed_total",
 			Help: "Total number of head truncations that failed.",
@@ -263,6 +268,7 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 			m.samplesAppended,
 			m.outOfBoundSamples,
 			m.outOfOrderSamples,
+			m.outOfOrderExemplars,
 			m.headTruncateFail,
 			m.headTruncateTotal,
 			m.checkpointDeleteFail,
@@ -1337,6 +1343,8 @@ func (a *headAppender) AddExemplarFast(ref uint64, e exemplar.Exemplar) error {
 		return storage.ErrNotFound
 	}
 
+	// TODO: check for out of order in future PR.
+
 	a.exemplars = append(a.exemplars, exemplarWithSeriesRef{ref, e})
 	return nil
 }
@@ -1385,9 +1393,11 @@ func (a *headAppender) Commit() (err error) {
 	// No errors logging to WAL, so pass the exemplars along to the in memory storage.
 	for _, e := range a.exemplars {
 		s := a.head.series.getByID(e.ref)
-		if err := a.exemplarAppender.AddExemplar(s.lset, e.exemplar); err != nil {
-			// todo: do we want to error out here?
-			return errors.Wrap(err, "adding exemplars")
+		err := a.exemplarAppender.AddExemplar(s.lset, e.exemplar)
+		if err == storage.ErrOutOfOrderExemplar {
+			a.head.metrics.outOfOrderExemplars.Inc()
+		} else if err != nil {
+			level.Debug(a.head.logger).Log("msg", "Unknown error while adding exemplar", "err", err)
 		}
 	}
 

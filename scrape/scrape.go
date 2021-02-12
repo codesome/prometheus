@@ -164,6 +164,12 @@ var (
 			Help: "How many times a scrape cache was flushed due to getting big while scrapes are failing.",
 		},
 	)
+	targetScrapeExemplarOutOfOrder = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "prometheus_target_scrapes_exemplar_out_of_order_total",
+			Help: "Total number of exemplar rejected due to not being out of the expected order",
+		},
+	)
 )
 
 func init() {
@@ -185,6 +191,7 @@ func init() {
 		targetScrapePoolTargetsAdded,
 		targetScrapeCacheFlushForced,
 		targetMetadataCache,
+		targetScrapeExemplarOutOfOrder,
 	)
 }
 
@@ -1244,9 +1251,10 @@ func (sl *scrapeLoop) getCache() *scrapeCache {
 }
 
 type appendErrors struct {
-	numOutOfOrder  int
-	numDuplicates  int
-	numOutOfBounds int
+	numOutOfOrder         int
+	numDuplicates         int
+	numOutOfBounds        int
+	numExemplarOutOfOrder int
 }
 
 func (sl *scrapeLoop) append(app storage.Appender, b []byte, contentType string, ts time.Time) (total, added, seriesAdded int, err error) {
@@ -1323,9 +1331,12 @@ loop:
 					e.Ts = t
 				}
 				exemplarErr := app.AddExemplarFast(ce.ref, e)
-				// todo: add a checkAddExemplarError here
+				exemplarErr = sl.checkAddExemplarError(exemplarErr, e, &appErrs)
 				if exemplarErr == storage.ErrNotFound {
 					ok = false
+				} else if exemplarErr != nil {
+					// Since exemplar storage is still experimental, we don't fail the scrape on ingestion errors.
+					level.Debug(sl.l).Log("msg", "Error while adding exemplar in AddExemplar", "exemplar", e, "err", err)
 				}
 			}
 		}
@@ -1373,10 +1384,11 @@ loop:
 				if !e.HasTs {
 					e.Ts = t
 				}
-				if exemplarErr := app.AddExemplar(lset, e); exemplarErr != nil {
-					// todo: log the error after calling checkAddExemplarError
-					// maybe don't break, since exemplars are still experimental
-					break loop
+				exemplarErr := app.AddExemplar(lset, e)
+				exemplarErr = sl.checkAddExemplarError(exemplarErr, e, &appErrs)
+				if exemplarErr != nil {
+					// Since exemplar storage is still experimental, we don't fail the scrape on ingestion errors.
+					level.Debug(sl.l).Log("msg", "Error while adding exemplar in AddExemplar", "exemplar", e, "err", err)
 				}
 			}
 		}
@@ -1401,6 +1413,9 @@ loop:
 	}
 	if appErrs.numOutOfBounds > 0 {
 		level.Warn(sl.l).Log("msg", "Error on ingesting samples that are too old or are too far into the future", "num_dropped", appErrs.numOutOfBounds)
+	}
+	if appErrs.numExemplarOutOfOrder > 0 {
+		level.Warn(sl.l).Log("msg", "Error on ingesting out-of-order exemplars", "num_dropped", appErrs.numExemplarOutOfOrder)
 	}
 	if err == nil {
 		sl.cache.forEachStale(func(lset labels.Labels) bool {
@@ -1456,6 +1471,20 @@ func (sl *scrapeLoop) checkAddError(ce *cacheEntry, met []byte, tp *int64, err e
 		return false, nil
 	default:
 		return false, err
+	}
+}
+
+func (sl *scrapeLoop) checkAddExemplarError(err error, e exemplar.Exemplar, appErrs *appendErrors) error {
+	switch errors.Cause(err) {
+	case storage.ErrNotFound:
+		return storage.ErrNotFound
+	case storage.ErrOutOfOrderExemplar:
+		appErrs.numExemplarOutOfOrder++
+		level.Debug(sl.l).Log("msg", "Out of order exemplar", "exemplar", e)
+		targetScrapeExemplarOutOfOrder.Inc()
+		return nil
+	default:
+		return err
 	}
 }
 

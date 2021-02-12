@@ -3356,16 +3356,16 @@ func TestExtractSelectors(t *testing.T) {
 		{
 			"foo",
 			[]string{`{__name__="foo"}`},
-		},
-		{
+		}, {
 			`foo{bar="baz"}`,
 			[]string{`{bar="baz", __name__="foo"}`},
-		},
-		{
+		}, {
 			`foo{bar="baz"} / flip{flop="flap"}`,
 			[]string{`{bar="baz", __name__="foo"}`, `{flop="flap", __name__="flip"}`},
-		},
-		{
+		}, {
+			`rate(foo[5m])`,
+			[]string{`{__name__="foo"}`},
+		}, {
 			`vector(1)`,
 			[]string{},
 		},
@@ -3377,12 +3377,9 @@ func TestExtractSelectors(t *testing.T) {
 		for _, s := range tc.expected {
 			selector, err := ParseMetricSelector(s)
 			require.NoError(t, err)
-
 			expected = append(expected, selector)
 		}
 
-		actual, err := ExtractSelectors(expr)
-		require.NoError(t, err)
-		require.Equal(t, expected, actual)
+		require.Equal(t, expected, ExtractSelectors(expr))
 	}
 }

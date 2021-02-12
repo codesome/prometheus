@@ -507,10 +507,7 @@ func (api *API) queryExemplars(r *http.Request) apiFuncResult {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 
-	selectors, err := parser.ExtractSelectors(expr)
-	if err != nil {
-		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
-	}
+	selectors := parser.ExtractSelectors(expr)
 	if len(selectors) < 1 {
 		return apiFuncResult{nil, nil, nil, nil}
 	}
