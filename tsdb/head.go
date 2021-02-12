@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -46,6 +47,9 @@ var (
 	// ErrInvalidSample is returned if an appended sample is not valid and can't
 	// be ingested.
 	ErrInvalidSample = errors.New("invalid sample")
+	// ErrInvalidExemplar is returned if an appended exemplar is not valid and can't
+	// be ingested.
+	ErrInvalidExemplar = errors.New("invalid exemplar")
 	// ErrAppenderClosed is returned if an appender has already be successfully
 	// rolled back or committed.
 	ErrAppenderClosed = errors.New("appender closed")
@@ -60,14 +64,16 @@ type Head struct {
 	lastWALTruncationTime atomic.Int64
 	lastSeriesID          atomic.Uint64
 
-	metrics      *headMetrics
-	opts         *HeadOptions
-	wal          *wal.WAL
-	logger       log.Logger
-	appendPool   sync.Pool
-	seriesPool   sync.Pool
-	bytesPool    sync.Pool
-	memChunkPool sync.Pool
+	metrics       *headMetrics
+	opts          *HeadOptions
+	wal           *wal.WAL
+	exemplars     storage.ExemplarStorage
+	logger        log.Logger
+	appendPool    sync.Pool
+	exemplarsPool sync.Pool
+	seriesPool    sync.Pool
+	bytesPool     sync.Pool
+	memChunkPool  sync.Pool
 
 	// All series addressable by their ID or hash.
 	series *stripeSeries
@@ -107,6 +113,7 @@ type HeadOptions struct {
 	// A smaller StripeSize reduces the memory allocated, but can decrease performance with large number of series.
 	StripeSize     int
 	SeriesCallback SeriesLifecycleCallback
+	NumExemplars   int
 }
 
 func DefaultHeadOptions() *HeadOptions {
@@ -133,6 +140,7 @@ type headMetrics struct {
 	samplesAppended          prometheus.Counter
 	outOfBoundSamples        prometheus.Counter
 	outOfOrderSamples        prometheus.Counter
+	outOfOrderExemplars      prometheus.Counter
 	walTruncateDuration      prometheus.Summary
 	walCorruptionsTotal      prometheus.Counter
 	walTotalReplayDuration   prometheus.Gauge
@@ -209,6 +217,10 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 			Name: "prometheus_tsdb_out_of_order_samples_total",
 			Help: "Total number of out of order samples ingestion failed attempts.",
 		}),
+		outOfOrderExemplars: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "prometheus_tsdb_out_of_order_exemplars_total",
+			Help: "Total number of out of order exemplars ingestion failed attempts.",
+		}),
 		headTruncateFail: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "prometheus_tsdb_head_truncations_failed_total",
 			Help: "Total number of head truncations that failed.",
@@ -256,6 +268,7 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 			m.samplesAppended,
 			m.outOfBoundSamples,
 			m.outOfOrderSamples,
+			m.outOfOrderExemplars,
 			m.headTruncateFail,
 			m.headTruncateTotal,
 			m.checkpointDeleteFail,
@@ -325,10 +338,17 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, opts *HeadOpti
 	if opts.SeriesCallback == nil {
 		opts.SeriesCallback = &noopSeriesLifecycleCallback{}
 	}
+
+	es, err := NewCircularExemplarStorage(opts.NumExemplars, r)
+	if err != nil {
+		return nil, err
+	}
+
 	h := &Head{
 		wal:        wal,
 		logger:     l,
 		opts:       opts,
+		exemplars:  es,
 		series:     newStripeSeries(opts.StripeSize, opts.SeriesCallback),
 		symbols:    map[string]struct{}{},
 		postings:   index.NewUnorderedMemPostings(),
@@ -351,7 +371,6 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, opts *HeadOpti
 		opts.ChunkPool = chunkenc.NewPool()
 	}
 
-	var err error
 	h.chunkDiskMapper, err = chunks.NewChunkDiskMapper(
 		mmappedChunksDir(opts.ChunkDirRoot),
 		opts.ChunkPool,
@@ -365,6 +384,14 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, opts *HeadOpti
 }
 
 func mmappedChunksDir(dir string) string { return filepath.Join(dir, "chunks_head") }
+
+func (h *Head) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	return h.exemplars.ExemplarQuerier(ctx)
+}
+
+func (h *Head) ExemplarStorage() storage.ExemplarStorage {
+	return h.exemplars
+}
 
 // processWALSamples adds a partition of samples it receives to the head and passes
 // them on to other workers.
@@ -1064,6 +1091,25 @@ func (a *initAppender) AddFast(ref uint64, t int64, v float64) error {
 	return a.app.AddFast(ref, t, v)
 }
 
+func (a *initAppender) AddExemplar(l labels.Labels, e exemplar.Exemplar) error {
+	if a.app != nil {
+		return a.app.AddExemplar(l, e)
+	}
+	// We should never reach here given we would call Add before AddExemplar
+	// and we probably want to always base head/WAL min time on sample times.
+	a.head.initTime(e.Ts)
+	a.app = a.head.appender()
+
+	return a.app.AddExemplar(l, e)
+}
+
+func (a *initAppender) AddExemplarFast(ref uint64, e exemplar.Exemplar) error {
+	if a.app == nil {
+		return storage.ErrNotFound
+	}
+	return a.app.AddExemplarFast(ref, e)
+}
+
 func (a *initAppender) Commit() error {
 	if a.app == nil {
 		return nil
@@ -1103,8 +1149,10 @@ func (h *Head) appender() *headAppender {
 		maxt:                  math.MinInt64,
 		samples:               h.getAppendBuffer(),
 		sampleSeries:          h.getSeriesBuffer(),
+		exemplars:             h.getExemplarBuffer(),
 		appendID:              appendID,
 		cleanupAppendIDsBelow: cleanupAppendIDsBelow,
+		exemplarAppender:      h.exemplars.ExemplarAppender(),
 	}
 }
 
@@ -1134,6 +1182,19 @@ func (h *Head) putAppendBuffer(b []record.RefSample) {
 	h.appendPool.Put(b[:0])
 }
 
+func (h *Head) getExemplarBuffer() []exemplarWithSeriesRef {
+	b := h.exemplarsPool.Get()
+	if b == nil {
+		return make([]exemplarWithSeriesRef, 0, 512)
+	}
+	return b.([]exemplarWithSeriesRef)
+}
+
+func (h *Head) putExemplarBuffer(b []exemplarWithSeriesRef) {
+	//nolint:staticcheck // Ignore SA6002 safe to ignore and actually fixing it has some performance penalty.
+	h.exemplarsPool.Put(b[:0])
+}
+
 func (h *Head) getSeriesBuffer() []*memSeries {
 	b := h.seriesPool.Get()
 	if b == nil {
@@ -1160,13 +1221,20 @@ func (h *Head) putBytesBuffer(b []byte) {
 	h.bytesPool.Put(b[:0])
 }
 
+type exemplarWithSeriesRef struct {
+	ref      uint64
+	exemplar exemplar.Exemplar
+}
+
 type headAppender struct {
-	head         *Head
-	minValidTime int64 // No samples below this timestamp are allowed.
-	mint, maxt   int64
+	head             *Head
+	minValidTime     int64 // No samples below this timestamp are allowed.
+	mint, maxt       int64
+	exemplarAppender storage.ExemplarAppender
 
 	series       []record.RefSeries
 	samples      []record.RefSample
+	exemplars    []exemplarWithSeriesRef
 	sampleSeries []*memSeries
 
 	appendID, cleanupAppendIDsBelow uint64
@@ -1241,6 +1309,46 @@ func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
 	return nil
 }
 
+func (a *headAppender) AddExemplar(lset labels.Labels, e exemplar.Exemplar) error {
+	// Ensure no empty labels have gotten through.
+	lset = lset.WithoutEmpty()
+
+	if len(lset) == 0 {
+		return errors.Wrap(ErrInvalidExemplar, "empty labelset")
+	}
+
+	if l, dup := lset.HasDuplicateLabelNames(); dup {
+		return errors.Wrap(ErrInvalidExemplar, fmt.Sprintf(`label name "%s" is not unique`, l))
+	}
+
+	s, created, err := a.head.getOrCreate(lset.Hash(), lset)
+	if err != nil {
+		return err
+	}
+
+	// In theory the series should never be created as a result of an AddExemplar call.
+	if created {
+		level.Warn(a.head.logger).Log("msg", "Series was created in AddExemplar, this should never happen")
+		a.series = append(a.series, record.RefSeries{
+			Ref:    s.ref,
+			Labels: lset,
+		})
+	}
+	return a.AddExemplarFast(s.ref, e)
+}
+
+func (a *headAppender) AddExemplarFast(ref uint64, e exemplar.Exemplar) error {
+	s := a.head.series.getByID(ref)
+	if s == nil {
+		return storage.ErrNotFound
+	}
+
+	// TODO: check for out of order in future PR.
+
+	a.exemplars = append(a.exemplars, exemplarWithSeriesRef{ref, e})
+	return nil
+}
+
 func (a *headAppender) log() error {
 	if a.head.wal == nil {
 		return nil
@@ -1282,9 +1390,21 @@ func (a *headAppender) Commit() (err error) {
 		return errors.Wrap(err, "write to WAL")
 	}
 
+	// No errors logging to WAL, so pass the exemplars along to the in memory storage.
+	for _, e := range a.exemplars {
+		s := a.head.series.getByID(e.ref)
+		err := a.exemplarAppender.AddExemplar(s.lset, e.exemplar)
+		if err == storage.ErrOutOfOrderExemplar {
+			a.head.metrics.outOfOrderExemplars.Inc()
+		} else if err != nil {
+			level.Debug(a.head.logger).Log("msg", "Unknown error while adding exemplar", "err", err)
+		}
+	}
+
 	defer a.head.metrics.activeAppenders.Dec()
 	defer a.head.putAppendBuffer(a.samples)
 	defer a.head.putSeriesBuffer(a.sampleSeries)
+	defer a.head.putExemplarBuffer(a.exemplars)
 	defer a.head.iso.closeAppend(a.appendID)
 
 	total := len(a.samples)

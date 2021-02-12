@@ -108,6 +108,11 @@ func (t *Test) TSDB() *tsdb.DB {
 	return t.storage.DB
 }
 
+// ExemplarStorage returns the test's exemplar storage.
+func (t *Test) ExemplarStorage() storage.ExemplarStorage {
+	return t.storage.DB.Head().ExemplarStorage()
+}
+
 func raise(line int, format string, v ...interface{}) error {
 	return &parser.ParseErr{
 		LineOffset: line,

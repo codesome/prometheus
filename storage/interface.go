@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -28,6 +29,7 @@ var (
 	ErrOutOfOrderSample            = errors.New("out of order sample")
 	ErrDuplicateSampleForTimestamp = errors.New("duplicate sample for timestamp")
 	ErrOutOfBounds                 = errors.New("out of bounds")
+	ErrOutOfOrderExemplar          = errors.New("out of order exemplar")
 )
 
 // Appendable allows creating appenders.
@@ -44,8 +46,14 @@ type SampleAndChunkQueryable interface {
 	ChunkQueryable
 }
 
+// ExemplarAppendable allows creating exemplar appenders.
+type ExemplarAppendable interface {
+	// Appender returns a new exemplar appender for the exemplar storage.
+	ExemplarAppender() ExemplarAppender
+}
+
 // Storage ingests and manages samples, along with various indexes. All methods
-// are goroutine-safe. Storage implements storage.SampleAppender.
+// are goroutine-safe. Storage implements storage.Appender.
 type Storage interface {
 	SampleAndChunkQueryable
 	Appendable
@@ -55,6 +63,13 @@ type Storage interface {
 
 	// Close closes the storage and all its underlying resources.
 	Close() error
+}
+
+// ExemplarStorage ingests and manages exemplars, along with various indexes. All methods are
+// goroutine-safe. ExemplarStorage implements storage.ExemplarAppender and storage.ExemplarQuerier.
+type ExemplarStorage interface {
+	ExemplarQueryable
+	ExemplarAppendable
 }
 
 // A Queryable handles queries against a storage.
@@ -107,6 +122,18 @@ type LabelQuerier interface {
 	Close() error
 }
 
+type ExemplarQueryable interface {
+	// ExemplarQuerier returns a new ExemplarQuerier on the storage.
+	ExemplarQuerier(ctx context.Context) (ExemplarQuerier, error)
+}
+
+// Querier provides reading access to time series data.
+type ExemplarQuerier interface {
+	// Select all the exemplars that match the matchers.
+	// Within a single slice of matchers, it is an intersection. Between the slices, it is a union.
+	Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error)
+}
+
 // SelectHints specifies hints passed for data selections.
 // This is used only as an option for implementation to use.
 type SelectHints struct {
@@ -149,6 +176,13 @@ type Appender interface {
 	// faster than adding a sample by providing its full label set.
 	AddFast(ref uint64, t int64, v float64) error
 
+	// AddExemplar adds an exemplar for the given series labels.
+	AddExemplar(l labels.Labels, e exemplar.Exemplar) error
+
+	// AddExemplarFast adds an exemplar for the referenced series. It is generally
+	// faster than adding a exemplar by providing its full series label set.
+	AddExemplarFast(ref uint64, e exemplar.Exemplar) error
+
 	// Commit submits the collected samples and purges the batch. If Commit
 	// returns a non-nil error, it also rolls back all modifications made in
 	// the appender so far, as Rollback would do. In any case, an Appender
@@ -158,6 +192,13 @@ type Appender interface {
 	// Rollback rolls back all modifications made in the appender so far.
 	// Appender has to be discarded after rollback.
 	Rollback() error
+}
+
+// ExemplarAppender provides an interface for adding samples to exemplar storage, which
+// within Prometheus is in-memory only.
+type ExemplarAppender interface {
+	// Add adds an exemplar to the for the given series labels.
+	AddExemplar(l labels.Labels, e exemplar.Exemplar) error
 }
 
 // SeriesSet contains a set of series.

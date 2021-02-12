@@ -44,6 +44,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/gate"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
@@ -309,6 +310,56 @@ func TestEndpoints(t *testing.T) {
 			test_metric4{foo="boo", dup="1"} 1+0x100
 			test_metric4{foo="boo"} 1+0x100
 	`)
+
+	start := time.Unix(0, 0)
+	exemplars := []exemplar.QueryResult{
+		{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
+				{
+					Labels: labels.FromStrings("id", "abc"),
+					Value:  10,
+					Ts:     timestamp.FromTime(start.Add(2 * time.Second)),
+				},
+			},
+		},
+		{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
+				{
+					Labels: labels.FromStrings("id", "lul"),
+					Value:  10,
+					Ts:     timestamp.FromTime(start.Add(4 * time.Second)),
+				},
+			},
+		},
+		{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
+				{
+					Labels: labels.FromStrings("id", "abc2"),
+					Value:  10,
+					Ts:     timestamp.FromTime(start.Add(4053 * time.Millisecond)),
+				},
+			},
+		},
+		{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
+				{
+					Labels: labels.FromStrings("id", "lul2"),
+					Value:  10,
+					Ts:     timestamp.FromTime(start.Add(4153 * time.Millisecond)),
+				},
+			},
+		},
+	}
+
+	for _, ed := range exemplars {
+		suite.ExemplarStorage().ExemplarAppender().AddExemplar(ed.SeriesLabels, ed.Exemplars[0])
+		require.NoError(t, err, "failed to add exemplar: %+v", ed.Exemplars[0])
+	}
+
 	require.NoError(t, err)
 	defer suite.Close()
 
@@ -329,6 +380,7 @@ func TestEndpoints(t *testing.T) {
 		api := &API{
 			Queryable:             suite.Storage(),
 			QueryEngine:           suite.QueryEngine(),
+			ExemplarQueryable:     suite.ExemplarStorage(),
 			targetRetriever:       testTargetRetriever.toFactory(),
 			alertmanagerRetriever: testAlertmanagerRetriever{}.toFactory(),
 			flagsMap:              sampleFlagMap,
@@ -337,8 +389,7 @@ func TestEndpoints(t *testing.T) {
 			ready:                 func(f http.HandlerFunc) http.HandlerFunc { return f },
 			rulesRetriever:        algr.toFactory(),
 		}
-
-		testEndpoints(t, api, testTargetRetriever, true)
+		testEndpoints(t, api, testTargetRetriever, suite.ExemplarStorage(), true)
 	})
 
 	// Run all the API tests against a API that is wired to forward queries via
@@ -393,6 +444,7 @@ func TestEndpoints(t *testing.T) {
 		api := &API{
 			Queryable:             remote,
 			QueryEngine:           suite.QueryEngine(),
+			ExemplarQueryable:     suite.ExemplarStorage(),
 			targetRetriever:       testTargetRetriever.toFactory(),
 			alertmanagerRetriever: testAlertmanagerRetriever{}.toFactory(),
 			flagsMap:              sampleFlagMap,
@@ -402,7 +454,7 @@ func TestEndpoints(t *testing.T) {
 			rulesRetriever:        algr.toFactory(),
 		}
 
-		testEndpoints(t, api, testTargetRetriever, false)
+		testEndpoints(t, api, testTargetRetriever, suite.ExemplarStorage(), false)
 	})
 
 }
@@ -540,7 +592,7 @@ func setupRemote(s storage.Storage) *httptest.Server {
 	return httptest.NewServer(handler)
 }
 
-func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI bool) {
+func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.ExemplarStorage, testLabelAPI bool) {
 	start := time.Unix(0, 0)
 
 	type targetMetadata struct {
@@ -557,6 +609,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 		errType     errorType
 		sorter      func(interface{})
 		metadata    []targetMetadata
+		exemplars   []exemplar.QueryResult
 	}
 
 	var tests = []test{
@@ -1463,6 +1516,59 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 				},
 			},
 		},
+		{
+			endpoint: api.queryExemplars,
+			query: url.Values{
+				"query": []string{`test_metric3{foo="boo"} - test_metric4{foo="bar"}`},
+				"start": []string{"0"},
+				"end":   []string{"4"},
+			},
+			// Note extra integer length of timestamps for exemplars because of millisecond preservation
+			// of timestamps within Prometheus (see timestamp package).
+
+			response: []exemplar.QueryResult{
+				{
+					SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+					Exemplars: []exemplar.Exemplar{
+						{
+							Labels: labels.FromStrings("id", "abc"),
+							Value:  10,
+							Ts:     timestamp.FromTime(start.Add(2 * time.Second)),
+						},
+					},
+				},
+				{
+					SeriesLabels: labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
+					Exemplars: []exemplar.Exemplar{
+						{
+							Labels: labels.FromStrings("id", "lul"),
+							Value:  10,
+							Ts:     timestamp.FromTime(start.Add(4 * time.Second)),
+						},
+					},
+				},
+			},
+		},
+		{
+			endpoint: api.queryExemplars,
+			query: url.Values{
+				"query": []string{`{foo="boo"}`},
+				"start": []string{"4"},
+				"end":   []string{"4.1"},
+			},
+			response: []exemplar.QueryResult{
+				{
+					SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+					Exemplars: []exemplar.Exemplar{
+						{
+							Labels: labels.FromStrings("id", "abc2"),
+							Value:  10,
+							Ts:     4053,
+						},
+					},
+				},
+			},
+		},
 	}
 
 	if testLabelAPI {
@@ -1893,6 +1999,15 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 					tr.ResetMetadataStore()
 					for _, tm := range test.metadata {
 						tr.SetMetadataStoreForTargets(tm.identifier, &testMetaStore{Metadata: tm.metadata})
+					}
+
+					for _, te := range test.exemplars {
+						for _, e := range te.Exemplars {
+							err := es.ExemplarAppender().AddExemplar(te.SeriesLabels, e)
+							if err != nil {
+								t.Fatal(err)
+							}
+						}
 					}
 
 					res := test.endpoint(req.WithContext(ctx))
@@ -2821,6 +2936,36 @@ func TestRespond(t *testing.T) {
 		{
 			response: promql.Point{V: 1.2345678e-67, T: 0},
 			expected: `{"status":"success","data":[0,"1.2345678e-67"]}`,
+		},
+		{
+			response: []exemplar.QueryResult{
+				{
+					SeriesLabels: labels.FromStrings("foo", "bar"),
+					Exemplars: []exemplar.Exemplar{
+						{
+							Labels: labels.FromStrings("traceID", "abc"),
+							Value:  100.123,
+							Ts:     1234,
+						},
+					},
+				},
+			},
+			expected: `{"status":"success","data":[{"seriesLabels":{"foo":"bar"},"exemplars":[{"labels":{"traceID":"abc"},"value":"100.123","timestamp":1.234}]}]}`,
+		},
+		{
+			response: []exemplar.QueryResult{
+				{
+					SeriesLabels: labels.FromStrings("foo", "bar"),
+					Exemplars: []exemplar.Exemplar{
+						{
+							Labels: labels.FromStrings("traceID", "abc"),
+							Value:  math.Inf(1),
+							Ts:     1234,
+						},
+					},
+				},
+			},
+			expected: `{"status":"success","data":[{"seriesLabels":{"foo":"bar"},"exemplars":[{"labels":{"traceID":"abc"},"value":"+Inf","timestamp":1.234}]}]}`,
 		},
 	}
 

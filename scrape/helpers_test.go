@@ -16,6 +16,7 @@ package scrape
 import (
 	"context"
 
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 )
@@ -28,10 +29,12 @@ func (a nopAppendable) Appender(_ context.Context) storage.Appender {
 
 type nopAppender struct{}
 
-func (a nopAppender) Add(labels.Labels, int64, float64) (uint64, error) { return 0, nil }
-func (a nopAppender) AddFast(uint64, int64, float64) error              { return nil }
-func (a nopAppender) Commit() error                                     { return nil }
-func (a nopAppender) Rollback() error                                   { return nil }
+func (a nopAppender) Add(labels.Labels, int64, float64) (uint64, error)  { return 0, nil }
+func (a nopAppender) AddFast(uint64, int64, float64) error               { return nil }
+func (a nopAppender) AddExemplar(labels.Labels, exemplar.Exemplar) error { return nil }
+func (a nopAppender) AddExemplarFast(uint64, exemplar.Exemplar) error    { return nil }
+func (a nopAppender) Commit() error                                      { return nil }
+func (a nopAppender) Rollback() error                                    { return nil }
 
 type sample struct {
 	metric labels.Labels
@@ -46,6 +49,8 @@ type collectResultAppender struct {
 	result           []sample
 	pendingResult    []sample
 	rolledbackResult []sample
+	pendingExemplars []exemplar.Exemplar
+	resultExemplars  []exemplar.Exemplar
 
 	mapper map[uint64]labels.Labels
 }
@@ -89,9 +94,29 @@ func (a *collectResultAppender) Add(m labels.Labels, t int64, v float64) (uint64
 	return ref, nil
 }
 
+func (a *collectResultAppender) AddExemplar(l labels.Labels, e exemplar.Exemplar) error {
+	a.pendingExemplars = append(a.pendingExemplars, e)
+	if a.next == nil {
+		return nil
+	}
+
+	return a.next.AddExemplar(l, e)
+}
+
+func (a *collectResultAppender) AddExemplarFast(ref uint64, e exemplar.Exemplar) error {
+	a.pendingExemplars = append(a.pendingExemplars, e)
+	if a.next == nil {
+		return nil
+	}
+
+	return a.next.AddExemplarFast(ref, e)
+}
+
 func (a *collectResultAppender) Commit() error {
 	a.result = append(a.result, a.pendingResult...)
+	a.resultExemplars = append(a.resultExemplars, a.pendingExemplars...)
 	a.pendingResult = nil
+	a.pendingExemplars = nil
 	if a.next == nil {
 		return nil
 	}

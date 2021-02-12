@@ -218,7 +218,6 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 			}
 			stats.TotalTombstones += len(tstones)
 			stats.DroppedTombstones += len(tstones) - len(repl)
-
 		default:
 			// Unknown record type, probably from a future Prometheus version.
 			continue
