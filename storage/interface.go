@@ -131,7 +131,7 @@ type ExemplarQueryable interface {
 type ExemplarQuerier interface {
 	// Select all the exemplars that match the matchers.
 	// Within a single slice of matchers, it is an intersection. Between the slices, it is a union.
-	Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.ExemplarQueryResult, error)
+	Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error)
 }
 
 // SelectHints specifies hints passed for data selections.

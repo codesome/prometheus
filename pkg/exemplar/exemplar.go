@@ -23,7 +23,7 @@ type Exemplar struct {
 	Ts     int64
 }
 
-type ExemplarQueryResult struct {
+type QueryResult struct {
 	SeriesLabels labels.Labels `json:"seriesLabels"`
 	Exemplars    []Exemplar    `json:"exemplars"`
 }

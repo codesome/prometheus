@@ -92,21 +92,16 @@ func (ce *CircularExemplarStorage) Querier(ctx context.Context) (storage.Exempla
 	return ce, nil
 }
 
-type exemplarResult struct {
-	seriesLabels labels.Labels
-	exemplars    []exemplar.Exemplar
-}
-
 // Select returns exemplars for a given set of series labels hash.
-func (ce *CircularExemplarStorage) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.ExemplarQueryResult, error) {
-	var ret []exemplar.ExemplarQueryResult
+func (ce *CircularExemplarStorage) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
+	var ret []exemplar.QueryResult
 
 	ce.lock.RLock()
 	defer ce.lock.RUnlock()
 
 	// Checking against all exemplars.
 	for _, idx := range ce.index {
-		var se exemplar.ExemplarQueryResult
+		var se exemplar.QueryResult
 		e := ce.exemplars[idx.first]
 		se.SeriesLabels = e.seriesLabels
 		for e.exemplar.Ts <= end {
@@ -210,7 +205,7 @@ func (noopExemplarStorage) ExemplarAppender() storage.ExemplarAppender {
 
 type noopExemplarQuerier struct{}
 
-func (noopExemplarQuerier) Select(_, _ int64, _ ...[]*labels.Matcher) ([]exemplar.ExemplarQueryResult, error) {
+func (noopExemplarQuerier) Select(_, _ int64, _ ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
 	return nil, nil
 }
 

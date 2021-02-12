@@ -312,10 +312,10 @@ func TestEndpoints(t *testing.T) {
 	`)
 
 	start := time.Unix(0, 0)
-	exemplars := []exemplar.ExemplarQueryResult{
+	exemplars := []exemplar.QueryResult{
 		{
-			labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
-			[]exemplar.Exemplar{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
 				{
 					Labels: labels.FromStrings("id", "abc"),
 					Value:  10,
@@ -324,8 +324,8 @@ func TestEndpoints(t *testing.T) {
 			},
 		},
 		{
-			labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
-			[]exemplar.Exemplar{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
 				{
 					Labels: labels.FromStrings("id", "lul"),
 					Value:  10,
@@ -334,8 +334,8 @@ func TestEndpoints(t *testing.T) {
 			},
 		},
 		{
-			labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
-			[]exemplar.Exemplar{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
 				{
 					Labels: labels.FromStrings("id", "abc2"),
 					Value:  10,
@@ -344,8 +344,8 @@ func TestEndpoints(t *testing.T) {
 			},
 		},
 		{
-			labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
-			[]exemplar.Exemplar{
+			SeriesLabels: labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
+			Exemplars: []exemplar.Exemplar{
 				{
 					Labels: labels.FromStrings("id", "lul2"),
 					Value:  10,
@@ -609,7 +609,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.E
 		errType     errorType
 		sorter      func(interface{})
 		metadata    []targetMetadata
-		exemplars   []exemplar.ExemplarQueryResult
+		exemplars   []exemplar.QueryResult
 	}
 
 	var tests = []test{
@@ -1526,10 +1526,10 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.E
 			// Note extra integer length of timestamps for exemplars because of millisecond preservation
 			// of timestamps within Prometheus (see timestamp package).
 
-			response: []exemplar.ExemplarQueryResult{
+			response: []exemplar.QueryResult{
 				{
-					labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
-					[]exemplar.Exemplar{
+					SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+					Exemplars: []exemplar.Exemplar{
 						{
 							Labels: labels.FromStrings("id", "abc"),
 							Value:  10,
@@ -1538,8 +1538,8 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.E
 					},
 				},
 				{
-					labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
-					[]exemplar.Exemplar{
+					SeriesLabels: labels.FromStrings("__name__", "test_metric4", "foo", "bar", "dup", "1"),
+					Exemplars: []exemplar.Exemplar{
 						{
 							Labels: labels.FromStrings("id", "lul"),
 							Value:  10,
@@ -1556,10 +1556,10 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.E
 				"start": []string{"4"},
 				"end":   []string{"4.1"},
 			},
-			response: []exemplar.ExemplarQueryResult{
+			response: []exemplar.QueryResult{
 				{
-					labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
-					[]exemplar.Exemplar{
+					SeriesLabels: labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
+					Exemplars: []exemplar.Exemplar{
 						{
 							Labels: labels.FromStrings("id", "abc2"),
 							Value:  10,
@@ -2938,7 +2938,7 @@ func TestRespond(t *testing.T) {
 			expected: `{"status":"success","data":[0,"1.2345678e-67"]}`,
 		},
 		{
-			response: []exemplar.ExemplarQueryResult{
+			response: []exemplar.QueryResult{
 				{
 					SeriesLabels: labels.FromStrings("foo", "bar"),
 					Exemplars: []exemplar.Exemplar{
@@ -2953,7 +2953,7 @@ func TestRespond(t *testing.T) {
 			expected: `{"status":"success","data":[{"seriesLabels":{"foo":"bar"},"exemplars":[{"labels":{"traceID":"abc"},"value":"100.123","timestamp":1.234}]}]}`,
 		},
 		{
-			response: []exemplar.ExemplarQueryResult{
+			response: []exemplar.QueryResult{
 				{
 					SeriesLabels: labels.FromStrings("foo", "bar"),
 					Exemplars: []exemplar.Exemplar{
