@@ -13,9 +13,7 @@
 
 package exemplar
 
-import (
-	"github.com/prometheus/prometheus/pkg/labels"
-)
+import "github.com/prometheus/prometheus/pkg/labels"
 
 // Exemplar is additional information associated with a time series.
 type Exemplar struct {
@@ -25,13 +23,18 @@ type Exemplar struct {
 	Ts     int64
 }
 
+type ExemplarQueryResult struct {
+	SeriesLabels labels.Labels `json:"seriesLabels"`
+	Exemplars    []Exemplar    `json:"exemplars"`
+}
+
 // Equals compares if the exemplar e is the same as e2. Note that if HasTs is false for
 // both exemplars then the timestamps will be ignored for the comparison. This can come up
 // when an exemplar is exported without it's own timestamp, in which case the scrape timestamp
 // is assigned to the Ts field. However we still want to treat the same exemplar, scraped without/
 // an exported timestamp, as a duplicate of itself for each subsequent scrape.
 func (e Exemplar) Equals(e2 Exemplar) bool {
-	if e.Labels.String() != e2.Labels.String() {
+	if !labels.Equal(e.Labels, e2.Labels) {
 		return false
 	}
 
@@ -39,9 +42,5 @@ func (e Exemplar) Equals(e2 Exemplar) bool {
 		return false
 	}
 
-	if e.Value != e2.Value {
-		return false
-	}
-
-	return true
+	return e.Value == e2.Value
 }

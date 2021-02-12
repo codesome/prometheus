@@ -2020,7 +2020,7 @@ func TestHeadExemplars(t *testing.T) {
 	head, _ := newTestHead(t, chunkRange, false)
 	app := head.Appender(context.Background())
 
-	// Its perfectly valid to add Exemplars before the current start time -
+	// It is perfectly valid to add Exemplars before the current start time -
 	// histogram buckets that haven't been update in a while could still be
 	// exported exemplars from an hour ago.
 	ref, err := app.Add(labels.Labels{{Name: "a", Value: "b"}}, 100, 100)

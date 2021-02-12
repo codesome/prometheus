@@ -30,14 +30,12 @@ type exemplarMetrics struct {
 func newExemplarMetrics(r prometheus.Registerer) *exemplarMetrics {
 	m := &exemplarMetrics{
 		outOfOrderExemplars: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "prometheus_exemplar_out_of_order_exemplars_total",
-			Help: "Total number of out of order samples ingestion failed attempts",
+			Name: "prometheus_tsdb_exemplar_out_of_order_exemplars_total",
+			Help: "Total number of out of order exemplar ingestion failed attempts",
 		}),
 	}
 	if r != nil {
-		r.MustRegister(
-			m.outOfOrderExemplars,
-		)
+		r.MustRegister(m.outOfOrderExemplars)
 	}
 	return m
 }
@@ -94,31 +92,41 @@ func (ce *CircularExemplarStorage) Querier(ctx context.Context) (storage.Exempla
 	return ce, nil
 }
 
+type exemplarResult struct {
+	seriesLabels labels.Labels
+	exemplars    []exemplar.Exemplar
+}
+
 // Select returns exemplars for a given set of series labels hash.
-func (ce *CircularExemplarStorage) Select(start, end int64, matchers ...[]labels.Matcher) ([]exemplar.Exemplar, error) {
-	var ret []exemplar.Exemplar
+func (ce *CircularExemplarStorage) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.ExemplarQueryResult, error) {
+	var ret []exemplar.ExemplarQueryResult
 
 	ce.lock.RLock()
 	defer ce.lock.RUnlock()
 
 	// Checking against all exemplars.
 	for _, idx := range ce.index {
+		var se exemplar.ExemplarQueryResult
 		e := ce.exemplars[idx.first]
+		se.SeriesLabels = e.seriesLabels
 		for e.exemplar.Ts <= end {
 			if e.exemplar.Ts >= start && matchesSomeMatcherSet(e.seriesLabels, matchers) {
-				ret = append(ret, e.exemplar)
+				se.Exemplars = append(se.Exemplars, e.exemplar)
 			}
 			if e.next == -1 {
 				break
 			}
 			e = ce.exemplars[e.next]
 		}
+		if len(se.Exemplars) > 0 {
+			ret = append(ret, se)
+		}
 	}
 
 	return ret, nil
 }
 
-func matchesSomeMatcherSet(lbls labels.Labels, matchers [][]labels.Matcher) bool {
+func matchesSomeMatcherSet(lbls labels.Labels, matchers [][]*labels.Matcher) bool {
 Outer:
 	for _, ms := range matchers {
 		for _, m := range ms {
@@ -190,12 +198,6 @@ func (ce *CircularExemplarStorage) AddExemplar(l labels.Labels, e exemplar.Exemp
 	return nil
 }
 
-// For use in tests, clears the entire exemplar storage.
-func (ce *CircularExemplarStorage) Reset() {
-	ce.exemplars = make([]*circularBufferEntry, len(ce.exemplars))
-	ce.index = make(map[string]*indexEntry)
-}
-
 type noopExemplarStorage struct{}
 
 func (noopExemplarStorage) ExemplarQuerier(context.Context) (storage.ExemplarQuerier, error) {
@@ -208,7 +210,7 @@ func (noopExemplarStorage) ExemplarAppender() storage.ExemplarAppender {
 
 type noopExemplarQuerier struct{}
 
-func (noopExemplarQuerier) Select(_, _ int64, _ ...[]labels.Matcher) ([]exemplar.Exemplar, error) {
+func (noopExemplarQuerier) Select(_, _ int64, _ ...[]*labels.Matcher) ([]exemplar.ExemplarQueryResult, error) {
 	return nil, nil
 }
 

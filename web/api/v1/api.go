@@ -143,11 +143,6 @@ type RuntimeInfo struct {
 	StorageRetention    string    `json:"storageRetention"`
 }
 
-type exemplarData struct {
-	SeriesLabels labels.Labels       `json:"seriesLabels"`
-	Exemplars    []exemplar.Exemplar `json:"exemplars"`
-}
-
 type response struct {
 	Status    status      `json:"status"`
 	Data      interface{} `json:"data,omitempty"`
@@ -503,47 +498,13 @@ func (api *API) queryExemplars(r *http.Request) apiFuncResult {
 		return invalidParamError(err, "end")
 	}
 	if end.Before(start) {
-		err := errors.New("end timestamp must not be before start time")
+		err := errors.New("end timestamp must not be before start timestamp")
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 
-	ctx := r.Context()
 	expr, err := parser.ParseExpr(r.FormValue("query"))
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
-	}
-
-	mint, maxt := api.QueryEngine.FindMinMaxTime(&parser.EvalStmt{Expr: expr, Start: start, End: end, Interval: 15 * time.Second})
-
-	queryExemplarsFor := func(selector []*labels.Matcher) ([]exemplarData, *apiError) {
-		q, err := api.Queryable.Querier(ctx, mint, maxt)
-		if err != nil {
-			return nil, &apiError{errorBadData, err}
-		}
-		defer q.Close()
-
-		s := q.Select(false, nil, selector...)
-		eq, err := api.ExemplarQueryable.ExemplarQuerier(ctx)
-		if err != nil {
-			return nil, &apiError{errorBadData, err}
-		}
-
-		var retExemplars []exemplarData
-		for s.Next() {
-			res, err := eq.Select(timestamp.FromTime(start), timestamp.FromTime(end), s.At().Labels())
-			if err != nil {
-				return nil, &apiError{errorBadData, err}
-			}
-			if len(res) == 0 {
-				continue
-			}
-			retExemplars = append(retExemplars, exemplarData{SeriesLabels: s.At().Labels(), Exemplars: res})
-		}
-		if err := s.Err(); err != nil {
-			return nil, &apiError{errorExec, err}
-		}
-
-		return retExemplars, nil
 	}
 
 	selectors, err := parser.ExtractSelectors(expr)
@@ -554,16 +515,11 @@ func (api *API) queryExemplars(r *http.Request) apiFuncResult {
 		return apiFuncResult{nil, nil, nil, nil}
 	}
 
-	var retExemplars []exemplarData
-	for _, selector := range selectors {
-		exemplars, err := queryExemplarsFor(selector)
-		if err != nil {
-			return apiFuncResult{nil, err, nil, nil}
-		}
-		retExemplars = append(retExemplars, exemplars...)
-	}
+	ctx := r.Context()
+	eq, err := api.ExemplarQueryable.ExemplarQuerier(ctx)
+	res, err := eq.Select(timestamp.FromTime(start), timestamp.FromTime(end), selectors...)
 
-	return apiFuncResult{retExemplars, nil, nil, nil}
+	return apiFuncResult{res, nil, nil, nil}
 }
 
 func returnAPIError(err error) *apiError {

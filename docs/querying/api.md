@@ -341,6 +341,7 @@ $ curl http://localhost:9090/api/v1/label/job/values
 ```
 
 ## Querying exemplars
+
 This is **experimental** and might change in the future.
 The following endpoint returns a list of exemplars for a valid PromQL query for a specific time range:
 

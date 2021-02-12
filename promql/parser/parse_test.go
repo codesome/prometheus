@@ -3365,6 +3365,10 @@ func TestExtractSelectors(t *testing.T) {
 			`foo{bar="baz"} / flip{flop="flap"}`,
 			[]string{`{bar="baz", __name__="foo"}`, `{flop="flap", __name__="flip"}`},
 		},
+		{
+			`vector(1)`,
+			[]string{},
+		},
 	} {
 		expr, err := ParseExpr(tc.input)
 		require.NoError(t, err)

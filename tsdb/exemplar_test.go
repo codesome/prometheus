@@ -106,10 +106,13 @@ func TestAddExtraExemplar(t *testing.T) {
 	}
 	require.True(t, (es.exemplars[0].exemplar.Ts == 106), "exemplar was not stored correctly")
 
-	ret, err := es.Select(100, 110, l)
+	m, err := labels.NewMatcher(labels.MatchEqual, l[0].Name, l[0].Value)
+	require.NoError(t, err, "error creating label matcher for exemplar query")
+	ret, err := es.Select(100, 110, []*labels.Matcher{m})
 	require.NoError(t, err)
+	require.True(t, len(ret) == 1, "select should have returned samples for a single series only")
 
-	require.True(t, reflect.DeepEqual(eList[1:], ret), "select did not return expected exemplars\n\texpected: %+v\n\tactual: %+v\n", eList[1:], ret)
+	require.True(t, reflect.DeepEqual(eList[1:], ret[0].Exemplars), "select did not return expected exemplars\n\texpected: %+v\n\tactual: %+v\n", eList[1:], ret[0].Exemplars)
 }
 
 func TestSelectExemplar(t *testing.T) {
@@ -131,14 +134,18 @@ func TestSelectExemplar(t *testing.T) {
 		Ts:    12,
 	}
 
-	es.AddExemplar(l, e)
+	err = es.AddExemplar(l, e)
+	require.NoError(t, err, "adding exemplar failed")
 	require.True(t, reflect.DeepEqual(es.exemplars[0].exemplar, e), "exemplar was not stored correctly")
 
-	exemplars, err := es.Select(0, 100, l)
+	m, err := labels.NewMatcher(labels.MatchEqual, l[0].Name, l[0].Value)
+	require.NoError(t, err, "error creating label matcher for exemplar query")
+	ret, err := es.Select(0, 100, []*labels.Matcher{m})
 	require.NoError(t, err)
+	require.True(t, len(ret) == 1, "select should have returned samples for a single series only")
 
 	expectedResult := []exemplar.Exemplar{e}
-	require.True(t, reflect.DeepEqual(expectedResult, exemplars), "select did not return expected exemplars\n\texpected: %+v\n\tactual: %+v\n", expectedResult, exemplars)
+	require.True(t, reflect.DeepEqual(expectedResult, ret[0].Exemplars), "select did not return expected exemplars\n\texpected: %+v\n\tactual: %+v\n", expectedResult, ret[0].Exemplars)
 }
 
 func TestSelectExemplar_MultiSeries(t *testing.T) {
@@ -183,13 +190,19 @@ func TestSelectExemplar_MultiSeries(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	el, err := es.Select(100, 200, l2)
+	m, err := labels.NewMatcher(labels.MatchEqual, l2[0].Name, l2[0].Value)
+	require.NoError(t, err, "error creating label matcher for exemplar query")
+	ret, err := es.Select(100, 200, []*labels.Matcher{m})
 	require.NoError(t, err)
-	require.True(t, len(el) == 3, "didn't get expected 8 exemplars, got %d", len(el))
+	require.True(t, len(ret) == 1, "select should have returned samples for a single series only")
+	require.True(t, len(ret[0].Exemplars) == 3, "didn't get expected 8 exemplars, got %d", len(ret[0].Exemplars))
 
-	el, err = es.Select(100, 200, l1)
+	m, err = labels.NewMatcher(labels.MatchEqual, l1[0].Name, l1[0].Value)
+	require.NoError(t, err, "error creating label matcher for exemplar query")
+	ret, err = es.Select(100, 200, []*labels.Matcher{m})
 	require.NoError(t, err)
-	require.True(t, len(el) == 2, "didn't get expected 8 exemplars, got %d", len(el))
+	require.True(t, len(ret) == 1, "select should have returned samples for a single series only")
+	require.True(t, len(ret[0].Exemplars) == 2, "didn't get expected 8 exemplars, got %d", len(ret[0].Exemplars))
 }
 
 func TestSelectExemplar_TimeRange(t *testing.T) {
@@ -249,10 +262,54 @@ func TestSelectExemplar_TimeRange(t *testing.T) {
 		require.Equal(t, es.index[l.String()].last, i, "exemplar was not stored correctly")
 	}
 
-	el, err := es.Select(102, 105, l)
+	m, err := labels.NewMatcher(labels.MatchEqual, l[0].Name, l[0].Value)
+	require.NoError(t, err, "error creating label matcher for exemplar query")
+	ret, err := es.Select(102, 105, []*labels.Matcher{m})
 	require.NoError(t, err)
-	require.True(t, len(el) == 2, "didn't get expected one exemplar")
-	require.True(t, reflect.DeepEqual(el, exemplars[1:3]), "returned exemplar did not matched expected\n\tactual: %+v\n\texpected %+v", el, exemplars[1:3])
+	require.True(t, len(ret) == 1, "select should have returned samples for a single series only")
+	require.True(t, len(ret[0].Exemplars) == 2, "didn't get expected two exemplars ", len(ret), ret)
+	require.True(t, reflect.DeepEqual(ret[0].Exemplars, exemplars[1:3]), "returned exemplar did not matched expected\n\tactual: %+v\n\texpected %+v", ret[0].Exemplars, exemplars[1:3])
+}
+
+func TestSelectExemplar_DuplicateSeries(t *testing.T) {
+	exs, err := NewCircularExemplarStorage(4, nil)
+	require.NoError(t, err)
+	es := exs.(*CircularExemplarStorage)
+
+	e := exemplar.Exemplar{
+		Labels: labels.Labels{
+			labels.Label{
+				Name:  "traceID",
+				Value: "qwerty",
+			},
+		},
+		Value: 0.1,
+		Ts:    12,
+	}
+
+	l := labels.Labels{
+		{Name: "service", Value: "asdf"},
+		{Name: "cluster", Value: "us-central1"},
+	}
+
+	// Lets just assume somehow the PromQL expression generated two separate lists of matchers,
+	// both of which can select this particular series.
+	m := [][]*labels.Matcher{
+		{
+			labels.MustNewMatcher(labels.MatchEqual, l[0].Name, l[0].Value),
+		},
+		{
+			labels.MustNewMatcher(labels.MatchEqual, l[1].Name, l[1].Value),
+		},
+	}
+
+	err = es.AddExemplar(l, e)
+	require.NoError(t, err, "adding exemplar failed")
+	require.True(t, reflect.DeepEqual(es.exemplars[0].exemplar, e), "exemplar was not stored correctly")
+
+	ret, err := es.Select(0, 100, m...)
+	require.NoError(t, err)
+	require.True(t, len(ret) == 1, "select should have returned samples for a single series only")
 }
 
 func TestIndexOverwrite(t *testing.T) {

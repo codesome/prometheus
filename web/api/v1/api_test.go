@@ -312,7 +312,7 @@ func TestEndpoints(t *testing.T) {
 	`)
 
 	start := time.Unix(0, 0)
-	exemplars := []exemplarData{
+	exemplars := []exemplar.ExemplarQueryResult{
 		{
 			labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
 			[]exemplar.Exemplar{
@@ -356,9 +356,8 @@ func TestEndpoints(t *testing.T) {
 	}
 
 	for _, ed := range exemplars {
-		if err := suite.ExemplarStorage().ExemplarAppender().AddExemplar(ed.SeriesLabels, ed.Exemplars[0]); err != nil {
-			t.Errorf("failed to add exemplar: %+v", ed.Exemplars[0])
-		}
+		suite.ExemplarStorage().ExemplarAppender().AddExemplar(ed.SeriesLabels, ed.Exemplars[0])
+		require.NoError(t, err, "failed to add exemplar: %+v", ed.Exemplars[0])
 	}
 
 	require.NoError(t, err)
@@ -610,7 +609,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.E
 		errType     errorType
 		sorter      func(interface{})
 		metadata    []targetMetadata
-		exemplars   []exemplarData
+		exemplars   []exemplar.ExemplarQueryResult
 	}
 
 	var tests = []test{
@@ -1527,7 +1526,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.E
 			// Note extra integer length of timestamps for exemplars because of millisecond preservation
 			// of timestamps within Prometheus (see timestamp package).
 
-			response: []exemplarData{
+			response: []exemplar.ExemplarQueryResult{
 				{
 					labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
 					[]exemplar.Exemplar{
@@ -1557,7 +1556,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, es storage.E
 				"start": []string{"4"},
 				"end":   []string{"4.1"},
 			},
-			response: []exemplarData{
+			response: []exemplar.ExemplarQueryResult{
 				{
 					labels.FromStrings("__name__", "test_metric3", "foo", "boo", "dup", "1"),
 					[]exemplar.Exemplar{
@@ -2939,7 +2938,7 @@ func TestRespond(t *testing.T) {
 			expected: `{"status":"success","data":[0,"1.2345678e-67"]}`,
 		},
 		{
-			response: []exemplarData{
+			response: []exemplar.ExemplarQueryResult{
 				{
 					SeriesLabels: labels.FromStrings("foo", "bar"),
 					Exemplars: []exemplar.Exemplar{
@@ -2954,7 +2953,7 @@ func TestRespond(t *testing.T) {
 			expected: `{"status":"success","data":[{"seriesLabels":{"foo":"bar"},"exemplars":[{"labels":{"traceID":"abc"},"value":"100.123","timestamp":1.234}]}]}`,
 		},
 		{
-			response: []exemplarData{
+			response: []exemplar.ExemplarQueryResult{
 				{
 					SeriesLabels: labels.FromStrings("foo", "bar"),
 					Exemplars: []exemplar.Exemplar{

@@ -53,7 +53,7 @@ type ExemplarAppendable interface {
 }
 
 // Storage ingests and manages samples, along with various indexes. All methods
-// are goroutine-safe. Storage implements storage.SampleAppender.
+// are goroutine-safe. Storage implements storage.Appender.
 type Storage interface {
 	SampleAndChunkQueryable
 	Appendable
@@ -65,6 +65,8 @@ type Storage interface {
 	Close() error
 }
 
+// ExemplarStorage ingests and manages exemplars, along with various indexes. All methods are
+// goroutine-safe. ExemplarStorage implements storage.ExemplarAppender and storage.ExemplarQuerier.
 type ExemplarStorage interface {
 	ExemplarQueryable
 	ExemplarAppendable
@@ -129,7 +131,7 @@ type ExemplarQueryable interface {
 type ExemplarQuerier interface {
 	// Select all the exemplars that match the matchers.
 	// Within a single slice of matchers, it is an intersection. Between the slices, it is a union.
-	Select(start, end int64, matchers ...[]labels.Matcher) ([]exemplar.Exemplar, error)
+	Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.ExemplarQueryResult, error)
 }
 
 // SelectHints specifies hints passed for data selections.
@@ -174,8 +176,11 @@ type Appender interface {
 	// faster than adding a sample by providing its full label set.
 	AddFast(ref uint64, t int64, v float64) error
 
+	// AddExemplar adds an exemplar for the given series labels.
 	AddExemplar(l labels.Labels, e exemplar.Exemplar) error
 
+	// AddExemplarFast adds an exemplar for the referenced series. It is generally
+	// faster than adding a exemplar by providing its full series label set.
 	AddExemplarFast(ref uint64, e exemplar.Exemplar) error
 
 	// Commit submits the collected samples and purges the batch. If Commit

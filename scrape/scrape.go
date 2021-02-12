@@ -1322,8 +1322,8 @@ loop:
 				if !e.HasTs {
 					e.Ts = t
 				}
-				err = app.AddExemplarFast(ce.ref, e)
-				if err == storage.ErrNotFound {
+				exemplarErr := app.AddExemplarFast(ce.ref, e)
+				if exemplarErr == storage.ErrNotFound {
 					ok = false
 				}
 			}
@@ -1372,7 +1372,7 @@ loop:
 				if !e.HasTs {
 					e.Ts = t
 				}
-				if err = app.AddExemplar(lset, e); err != nil {
+				if exemplarErr := app.AddExemplar(lset, e); exemplarErr != nil {
 					break loop
 				}
 			}

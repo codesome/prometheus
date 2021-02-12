@@ -1089,7 +1089,7 @@ func (a *initAppender) AddExemplar(l labels.Labels, e exemplar.Exemplar) error {
 	if a.app != nil {
 		return a.app.AddExemplar(l, e)
 	}
-	// I don't think we should ever reach here given we would call Add before AddExemplar
+	// We should never reach here given we would call Add before AddExemplar
 	// and we probably want to always base head/WAL min time on sample times.
 	a.head.initTime(e.Ts)
 	a.app = a.head.appender()
@@ -1320,8 +1320,9 @@ func (a *headAppender) AddExemplar(lset labels.Labels, e exemplar.Exemplar) erro
 		return err
 	}
 
-	// in theory the series should never be created as a result of an AddExemplar call, I think
+	// In theory the series should never be created as a result of an AddExemplar call.
 	if created {
+		level.Warn(a.head.logger).Log("msg", "Series was created in AddExemplar, this should never happen")
 		a.series = append(a.series, record.RefSeries{
 			Ref:    s.ref,
 			Labels: lset,
@@ -1381,11 +1382,9 @@ func (a *headAppender) Commit() (err error) {
 		return errors.Wrap(err, "write to WAL")
 	}
 
-	// no errors logging to WAL, so pass the exemplars along to the
-	// in memory storage
+	// No errors logging to WAL, so pass the exemplars along to the in memory storage.
 	for _, e := range a.exemplars {
 		s := a.head.series.getByID(e.ref)
-		// todo: proper
 		if err := a.exemplarAppender.AddExemplar(s.lset, e.exemplar); err != nil {
 			// todo: do we want to error out here?
 			return errors.Wrap(err, "adding exemplars")

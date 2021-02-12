@@ -143,6 +143,7 @@ func (c *flagConfig) setFeatureListOptions(logger log.Logger) error {
 				level.Info(logger).Log("msg", "Experimental remote-write-receiver enabled")
 			case "exemplar-storage":
 				c.tsdb.MaxExemplars = maxExemplars
+				level.Info(logger).Log("msg", "Experimental in-memory exemplar storage enabled")
 			case "":
 				continue
 			default:
@@ -269,7 +270,7 @@ func main() {
 	a.Flag("storage.remote.read-max-bytes-in-frame", "Maximum number of bytes in a single frame for streaming remote read response types before marshalling. Note that client might have limit on frame size as well. 1MB as recommended by protobuf by default.").
 		Default("1048576").IntVar(&cfg.web.RemoteReadBytesInFrame)
 
-	a.Flag("storage.exemplars.exemplars-limit", "Maximum number of exemplars to store in in-memory exemplar storage total. <1 disables the exemplar storage. This flag is effective only with --enable-feature=exemplar-storage.").
+	a.Flag("storage.exemplars.exemplars-limit", "[EXPERIMENTAL] Maximum number of exemplars to store in in-memory exemplar storage total. 0 disables the exemplar storage. This flag is effective only with --enable-feature=exemplar-storage.").
 		Default("100000").IntVar(&cfg.tsdb.MaxExemplars)
 
 	a.Flag("rules.alert.for-outage-tolerance", "Max time to tolerate prometheus outage for restoring \"for\" state of alert.").
@@ -302,7 +303,7 @@ func main() {
 	a.Flag("query.max-samples", "Maximum number of samples a single query can load into memory. Note that queries will fail if they try to load more samples than this into memory, so this also limits the number of samples a query can return.").
 		Default("50000000").IntVar(&cfg.queryMaxSamples)
 
-	a.Flag("enable-feature", "Comma separated feature names to enable. Valid options: 'promql-at-modifier' to enable the @ modifier, 'remote-write-receiver' to enable remote write receiver. See https://prometheus.io/docs/prometheus/latest/disabled_features/ for more details.").
+	a.Flag("enable-feature", "Comma separated feature names to enable. Valid options: 'promql-at-modifier' to enable the @ modifier, 'remote-write-receiver' to enable remote write receiver, 'exemplar-storage' to enable the in-memory exemplar storage. See https://prometheus.io/docs/prometheus/latest/disabled_features/ for more details.").
 		Default("").StringsVar(&cfg.featureList)
 
 	promlogflag.AddFlags(a, &cfg.promlogConfig)
@@ -1132,6 +1133,7 @@ func (n notReadyAppender) AddFast(ref uint64, t int64, v float64) error { return
 func (n notReadyAppender) AddExemplar(l labels.Labels, e exemplar.Exemplar) error {
 	return tsdb.ErrNotReady
 }
+
 func (n notReadyAppender) AddExemplarFast(ref uint64, e exemplar.Exemplar) error {
 	return tsdb.ErrNotReady
 }
