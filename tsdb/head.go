@@ -112,7 +112,8 @@ type Head struct {
 	// pendingIndexReaders is used to track open queries on Head.
 	// It is enough to track the index readers and not chunk readers
 	// since the index tells which chunks to access.
-	pendingIndexReaders sync.WaitGroup
+	pendingIndexReadersMtx sync.RWMutex
+	pendingIndexReaders    map[*headIndexReader]struct{}
 }
 
 // HeadOptions are parameters for the Head block.
@@ -404,7 +405,8 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, opts *HeadOpti
 				return &memChunk{}
 			},
 		},
-		stats: stats,
+		stats:               stats,
+		pendingIndexReaders: make(map[*headIndexReader]struct{}),
 	}
 	h.chunkRange.Store(opts.ChunkRange)
 	h.minTime.Store(math.MaxInt64)
@@ -951,6 +953,23 @@ func (h *Head) ReleaseQuerierLock() {
 	h.truncateMtx.RUnlock()
 }
 
+func (h *Head) waitForPendingReaders(t int64) {
+	// TODO: should we have some limit on how long we wait in total? If so, how long?
+	overlaps := func() bool {
+		h.pendingIndexReadersMtx.RLock()
+		defer h.pendingIndexReadersMtx.RUnlock()
+		for ir := range h.pendingIndexReaders {
+			if ir.mint <= t && t <= ir.maxt {
+				return true
+			}
+		}
+		return false
+	}
+	for overlaps() {
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // truncateMemory removes old data before mint from the head.
 func (h *Head) truncateMemory(mint int64) (err error) {
 	defer func() {
@@ -962,8 +981,8 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	// This locks blocks queries to proceede further.
 	h.truncateMtx.Lock()
 
-	// We wait for pending queries to end.
-	h.pendingIndexReaders.Wait()
+	// We wait for pending queries to end that overlap with this truncation.
+	h.waitForPendingReaders(mint)
 
 	initialize := h.MinTime() == math.MaxInt64
 
@@ -1140,8 +1159,11 @@ func NewRangeHead(head *Head, mint, maxt int64) *RangeHead {
 }
 
 func (h *RangeHead) Index() (IndexReader, error) {
-	h.head.pendingIndexReaders.Add(1)
-	return h.head.indexRange(h.mint, h.maxt), nil
+	ir := h.head.indexRange(h.mint, h.maxt)
+	h.head.pendingIndexReadersMtx.Lock()
+	h.head.pendingIndexReaders[ir] = struct{}{}
+	h.head.pendingIndexReadersMtx.Unlock()
+	return ir, nil
 }
 
 func (h *RangeHead) Chunks() (ChunkReader, error) {
@@ -1723,8 +1745,11 @@ func (h *Head) Tombstones() (tombstones.Reader, error) {
 
 // Index returns an IndexReader against the block.
 func (h *Head) Index() (IndexReader, error) {
-	h.pendingIndexReaders.Add(1)
-	return h.indexRange(math.MinInt64, math.MaxInt64), nil
+	ir := h.indexRange(math.MinInt64, math.MaxInt64)
+	h.pendingIndexReadersMtx.Lock()
+	h.pendingIndexReaders[ir] = struct{}{}
+	h.pendingIndexReadersMtx.Unlock()
+	return ir, nil
 }
 
 func (h *Head) indexRange(mint, maxt int64) *headIndexReader {
@@ -1900,7 +1925,9 @@ type headIndexReader struct {
 }
 
 func (h *headIndexReader) Close() error {
-	h.head.pendingIndexReaders.Done()
+	h.head.pendingIndexReadersMtx.Lock()
+	delete(h.head.pendingIndexReaders, h)
+	h.head.pendingIndexReadersMtx.Unlock()
 	return nil
 }
 
