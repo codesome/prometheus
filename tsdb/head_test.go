@@ -1229,11 +1229,11 @@ func TestRemoveSeriesAfterRollbackAndTruncate(t *testing.T) {
 
 	q, err := NewBlockQuerier(h, 1500, 2500)
 	require.NoError(t, err)
-	defer q.Close()
 
 	ss := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "1"))
 	require.Equal(t, false, ss.Next())
 	require.Equal(t, 0, len(ss.Warnings()))
+	require.NoError(t, q.Close())
 
 	// Truncate again, this time the series should be deleted
 	require.NoError(t, h.Truncate(2050))
