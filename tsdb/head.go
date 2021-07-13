@@ -107,6 +107,12 @@ type Head struct {
 	closed    bool
 
 	stats *HeadStats
+
+	truncateMtx sync.RWMutex
+	// pendingIndexReaders is used to track open queries on Head.
+	// It is enough to track the index readers and not chunk readers
+	// since the index tells which chunks to access.
+	pendingIndexReaders sync.WaitGroup
 }
 
 // HeadOptions are parameters for the Head block.
@@ -934,6 +940,17 @@ func (h *Head) Truncate(mint int64) (err error) {
 	return h.truncateWAL(mint)
 }
 
+// AcquireQuerierLock waits till there is not Head truncation happening in parallel
+// and acquires a lock to prevent parallel truncation.
+// NOTE: It is mandatory to call h.ReleaseQuerierLock() after this.
+func (h *Head) AcquireQuerierLock() {
+	h.truncateMtx.RLock()
+}
+
+func (h *Head) ReleaseQuerierLock() {
+	h.truncateMtx.RUnlock()
+}
+
 // truncateMemory removes old data before mint from the head.
 func (h *Head) truncateMemory(mint int64) (err error) {
 	defer func() {
@@ -941,9 +958,17 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 			h.metrics.headTruncateFail.Inc()
 		}
 	}()
+
+	// This locks blocks queries to proceede further.
+	h.truncateMtx.Lock()
+
+	// We wait for pending queries to end.
+	h.pendingIndexReaders.Wait()
+
 	initialize := h.MinTime() == math.MaxInt64
 
 	if h.MinTime() >= mint && !initialize {
+		h.truncateMtx.Unlock()
 		return nil
 	}
 	h.minTime.Store(mint)
@@ -957,6 +982,7 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	// This was an initial call to Truncate after loading blocks on startup.
 	// We haven't read back the WAL yet, so do not attempt to truncate it.
 	if initialize {
+		h.truncateMtx.Unlock()
 		return nil
 	}
 
@@ -979,6 +1005,10 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 			h.minValidTime.Store(appendableMinValidTime)
 		}
 	}
+
+	// At this point the index is updated and queries cannot access old chunks.
+	// So we can truncate m-mapped chunks outside this lock.
+	h.truncateMtx.Unlock()
 
 	// Truncate the chunk m-mapper.
 	if err := h.chunkDiskMapper.Truncate(mint); err != nil {
@@ -1110,6 +1140,7 @@ func NewRangeHead(head *Head, mint, maxt int64) *RangeHead {
 }
 
 func (h *RangeHead) Index() (IndexReader, error) {
+	h.head.pendingIndexReaders.Add(1)
 	return h.head.indexRange(h.mint, h.maxt), nil
 }
 
@@ -1692,6 +1723,7 @@ func (h *Head) Tombstones() (tombstones.Reader, error) {
 
 // Index returns an IndexReader against the block.
 func (h *Head) Index() (IndexReader, error) {
+	h.pendingIndexReaders.Add(1)
 	return h.indexRange(math.MinInt64, math.MaxInt64), nil
 }
 
@@ -1868,6 +1900,7 @@ type headIndexReader struct {
 }
 
 func (h *headIndexReader) Close() error {
+	h.head.pendingIndexReaders.Done()
 	return nil
 }
 
