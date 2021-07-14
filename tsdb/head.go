@@ -110,13 +110,8 @@ type Head struct {
 
 	stats *HeadStats
 
-	truncateMtx sync.RWMutex
-	// pendingIndexReaders is used to track open queries on Head.
-	// It is enough to track the index readers and not chunk readers
-	// since the index tells which chunks to access.
-	pendingIndexReadersMtx sync.RWMutex
-	pendingIndexReaders    map[*headIndexReader]struct{}
-	truncationInProcess    atomic.Bool
+	memTruncateMtx         sync.RWMutex
+	memTruncationInProcess atomic.Bool
 }
 
 // HeadOptions are parameters for the Head block.
@@ -408,8 +403,7 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, opts *HeadOpti
 				return &memChunk{}
 			},
 		},
-		stats:               stats,
-		pendingIndexReaders: make(map[*headIndexReader]struct{}),
+		stats: stats,
 	}
 	h.chunkRange.Store(opts.ChunkRange)
 	h.minTime.Store(math.MaxInt64)
@@ -953,7 +947,7 @@ func (h *Head) Truncate(mint int64) (err error) {
 //   after the query.
 // * return false means the lock was not acquired and it's safe to query.
 func (h *Head) AcquireQuerierLock(mint, maxt int64) bool {
-	if h.truncationInProcess.Load() {
+	if h.memTruncationInProcess.Load() {
 		// We assume that truncation is not called too often.
 		// So if truncation is in progress, it is safe to check
 		// the last truncation time as best effort to avoid taking the lock if
@@ -966,26 +960,27 @@ func (h *Head) AcquireQuerierLock(mint, maxt int64) bool {
 
 	// If we reach here, it means either the truncation is not in progress or
 	// we overlap with the truncation range in progress.
-	h.truncateMtx.RLock()
+	h.memTruncateMtx.RLock()
 	return true
 }
 
 func (h *Head) ReleaseQuerierLock() {
-	h.truncateMtx.RUnlock()
+	h.memTruncateMtx.RUnlock()
 }
 
 func (h *Head) waitForPendingReaders(mint, maxt int64) {
 	// TODO: should we have some limit on how long we wait in total? If so, how long?
 	overlaps := func() bool {
-		h.pendingIndexReadersMtx.RLock()
-		defer h.pendingIndexReadersMtx.RUnlock()
-		for ir := range h.pendingIndexReaders {
-			if ir.mint <= maxt && mint <= ir.maxt {
+		o := false
+		h.iso.TraverseOpenReads(func(s *isolationState) bool {
+			if s.mint <= maxt && mint <= s.maxt {
 				// Overlaps with the truncation range.
-				return true
+				o = true
+				return false
 			}
-		}
-		return false
+			return true
+		})
+		return o
 	}
 	for overlaps() {
 		time.Sleep(2 * time.Millisecond)
@@ -1000,20 +995,20 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 		}
 	}()
 
-	// This locks blocks queries to proceede further.
-	h.truncateMtx.Lock()
+	// This locks blocks queries to proceed further.
+	h.memTruncateMtx.Lock()
 
 	initialize := h.MinTime() == math.MaxInt64
 
 	if h.MinTime() >= mint && !initialize {
-		h.truncateMtx.Unlock()
+		h.memTruncateMtx.Unlock()
 		return nil
 	}
 
 	h.lastMemoryTruncationStartTime.Store(h.MinTime())
 	h.lastMemoryTruncationEndTime.Store(mint)
-	h.truncationInProcess.Store(true)
-	defer h.truncationInProcess.Store(false)
+	h.memTruncationInProcess.Store(true)
+	defer h.memTruncationInProcess.Store(false)
 
 	// We wait for pending queries to end that overlap with this truncation.
 	if !initialize {
@@ -1031,7 +1026,7 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	// This was an initial call to Truncate after loading blocks on startup.
 	// We haven't read back the WAL yet, so do not attempt to truncate it.
 	if initialize {
-		h.truncateMtx.Unlock()
+		h.memTruncateMtx.Unlock()
 		return nil
 	}
 
@@ -1057,7 +1052,7 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 
 	// At this point the index is updated and queries cannot access old chunks.
 	// So we can truncate m-mapped chunks outside this lock.
-	h.truncateMtx.Unlock()
+	h.memTruncateMtx.Unlock()
 
 	// Truncate the chunk m-mapper.
 	if err := h.chunkDiskMapper.Truncate(mint); err != nil {
@@ -1190,14 +1185,11 @@ func NewRangeHead(head *Head, mint, maxt int64) *RangeHead {
 
 func (h *RangeHead) Index() (IndexReader, error) {
 	ir := h.head.indexRange(h.mint, h.maxt)
-	h.head.pendingIndexReadersMtx.Lock()
-	h.head.pendingIndexReaders[ir] = struct{}{}
-	h.head.pendingIndexReadersMtx.Unlock()
 	return ir, nil
 }
 
 func (h *RangeHead) Chunks() (ChunkReader, error) {
-	return h.head.chunksRange(h.mint, h.maxt, h.head.iso.State())
+	return h.head.chunksRange(h.mint, h.maxt, h.head.iso.State(h.mint, h.maxt))
 }
 
 func (h *RangeHead) Tombstones() (tombstones.Reader, error) {
@@ -1776,9 +1768,6 @@ func (h *Head) Tombstones() (tombstones.Reader, error) {
 // Index returns an IndexReader against the block.
 func (h *Head) Index() (IndexReader, error) {
 	ir := h.indexRange(math.MinInt64, math.MaxInt64)
-	h.pendingIndexReadersMtx.Lock()
-	h.pendingIndexReaders[ir] = struct{}{}
-	h.pendingIndexReadersMtx.Unlock()
 	return ir, nil
 }
 
@@ -1791,7 +1780,7 @@ func (h *Head) indexRange(mint, maxt int64) *headIndexReader {
 
 // Chunks returns a ChunkReader against the block.
 func (h *Head) Chunks() (ChunkReader, error) {
-	return h.chunksRange(math.MinInt64, math.MaxInt64, h.iso.State())
+	return h.chunksRange(math.MinInt64, math.MaxInt64, h.iso.State(math.MinInt64, math.MaxInt64))
 }
 
 func (h *Head) chunksRange(mint, maxt int64, is *isolationState) (*headChunkReader, error) {
@@ -1955,9 +1944,6 @@ type headIndexReader struct {
 }
 
 func (h *headIndexReader) Close() error {
-	h.head.pendingIndexReadersMtx.Lock()
-	delete(h.head.pendingIndexReaders, h)
-	h.head.pendingIndexReadersMtx.Unlock()
 	return nil
 }
 

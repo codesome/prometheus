@@ -1489,7 +1489,7 @@ func TestMemSeriesIsolation(t *testing.T) {
 
 		require.NoError(t, err)
 
-		iso := h.iso.State()
+		iso := h.iso.State(math.MinInt64, math.MaxInt64)
 		iso.maxAppendID = maxAppendID
 
 		chunks, err := h.chunksRange(math.MinInt64, math.MaxInt64, iso)
@@ -1704,7 +1704,7 @@ func TestIsolationLowWatermarkMonotonous(t *testing.T) {
 	require.NoError(t, app2.Commit())
 	require.Equal(t, uint64(2), hb.iso.lowWatermark(), "Low watermark should stay two because app1 is not committed yet.")
 
-	is := hb.iso.State()
+	is := hb.iso.State(math.MinInt64, math.MaxInt64)
 	require.Equal(t, uint64(2), hb.iso.lowWatermark(), "After simulated read (iso state retrieved), low watermark should stay at 2.")
 
 	require.NoError(t, app1.Commit())
