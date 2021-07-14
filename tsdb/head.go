@@ -941,12 +941,12 @@ func (h *Head) Truncate(mint int64) (err error) {
 	return h.truncateWAL(mint)
 }
 
-// AcquireQuerierLock waits till there is not Head truncation happening in parallel
+// AcquireQuerierRLock waits till there is not Head truncation happening in parallel
 // and acquires a lock to prevent parallel truncation.
 // * return true means it acquired the lock and it is mandatory to h.ReleaseQuerierLock()
 //   after the query.
 // * return false means the lock was not acquired and it's safe to query.
-func (h *Head) AcquireQuerierLock(mint, maxt int64) bool {
+func (h *Head) AcquireQuerierRLock(mint, maxt int64) bool {
 	if h.memTruncationInProcess.Load() {
 		// We assume that truncation is not called too often.
 		// So if truncation is in progress, it is safe to check
@@ -964,11 +964,19 @@ func (h *Head) AcquireQuerierLock(mint, maxt int64) bool {
 	return true
 }
 
-func (h *Head) ReleaseQuerierLock() {
+func (h *Head) ReleaseQuerierRLock() {
 	h.memTruncateMtx.RUnlock()
 }
 
-func (h *Head) waitForPendingReaders(mint, maxt int64) {
+func (h *Head) AcquireQuerierLock() {
+	h.memTruncateMtx.Lock()
+}
+
+func (h *Head) ReleaseQuerierLock() {
+	h.memTruncateMtx.Unlock()
+}
+
+func (h *Head) WaitForPendingReadersInTimeRange(mint, maxt int64) {
 	// TODO: should we have some limit on how long we wait in total? If so, how long?
 	overlaps := func() bool {
 		o := false
@@ -998,7 +1006,6 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	initialize := h.MinTime() == math.MaxInt64
 
 	if h.MinTime() >= mint && !initialize {
-		h.memTruncateMtx.Unlock()
 		return nil
 	}
 
@@ -1008,13 +1015,13 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	defer h.memTruncationInProcess.Store(false)
 
 	if !initialize {
-		// This prevents getting any new queriers.
-		h.memTruncateMtx.Lock()
+		// This prevents getting any new queriers overlapping with truncation.
+		h.AcquireQuerierLock()
 	}
 
 	// We wait for pending queries to end that overlap with this truncation.
 	if !initialize {
-		h.waitForPendingReaders(h.MinTime(), mint)
+		h.WaitForPendingReadersInTimeRange(h.MinTime(), mint)
 	}
 
 	h.minTime.Store(mint)
@@ -1053,7 +1060,7 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 
 	// At this point the index is updated and queries cannot access old chunks.
 	// So we can truncate m-mapped chunks outside this lock.
-	h.memTruncateMtx.Unlock()
+	h.ReleaseQuerierLock()
 
 	// Truncate the chunk m-mapper.
 	if err := h.chunkDiskMapper.Truncate(mint); err != nil {

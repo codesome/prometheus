@@ -1517,6 +1517,13 @@ func (db *DB) Querier(_ context.Context, mint, maxt int64) (storage.Querier, err
 		}
 	}
 	if maxt >= db.head.MinTime() {
+		// Acquiring this lock is important to avoid these bugs:
+		// - https://github.com/prometheus/prometheus/issues/8221
+		// - https://github.com/prometheus/prometheus/issues/9079
+		if db.head.AcquireQuerierRLock(mint, maxt) {
+			defer db.head.ReleaseQuerierRLock()
+		}
+
 		blocks = append(blocks, NewRangeHead(db.head, mint, maxt))
 	}
 
@@ -1553,8 +1560,8 @@ func (db *DB) ChunkQuerier(_ context.Context, mint, maxt int64) (storage.ChunkQu
 		// Acquiring this lock is important to avoid these bugs:
 		// - https://github.com/prometheus/prometheus/issues/8221
 		// - https://github.com/prometheus/prometheus/issues/9079
-		if db.head.AcquireQuerierLock(mint, maxt) {
-			defer db.head.ReleaseQuerierLock()
+		if db.head.AcquireQuerierRLock(mint, maxt) {
+			defer db.head.ReleaseQuerierRLock()
 		}
 
 		blocks = append(blocks, NewRangeHead(db.head, mint, maxt))

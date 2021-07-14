@@ -16,6 +16,7 @@ package tsdb
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
 	"math/rand"
@@ -30,6 +31,7 @@ import (
 	"github.com/pkg/errors"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -2181,28 +2183,21 @@ func TestMemSafeIteratorSeekIntoBuffer(t *testing.T) {
 
 // Tests https://github.com/prometheus/prometheus/issues/8221.
 func TestChunkNotFoundHeadGCRace(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, os.RemoveAll(dir))
-	})
-
-	db, err := Open(dir, nil, nil, DefaultOptions(), nil)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
+	db := newTestDB(t)
 	db.DisableCompactions()
 
+	var (
+		app        = db.Appender(context.Background())
+		ref        = uint64(0)
+		mint, maxt = int64(0), int64(0)
+		err        error
+	)
+
 	// Appends samples to span over 1.5 block ranges.
-	lbls := labels.FromStrings("a", "b")
-	app := db.Appender(context.Background())
-	ref := uint64(0)
-	mint, maxt := int64(0), int64(0)
 	// 7 chunks with 15s scrape interval.
 	for i := int64(0); i <= 120*7; i++ {
 		ts := i * DefaultBlockDuration / (4 * 120)
-		ref, err = app.Append(ref, lbls, ts, float64(i))
+		ref, err = app.Append(ref, labels.FromStrings("a", "b"), ts, float64(i))
 		require.NoError(t, err)
 		maxt = ts
 	}
@@ -2213,7 +2208,7 @@ func TestChunkNotFoundHeadGCRace(t *testing.T) {
 	require.NoError(t, err)
 
 	// Query the compacted range and get the first series before compaction.
-	ss := q.Select(true, nil, labels.MustNewMatcher(labels.MatchEqual, lbls[0].Name, lbls[0].Value))
+	ss := q.Select(true, nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
 	require.True(t, ss.Next())
 	s := ss.At()
 
@@ -2235,7 +2230,8 @@ func TestChunkNotFoundHeadGCRace(t *testing.T) {
 	for it.Next() {
 		_, _ = it.At()
 	}
-	require.NoError(t, it.Err()) // It should error here.
+	// It should error here without any fix for the mentioned issue.
+	require.NoError(t, it.Err())
 	for ss.Next() {
 		s = ss.At()
 		it := s.Iterator()
@@ -2252,29 +2248,22 @@ func TestChunkNotFoundHeadGCRace(t *testing.T) {
 
 // Tests https://github.com/prometheus/prometheus/issues/9079.
 func TestDataMissingOnQueryDuringCompaction(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, os.RemoveAll(dir))
-	})
-
-	db, err := Open(dir, nil, nil, DefaultOptions(), nil)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
+	db := newTestDB(t)
 	db.DisableCompactions()
 
+	var (
+		app        = db.Appender(context.Background())
+		ref        = uint64(0)
+		mint, maxt = int64(0), int64(0)
+		err        error
+	)
+
 	// Appends samples to span over 1.5 block ranges.
-	lbls := labels.FromStrings("a", "b")
-	app := db.Appender(context.Background())
-	ref := uint64(0)
-	mint, maxt := int64(0), int64(0)
 	expSamples := make([]tsdbutil.Sample, 0)
 	// 7 chunks with 15s scrape interval.
 	for i := int64(0); i <= 120*7; i++ {
 		ts := i * DefaultBlockDuration / (4 * 120)
-		ref, err = app.Append(ref, lbls, ts, float64(i))
+		ref, err = app.Append(ref, labels.FromStrings("a", "b"), ts, float64(i))
 		require.NoError(t, err)
 		maxt = ts
 		expSamples = append(expSamples, sample{ts, float64(i)})
@@ -2299,8 +2288,156 @@ func TestDataMissingOnQueryDuringCompaction(t *testing.T) {
 	<-time.After(3 * time.Second)
 
 	// Querying the querier that was got before compaction.
-	series := query(t, q, labels.MustNewMatcher(labels.MatchEqual, lbls[0].Name, lbls[0].Value))
+	series := query(t, q, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
 	require.Equal(t, map[string][]tsdbutil.Sample{`{a="b"}`: expSamples}, series)
 
 	wg.Wait()
+}
+
+func TestQueryWaitingOnTruncation(t *testing.T) {
+	db := newTestDB(t)
+	db.DisableCompactions()
+
+	var (
+		app = db.Appender(context.Background())
+		ref = uint64(0)
+		err error
+	)
+
+	for i := int64(0); i <= 3000; i++ {
+		ref, err = app.Append(ref, labels.FromStrings("a", "b"), i, float64(i))
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+
+	// This mocks truncation.
+	db.head.memTruncationInProcess.Store(true)
+	db.head.lastMemoryTruncationStartTime.Store(1000)
+	db.head.lastMemoryTruncationEndTime.Store(2000)
+
+	// Getting querier when truncation is in progress and not overlapping with
+	// truncation should not acquire and release the lock.
+	// With this lock, below goroutine should not get blocked.
+	db.head.AcquireQuerierLock()
+
+	done := false
+	go func() {
+		// These queriers should not take the lock since it does not overlap with truncation.
+		// This case also tests that we are not unlocking the lock when we haven't got it in
+		// the first place.
+
+		// Before range truncation.
+		q, err := db.Querier(context.Background(), 0, 500)
+		require.NoError(t, err)
+		require.NoError(t, q.Close())
+		cq, err := db.ChunkQuerier(context.Background(), 0, 500)
+		require.NoError(t, err)
+		require.NoError(t, cq.Close())
+
+		// After truncation range.
+		q, err = db.Querier(context.Background(), 2100, 2500)
+		require.NoError(t, err)
+		require.NoError(t, q.Close())
+		cq, err = db.ChunkQuerier(context.Background(), 2100, 2500)
+		require.NoError(t, err)
+		require.NoError(t, cq.Close())
+
+		done = true
+	}()
+
+	<-time.After(500 * time.Millisecond)
+	require.True(t, done)
+
+	// Getting queriers that overlap with truncation should get blocked till
+	// truncation is over.
+	cases := []struct {
+		mint, maxt int64
+	}{
+		{500, 1500},  // Overlaps with truncation at the start.
+		{1200, 1700}, // Within truncation range.
+		{1800, 2500}, // Overlaps with truncation at the end.
+	}
+	// Generating all possible overlaps.
+	var queriersGot atomic.Int64
+	for _, c := range cases {
+		go func(mint, maxt int64) {
+			q, err := db.Querier(context.Background(), mint, maxt)
+			queriersGot.Inc()
+			require.NoError(t, err)
+			require.NoError(t, q.Close())
+		}(c.mint, c.maxt)
+		go func(mint, maxt int64) {
+			cq, err := db.ChunkQuerier(context.Background(), mint, maxt)
+			queriersGot.Inc()
+			require.NoError(t, err)
+			require.NoError(t, cq.Close())
+		}(c.mint, c.maxt)
+	}
+
+	<-time.After(100 * time.Millisecond)
+	require.Equal(t, int64(0), queriersGot.Load())
+
+	db.head.memTruncationInProcess.Store(false)
+	db.head.ReleaseQuerierLock()
+
+	// Now after head truncation is over they should be all unblocked.
+	<-time.After(25 * time.Millisecond)
+	require.Equal(t, int64(2*len(cases)), queriersGot.Load())
+
+}
+
+func TestWaitForPendingReadersInTimeRange(t *testing.T) {
+	db := newTestDB(t)
+	db.DisableCompactions()
+
+	sampleTs := func(i int64) int64 { return i * DefaultBlockDuration / (4 * 120) }
+
+	var (
+		app = db.Appender(context.Background())
+		ref = uint64(0)
+		err error
+	)
+
+	for i := int64(0); i <= 3000; i++ {
+		ts := sampleTs(i)
+		ref, err = app.Append(ref, labels.FromStrings("a", "b"), ts, float64(i))
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+
+	truncMint, truncMaxt := int64(1000), int64(2000)
+	cases := []struct {
+		mint, maxt int64
+		shouldWait bool
+	}{
+		{0, 500, false},     // Before truncation range.
+		{500, 1500, true},   // Overlaps with truncation at the start.
+		{1200, 1700, true},  // Within truncation range.
+		{1800, 2500, true},  // Overlaps with truncation at the end.
+		{2100, 2500, false}, // After truncation range.
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("mint=%d,maxt=%d,shouldWait=%t", c.mint, c.maxt, c.shouldWait), func(t *testing.T) {
+			checkWaiting := func(cl io.Closer) {
+				waitOver := false
+				go func() {
+					db.head.WaitForPendingReadersInTimeRange(truncMint, truncMaxt)
+					waitOver = true
+				}()
+				<-time.After(50 * time.Millisecond)
+				require.Equal(t, !c.shouldWait, waitOver)
+				require.NoError(t, cl.Close())
+				<-time.After(50 * time.Millisecond)
+				require.True(t, waitOver)
+			}
+
+			q, err := db.Querier(context.Background(), c.mint, c.maxt)
+			require.NoError(t, err)
+			checkWaiting(q)
+
+			cq, err := db.ChunkQuerier(context.Background(), c.mint, c.maxt)
+			require.NoError(t, err)
+			checkWaiting(cq)
+		})
+	}
 }
