@@ -995,9 +995,6 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 		}
 	}()
 
-	// This locks blocks queries to proceed further.
-	h.memTruncateMtx.Lock()
-
 	initialize := h.MinTime() == math.MaxInt64
 
 	if h.MinTime() >= mint && !initialize {
@@ -1009,6 +1006,11 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	h.lastMemoryTruncationEndTime.Store(mint)
 	h.memTruncationInProcess.Store(true)
 	defer h.memTruncationInProcess.Store(false)
+
+	if !initialize {
+		// This prevents getting any new queriers.
+		h.memTruncateMtx.Lock()
+	}
 
 	// We wait for pending queries to end that overlap with this truncation.
 	if !initialize {
@@ -1026,7 +1028,6 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	// This was an initial call to Truncate after loading blocks on startup.
 	// We haven't read back the WAL yet, so do not attempt to truncate it.
 	if initialize {
-		h.memTruncateMtx.Unlock()
 		return nil
 	}
 
