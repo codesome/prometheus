@@ -63,12 +63,14 @@ type ExemplarStorage interface {
 
 // Head handles reads and writes of time series data within a time window.
 type Head struct {
-	chunkRange            atomic.Int64
-	numSeries             atomic.Uint64
-	minTime, maxTime      atomic.Int64 // Current min and max of the samples included in the head.
-	minValidTime          atomic.Int64 // Mint allowed to be added to the head. It shouldn't be lower than the maxt of the last persisted block.
-	lastWALTruncationTime atomic.Int64
-	lastSeriesID          atomic.Uint64
+	chunkRange                    atomic.Int64
+	numSeries                     atomic.Uint64
+	minTime, maxTime              atomic.Int64 // Current min and max of the samples included in the head.
+	minValidTime                  atomic.Int64 // Mint allowed to be added to the head. It shouldn't be lower than the maxt of the last persisted block.
+	lastWALTruncationTime         atomic.Int64
+	lastMemoryTruncationStartTime atomic.Int64
+	lastMemoryTruncationEndTime   atomic.Int64
+	lastSeriesID                  atomic.Uint64
 
 	metrics       *headMetrics
 	opts          *HeadOptions
@@ -114,6 +116,7 @@ type Head struct {
 	// since the index tells which chunks to access.
 	pendingIndexReadersMtx sync.RWMutex
 	pendingIndexReaders    map[*headIndexReader]struct{}
+	truncationInProcess    atomic.Bool
 }
 
 // HeadOptions are parameters for the Head block.
@@ -412,6 +415,8 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, opts *HeadOpti
 	h.minTime.Store(math.MaxInt64)
 	h.maxTime.Store(math.MinInt64)
 	h.lastWALTruncationTime.Store(math.MinInt64)
+	h.lastMemoryTruncationStartTime.Store(math.MinInt64)
+	h.lastMemoryTruncationEndTime.Store(math.MinInt64)
 	h.metrics = newHeadMetrics(h, r)
 
 	if opts.ChunkPool == nil {
@@ -944,22 +949,39 @@ func (h *Head) Truncate(mint int64) (err error) {
 
 // AcquireQuerierLock waits till there is not Head truncation happening in parallel
 // and acquires a lock to prevent parallel truncation.
-// NOTE: It is mandatory to call h.ReleaseQuerierLock() after this.
-func (h *Head) AcquireQuerierLock() {
+// * return true means it acquired the lock and it is mandatory to h.ReleaseQuerierLock()
+//   after the query.
+// * return false means the lock was not acquired and it's safe to query.
+func (h *Head) AcquireQuerierLock(mint, maxt int64) bool {
+	if h.truncationInProcess.Load() {
+		// We assume that truncation is not called too often.
+		// So if truncation is in progress, it is safe to check
+		// the last truncation time as best effort to avoid taking the lock if
+		// the query does not overlap the truncation.
+		if h.lastMemoryTruncationStartTime.Load() > maxt || mint > h.lastMemoryTruncationEndTime.Load() {
+			// Does not overlap with the truncation range.
+			return false
+		}
+	}
+
+	// If we reach here, it means either the truncation is not in progress or
+	// we overlap with the truncation range in progress.
 	h.truncateMtx.RLock()
+	return true
 }
 
 func (h *Head) ReleaseQuerierLock() {
 	h.truncateMtx.RUnlock()
 }
 
-func (h *Head) waitForPendingReaders(t int64) {
+func (h *Head) waitForPendingReaders(mint, maxt int64) {
 	// TODO: should we have some limit on how long we wait in total? If so, how long?
 	overlaps := func() bool {
 		h.pendingIndexReadersMtx.RLock()
 		defer h.pendingIndexReadersMtx.RUnlock()
 		for ir := range h.pendingIndexReaders {
-			if ir.mint <= t && t <= ir.maxt {
+			if ir.mint <= maxt && mint <= ir.maxt {
+				// Overlaps with the truncation range.
 				return true
 			}
 		}
@@ -981,15 +1003,23 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 	// This locks blocks queries to proceede further.
 	h.truncateMtx.Lock()
 
-	// We wait for pending queries to end that overlap with this truncation.
-	h.waitForPendingReaders(mint)
-
 	initialize := h.MinTime() == math.MaxInt64
 
 	if h.MinTime() >= mint && !initialize {
 		h.truncateMtx.Unlock()
 		return nil
 	}
+
+	h.lastMemoryTruncationStartTime.Store(h.MinTime())
+	h.lastMemoryTruncationEndTime.Store(mint)
+	h.truncationInProcess.Store(true)
+	defer h.truncationInProcess.Store(false)
+
+	// We wait for pending queries to end that overlap with this truncation.
+	if !initialize {
+		h.waitForPendingReaders(h.MinTime(), mint)
+	}
+
 	h.minTime.Store(mint)
 	h.minValidTime.Store(mint)
 

@@ -1553,7 +1553,7 @@ func (db *DB) ChunkQuerier(_ context.Context, mint, maxt int64) (storage.ChunkQu
 		// Acquiring this lock is important to avoid these bugs:
 		// - https://github.com/prometheus/prometheus/issues/8221
 		// - https://github.com/prometheus/prometheus/issues/9079
-		db.head.AcquireQuerierLock()
+		db.head.AcquireQuerierLock(mint, maxt)
 		defer db.head.ReleaseQuerierLock()
 
 		blocks = append(blocks, NewRangeHead(db.head, mint, maxt))
