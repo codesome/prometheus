@@ -2320,7 +2320,7 @@ func TestQueryWaitingOnTruncation(t *testing.T) {
 	// With this lock, below goroutine should not get blocked.
 	db.head.AcquireQuerierLock()
 
-	done := false
+	var done atomic.Bool
 	go func() {
 		// These queriers should not take the lock since it does not overlap with truncation.
 		// This case also tests that we are not unlocking the lock when we haven't got it in
@@ -2342,11 +2342,11 @@ func TestQueryWaitingOnTruncation(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, cq.Close())
 
-		done = true
+		done.Store(false)
 	}()
 
 	<-time.After(500 * time.Millisecond)
-	require.True(t, done)
+	require.True(t, done.Load())
 
 	// Getting queriers that overlap with truncation should get blocked till
 	// truncation is over.
@@ -2419,16 +2419,16 @@ func TestWaitForPendingReadersInTimeRange(t *testing.T) {
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("mint=%d,maxt=%d,shouldWait=%t", c.mint, c.maxt, c.shouldWait), func(t *testing.T) {
 			checkWaiting := func(cl io.Closer) {
-				waitOver := false
+				var waitOver atomic.Bool
 				go func() {
 					db.head.WaitForPendingReadersInTimeRange(truncMint, truncMaxt)
-					waitOver = true
+					waitOver.Store(true)
 				}()
 				<-time.After(50 * time.Millisecond)
 				require.Equal(t, !c.shouldWait, waitOver)
 				require.NoError(t, cl.Close())
 				<-time.After(50 * time.Millisecond)
-				require.True(t, waitOver)
+				require.True(t, waitOver.Load())
 			}
 
 			q, err := db.Querier(context.Background(), c.mint, c.maxt)
