@@ -2294,7 +2294,7 @@ func TestDataMissingOnQueryDuringCompaction(t *testing.T) {
 	wg.Wait()
 }
 
-func TestQueryWaitingOnTruncation(t *testing.T) {
+func TestIsQuerierValid(t *testing.T) {
 	db := newTestDB(t)
 	db.DisableCompactions()
 
@@ -2312,78 +2312,31 @@ func TestQueryWaitingOnTruncation(t *testing.T) {
 
 	// This mocks truncation.
 	db.head.memTruncationInProcess.Store(true)
-	db.head.lastMemoryTruncationStartTime.Store(1000)
-	db.head.lastMemoryTruncationEndTime.Store(2000)
+	db.head.lastMemoryTruncationTime.Store(2000)
 
-	// Getting querier when truncation is in progress and not overlapping with
-	// truncation should not acquire and release the lock.
-	// With this lock, below goroutine should not get blocked.
-	db.head.AcquireQuerierLock()
-
-	var done atomic.Bool
-	go func() {
-		// These queriers should not take the lock since it does not overlap with truncation.
-		// This case also tests that we are not unlocking the lock when we haven't got it in
-		// the first place.
-
-		// Before range truncation.
-		q, err := db.Querier(context.Background(), 0, 500)
-		require.NoError(t, err)
-		require.NoError(t, q.Close())
-		cq, err := db.ChunkQuerier(context.Background(), 0, 500)
-		require.NoError(t, err)
-		require.NoError(t, cq.Close())
-
-		// After truncation range.
-		q, err = db.Querier(context.Background(), 2100, 2500)
-		require.NoError(t, err)
-		require.NoError(t, q.Close())
-		cq, err = db.ChunkQuerier(context.Background(), 2100, 2500)
-		require.NoError(t, err)
-		require.NoError(t, cq.Close())
-
-		done.Store(false)
-	}()
-
-	<-time.After(500 * time.Millisecond)
-	require.True(t, done.Load())
-
-	// Getting queriers that overlap with truncation should get blocked till
-	// truncation is over.
+	// Test that IsQuerierValid suggests correct querier ranges.
 	cases := []struct {
-		mint, maxt int64
+		mint, maxt                int64 // For the querier.
+		expShouldClose, expGetNew bool
+		expNewMint                int64
 	}{
-		{500, 1500},  // Overlaps with truncation at the start.
-		{1200, 1700}, // Within truncation range.
-		{1800, 2500}, // Overlaps with truncation at the end.
+		{-200, -100, true, false, 0},
+		{-200, 300, true, false, 0},
+		{100, 1900, true, false, 0},
+		{1900, 2200, true, true, 2000},
+		{2000, 2500, false, false, 0},
 	}
-	// Generating all possible overlaps.
-	var queriersGot atomic.Int64
+
 	for _, c := range cases {
-		go func(mint, maxt int64) {
-			q, err := db.Querier(context.Background(), mint, maxt)
-			queriersGot.Inc()
-			require.NoError(t, err)
-			require.NoError(t, q.Close())
-		}(c.mint, c.maxt)
-		go func(mint, maxt int64) {
-			cq, err := db.ChunkQuerier(context.Background(), mint, maxt)
-			queriersGot.Inc()
-			require.NoError(t, err)
-			require.NoError(t, cq.Close())
-		}(c.mint, c.maxt)
+		t.Run(fmt.Sprintf("mint=%d,maxt=%d", c.mint, c.maxt), func(t *testing.T) {
+			shouldClose, getNew, newMint := db.head.IsQuerierValid(c.mint, c.maxt)
+			require.Equal(t, c.expShouldClose, shouldClose)
+			require.Equal(t, c.expGetNew, getNew)
+			if getNew {
+				require.Equal(t, c.expNewMint, newMint)
+			}
+		})
 	}
-
-	<-time.After(100 * time.Millisecond)
-	require.Equal(t, int64(0), queriersGot.Load())
-
-	db.head.memTruncationInProcess.Store(false)
-	db.head.ReleaseQuerierLock()
-
-	// Now after head truncation is over they should be all unblocked.
-	<-time.After(25 * time.Millisecond)
-	require.Equal(t, int64(2*len(cases)), queriersGot.Load())
-
 }
 
 func TestWaitForPendingReadersInTimeRange(t *testing.T) {
@@ -2424,10 +2377,10 @@ func TestWaitForPendingReadersInTimeRange(t *testing.T) {
 					db.head.WaitForPendingReadersInTimeRange(truncMint, truncMaxt)
 					waitOver.Store(true)
 				}()
-				<-time.After(50 * time.Millisecond)
-				require.Equal(t, !c.shouldWait, waitOver)
+				<-time.After(550 * time.Millisecond)
+				require.Equal(t, !c.shouldWait, waitOver.Load())
 				require.NoError(t, cl.Close())
-				<-time.After(50 * time.Millisecond)
+				<-time.After(550 * time.Millisecond)
 				require.True(t, waitOver.Load())
 			}
 

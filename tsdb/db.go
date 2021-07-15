@@ -1516,15 +1516,29 @@ func (db *DB) Querier(_ context.Context, mint, maxt int64) (storage.Querier, err
 			blocks = append(blocks, b)
 		}
 	}
+	var headQuerier storage.Querier
 	if maxt >= db.head.MinTime() {
-		// Acquiring this lock is important to avoid these bugs:
-		// - https://github.com/prometheus/prometheus/issues/8221
-		// - https://github.com/prometheus/prometheus/issues/9079
-		if db.head.AcquireQuerierRLock(mint, maxt) {
-			defer db.head.ReleaseQuerierRLock()
+		rh := NewRangeHead(db.head, mint, maxt)
+		var err error
+		headQuerier, err = NewBlockQuerier(rh, mint, maxt)
+		if err != nil {
+			return nil, errors.Wrapf(err, "open querier for head %s", rh)
 		}
 
-		blocks = append(blocks, NewRangeHead(db.head, mint, maxt))
+		shouldClose, getNew, newMint := db.head.IsQuerierValid(mint, maxt)
+		if shouldClose {
+			if err := headQuerier.Close(); err != nil {
+				return nil, errors.Wrapf(err, "closing head querier %s", rh)
+			}
+			headQuerier = nil
+		}
+		if getNew {
+			rh := NewRangeHead(db.head, newMint, maxt)
+			headQuerier, err = NewBlockQuerier(rh, mint, maxt)
+			if err != nil {
+				return nil, errors.Wrapf(err, "open querier for head while getting new querier %s", rh)
+			}
+		}
 	}
 
 	blockQueriers := make([]storage.Querier, 0, len(blocks))
@@ -1541,6 +1555,9 @@ func (db *DB) Querier(_ context.Context, mint, maxt int64) (storage.Querier, err
 		}
 		return nil, errors.Wrapf(err, "open querier for block %s", b)
 	}
+	if headQuerier != nil {
+		blockQueriers = append(blockQueriers, headQuerier)
+	}
 	return storage.NewMergeQuerier(blockQueriers, nil, storage.ChainedSeriesMerge), nil
 }
 
@@ -1556,15 +1573,29 @@ func (db *DB) ChunkQuerier(_ context.Context, mint, maxt int64) (storage.ChunkQu
 			blocks = append(blocks, b)
 		}
 	}
+	var headQuerier storage.ChunkQuerier
 	if maxt >= db.head.MinTime() {
-		// Acquiring this lock is important to avoid these bugs:
-		// - https://github.com/prometheus/prometheus/issues/8221
-		// - https://github.com/prometheus/prometheus/issues/9079
-		if db.head.AcquireQuerierRLock(mint, maxt) {
-			defer db.head.ReleaseQuerierRLock()
+		rh := NewRangeHead(db.head, mint, maxt)
+		var err error
+		headQuerier, err = NewBlockChunkQuerier(rh, mint, maxt)
+		if err != nil {
+			return nil, errors.Wrapf(err, "open querier for head %s", rh)
 		}
 
-		blocks = append(blocks, NewRangeHead(db.head, mint, maxt))
+		shouldClose, getNew, newMint := db.head.IsQuerierValid(mint, maxt)
+		if shouldClose {
+			if err := headQuerier.Close(); err != nil {
+				return nil, errors.Wrapf(err, "closing head querier %s", rh)
+			}
+			headQuerier = nil
+		}
+		if getNew {
+			rh := NewRangeHead(db.head, newMint, maxt)
+			headQuerier, err = NewBlockChunkQuerier(rh, mint, maxt)
+			if err != nil {
+				return nil, errors.Wrapf(err, "open querier for head while getting new querier %s", rh)
+			}
+		}
 	}
 
 	blockQueriers := make([]storage.ChunkQuerier, 0, len(blocks))
@@ -1580,6 +1611,9 @@ func (db *DB) ChunkQuerier(_ context.Context, mint, maxt int64) (storage.ChunkQu
 			_ = q.Close()
 		}
 		return nil, errors.Wrapf(err, "open querier for block %s", b)
+	}
+	if headQuerier != nil {
+		blockQueriers = append(blockQueriers, headQuerier)
 	}
 
 	return storage.NewMergeChunkQuerier(blockQueriers, nil, storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)), nil

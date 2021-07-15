@@ -63,14 +63,13 @@ type ExemplarStorage interface {
 
 // Head handles reads and writes of time series data within a time window.
 type Head struct {
-	chunkRange                    atomic.Int64
-	numSeries                     atomic.Uint64
-	minTime, maxTime              atomic.Int64 // Current min and max of the samples included in the head.
-	minValidTime                  atomic.Int64 // Mint allowed to be added to the head. It shouldn't be lower than the maxt of the last persisted block.
-	lastWALTruncationTime         atomic.Int64
-	lastMemoryTruncationStartTime atomic.Int64
-	lastMemoryTruncationEndTime   atomic.Int64
-	lastSeriesID                  atomic.Uint64
+	chunkRange               atomic.Int64
+	numSeries                atomic.Uint64
+	minTime, maxTime         atomic.Int64 // Current min and max of the samples included in the head.
+	minValidTime             atomic.Int64 // Mint allowed to be added to the head. It shouldn't be lower than the maxt of the last persisted block.
+	lastWALTruncationTime    atomic.Int64
+	lastMemoryTruncationTime atomic.Int64
+	lastSeriesID             atomic.Uint64
 
 	metrics       *headMetrics
 	opts          *HeadOptions
@@ -409,8 +408,7 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal *wal.WAL, opts *HeadOpti
 	h.minTime.Store(math.MaxInt64)
 	h.maxTime.Store(math.MinInt64)
 	h.lastWALTruncationTime.Store(math.MinInt64)
-	h.lastMemoryTruncationStartTime.Store(math.MinInt64)
-	h.lastMemoryTruncationEndTime.Store(math.MinInt64)
+	h.lastMemoryTruncationTime.Store(math.MinInt64)
 	h.metrics = newHeadMetrics(h, r)
 
 	if opts.ChunkPool == nil {
@@ -941,60 +939,6 @@ func (h *Head) Truncate(mint int64) (err error) {
 	return h.truncateWAL(mint)
 }
 
-// AcquireQuerierRLock waits till there is not Head truncation happening in parallel
-// and acquires a lock to prevent parallel truncation.
-// * return true means it acquired the lock and it is mandatory to h.ReleaseQuerierLock()
-//   after the query.
-// * return false means the lock was not acquired and it's safe to query.
-func (h *Head) AcquireQuerierRLock(mint, maxt int64) bool {
-	if h.memTruncationInProcess.Load() {
-		// We assume that truncation is not called too often.
-		// So if truncation is in progress, it is safe to check
-		// the last truncation time as best effort to avoid taking the lock if
-		// the query does not overlap the truncation.
-		if h.lastMemoryTruncationStartTime.Load() > maxt || mint > h.lastMemoryTruncationEndTime.Load() {
-			// Does not overlap with the truncation range.
-			return false
-		}
-	}
-
-	// If we reach here, it means either the truncation is not in progress or
-	// we overlap with the truncation range in progress.
-	h.memTruncateMtx.RLock()
-	return true
-}
-
-func (h *Head) ReleaseQuerierRLock() {
-	h.memTruncateMtx.RUnlock()
-}
-
-func (h *Head) AcquireQuerierLock() {
-	h.memTruncateMtx.Lock()
-}
-
-func (h *Head) ReleaseQuerierLock() {
-	h.memTruncateMtx.Unlock()
-}
-
-func (h *Head) WaitForPendingReadersInTimeRange(mint, maxt int64) {
-	// TODO: should we have some limit on how long we wait in total? If so, how long?
-	overlaps := func() bool {
-		o := false
-		h.iso.TraverseOpenReads(func(s *isolationState) bool {
-			if s.mint <= maxt && mint <= s.maxt {
-				// Overlaps with the truncation range.
-				o = true
-				return false
-			}
-			return true
-		})
-		return o
-	}
-	for overlaps() {
-		time.Sleep(2 * time.Millisecond)
-	}
-}
-
 // truncateMemory removes old data before mint from the head.
 func (h *Head) truncateMemory(mint int64) (err error) {
 	defer func() {
@@ -1009,15 +953,11 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 		return nil
 	}
 
-	h.lastMemoryTruncationStartTime.Store(h.MinTime())
-	h.lastMemoryTruncationEndTime.Store(mint)
+	// The order of these two Store() should not be changed,
+	// i.e. truncation time is set before in-process boolean.
+	h.lastMemoryTruncationTime.Store(mint)
 	h.memTruncationInProcess.Store(true)
 	defer h.memTruncationInProcess.Store(false)
-
-	if !initialize {
-		// This prevents getting any new queriers overlapping with truncation.
-		h.AcquireQuerierLock()
-	}
 
 	// We wait for pending queries to end that overlap with this truncation.
 	if !initialize {
@@ -1058,15 +998,81 @@ func (h *Head) truncateMemory(mint int64) (err error) {
 		}
 	}
 
-	// At this point the index is updated and queries cannot access old chunks.
-	// So we can truncate m-mapped chunks outside this lock.
-	h.ReleaseQuerierLock()
-
 	// Truncate the chunk m-mapper.
 	if err := h.chunkDiskMapper.Truncate(mint); err != nil {
 		return errors.Wrap(err, "truncate chunks.HeadReadWriter")
 	}
 	return nil
+}
+
+func (h *Head) WaitForPendingReadersInTimeRange(mint, maxt int64) {
+	// TODO: should we have some limit on how long we wait in total? If so, how long?
+	overlaps := func() bool {
+		o := false
+		h.iso.TraverseOpenReads(func(s *isolationState) bool {
+			if s.mint <= maxt && mint <= s.maxt {
+				// Overlaps with the truncation range.
+				o = true
+				return false
+			}
+			return true
+		})
+		return o
+	}
+	for overlaps() {
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// IsQuerierValid tells if the current querier should be closed and if
+// have to get a new querier. If should get a new querier, it also tells
+// what is the new mint of the Head to be considered.
+// headMintObserved argument is the head mint that was considered while
+// taking the querier.
+// This function helps in preventing race with truncation of in-memory data.
+// NOTE: The querier should already be taken before calling this.
+func (h *Head) IsQuerierValid(querierMint, querierMaxt int64) (shouldClose bool, getNew bool, newMint int64) {
+	if !h.memTruncationInProcess.Load() {
+		return false, false, 0
+	}
+	// Head truncation is in process. It also means that the block that was
+	// created for this truncation range is also available.
+	// Check if we took a querier which overlaps with this truncation.
+	memTruncTime := h.lastMemoryTruncationTime.Load()
+	if querierMaxt < memTruncTime {
+		// Head compaction has happened and this time range is being truncated.
+		// This query not longer overlaps with the Head.
+		// We should close this querier to avoid races and the data would be
+		// available with the blocks below.
+		// Cases:
+		// 1.     |------truncation------|
+		//   |---query---|
+		// 2.     |------truncation------|
+		//              |---query---|
+		shouldClose = true
+	} else if querierMint < memTruncTime {
+		// The truncation time is not same as head mint that we saw above but the
+		// query still overlaps with the Head.
+		// The truncation started after we got the querier. So it is not safe
+		// to use this querier and/or might block truncation. We should get
+		// a new querier for the new Head range while remaining will be available
+		// in the blocks below.
+		// Case:
+		//      |------truncation------|
+		//                        |----query----|
+		// Turns into
+		//      |------truncation------|
+		//                             |---qu---|
+
+		shouldClose = true
+		getNew = true
+		newMint = memTruncTime
+	}
+	// Other case is this, which is a no-op
+	//      |------truncation------|
+	//                              |---query---|
+
+	return shouldClose, getNew, newMint
 }
 
 // truncateWAL removes old data before mint from the WAL.
