@@ -2240,7 +2240,7 @@ func TestDBReadOnly(t *testing.T) {
 		w, err := wal.New(logger, nil, filepath.Join(dbDir, "wal"), true)
 		require.NoError(t, err)
 		h := createHead(t, w, genSeries(1, 1, 16, 18), dbDir)
-		require.NoError(t, h.Close())
+		require.NoError(t, h.CloseWithoutSnapshot())
 	}
 
 	// Open a normal db to use for a comparison.

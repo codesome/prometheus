@@ -382,7 +382,7 @@ func (db *DBReadOnly) FlushWAL(dir string) (returnErr error) {
 	defer func() {
 		returnErr = tsdb_errors.NewMulti(
 			returnErr,
-			errors.Wrap(head.Close(), "closing Head"),
+			errors.Wrap(head.CloseWithoutSnapshot(), "closing Head"),
 		).Err()
 	}()
 	// Set the min valid time for the ingested wal samples
@@ -442,7 +442,7 @@ func (db *DBReadOnly) loadDataAsQueryable(maxt int64) (storage.SampleAndChunkQue
 
 	// Also add the WAL if the current blocks don't cover the requests time range.
 	if maxBlockTime <= maxt {
-		if err := head.Close(); err != nil {
+		if err := head.CloseWithoutSnapshot(); err != nil {
 			return nil, err
 		}
 		w, err := wal.Open(db.logger, filepath.Join(db.dir, "wal"))
@@ -465,13 +465,24 @@ func (db *DBReadOnly) loadDataAsQueryable(maxt int64) (storage.SampleAndChunkQue
 		head.wal = nil
 	}
 
-	db.closers = append(db.closers, head)
+	db.closers = append(db.closers, &customCloser{closer: head.CloseWithoutSnapshot})
 	return &DB{
 		dir:    db.dir,
 		logger: db.logger,
 		blocks: blocks,
 		head:   head,
 	}, nil
+}
+
+type customCloser struct {
+	closer func() error
+}
+
+func (cc *customCloser) Close() error {
+	if cc.closer == nil {
+		return nil
+	}
+	return cc.closer()
 }
 
 // Querier loads the blocks and wal and returns a new querier over the data partition for the given time range.
@@ -1430,6 +1441,14 @@ func (db *DB) Head() *Head {
 
 // Close the partition.
 func (db *DB) Close() error {
+	return db.close(true)
+}
+
+func (db *DB) CloseWithoutSnapshot() error {
+	return db.close(false)
+}
+
+func (db *DB) close(withHeadSnapshot bool) error {
 	close(db.stopc)
 	if db.compactCancel != nil {
 		db.compactCancel()
@@ -1452,7 +1471,11 @@ func (db *DB) Close() error {
 		errs.Add(os.Remove(db.lockfPath))
 	}
 	if db.head != nil {
-		errs.Add(db.head.Close())
+		if withHeadSnapshot {
+			errs.Add(db.head.Close())
+		} else {
+			errs.Add(db.head.CloseWithoutSnapshot())
+		}
 	}
 	return errs.Err()
 }

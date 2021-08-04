@@ -2465,3 +2465,67 @@ func TestWaitForPendingReadersInTimeRange(t *testing.T) {
 		})
 	}
 }
+
+func TestChunkSnapshot(t *testing.T) {
+	head, w := newTestHead(t, DefaultBlockDuration, false)
+	defer func() {
+		require.NoError(t, head.CloseWithoutSnapshot())
+	}()
+
+	numSeries := 10
+	expSeries := make(map[string][]tsdbutil.Sample)
+	app := head.Appender(context.Background())
+	for i := 1; i <= numSeries; i++ {
+		lbls := labels.Labels{labels.Label{Name: "foo", Value: fmt.Sprintf("bar%d", i)}}
+		lblStr := lbls.String()
+		for ts := int64(1); ts <= 10; ts++ {
+			val := rand.Float64()
+			expSeries[lblStr] = append(expSeries[lblStr], sample{ts, val})
+			_, err := app.Append(0, lbls, ts, val)
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, app.Commit())
+
+	require.NoError(t, head.Close()) // This will create a snapshot.
+
+	w, err := wal.NewSize(nil, nil, w.Dir(), 32768, false)
+	require.NoError(t, err)
+	head, err = NewHead(nil, nil, w, head.opts, nil)
+	require.NoError(t, err)
+	require.NoError(t, head.Init(math.MinInt64))
+
+	// Test query when everything is replayed from snapshot.
+	q, err := NewBlockQuerier(head, math.MinInt64, math.MaxInt64)
+	require.NoError(t, err)
+	series := query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "foo", ".*"))
+	require.Equal(t, expSeries, series)
+
+	// Add more samples to only include in WAL and not snapshot.
+	app = head.Appender(context.Background())
+	for i := 1; i <= numSeries; i++ {
+		lbls := labels.Labels{labels.Label{Name: "foo", Value: fmt.Sprintf("bar%d", i)}}
+		lblStr := lbls.String()
+		for ts := int64(11); ts <= 20; ts++ {
+			val := rand.Float64()
+			expSeries[lblStr] = append(expSeries[lblStr], sample{ts, val})
+			_, err := app.Append(0, lbls, ts, val)
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, app.Commit())
+
+	require.NoError(t, head.CloseWithoutSnapshot()) // This will not create a snapshot.
+
+	w, err = wal.NewSize(nil, nil, w.Dir(), 32768, false)
+	require.NoError(t, err)
+	head, err = NewHead(nil, nil, w, head.opts, nil)
+	require.NoError(t, err)
+	require.NoError(t, head.Init(math.MinInt64))
+
+	// Test query when everything part is replayed from snapshot and part from WAL.
+	q, err = NewBlockQuerier(head, math.MinInt64, math.MaxInt64)
+	require.NoError(t, err)
+	series = query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "foo", ".*"))
+	require.Equal(t, expSeries, series)
+}
