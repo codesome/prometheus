@@ -16,6 +16,7 @@ package tsdb
 import (
 	"context"
 	"fmt"
+	"github.com/go-kit/log"
 	"io"
 	"io/ioutil"
 	"math"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2804,4 +2806,497 @@ func TestSparseHistogramMetrics(t *testing.T) {
 
 	require.Equal(t, float64(expHistSeries), prom_testutil.ToFloat64(head.metrics.sparseHistogramSeries))
 	require.Equal(t, float64(0), prom_testutil.ToFloat64(head.metrics.sparseHistogramSamplesTotal)) // Counter reset.
+}
+
+//Stripping 01FEF7201WX0Y7NBJ9Q9QZ83GH
+//New Block 01FEXAQ39816EKZEAKYQ42S9Z3 NumSeries 249
+//Stripping 01FEFMSE3JMVE64HTMH917YE7V
+//New Block 01FEXAQ3FXK802SH79QYTPRJ61 NumSeries 143
+//Stripping 01FEFVN5BGNZQDM2KZMNJRS8YD
+//New Block 01FEXAQ3P150MEM6N09925EMRX NumSeries 144
+//
+//Histo metric names
+//cortex_request_duration_seconds
+func TestStripSparseBlock(t *testing.T) {
+	pool := chunkenc.NewPool()
+	l := log.NewNopLogger()
+	blocksDir := "/home/ganesh/Desktop/histo/new"
+	writeDir := "/home/ganesh/Desktop/histo/new_stripped"
+
+	blocks, corrupted, err := openBlocks(l, blocksDir, nil, pool)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(corrupted))
+	var closers []io.Closer
+
+	t.Cleanup(func() {
+		for _, c := range closers {
+			require.NoError(t, c.Close())
+		}
+		for _, b := range blocks {
+			require.NoError(t, b.Close())
+		}
+	})
+
+	metricNames := make(map[string]struct{})
+
+	for bidx, b := range blocks {
+		fmt.Println("Stripping", b.meta.ULID)
+		indexr, err := b.Index()
+		require.NoError(t, err)
+		closers = append(closers, indexr)
+
+		chunkr, err := b.Chunks()
+		require.NoError(t, err)
+		closers = append(closers, chunkr)
+
+		tombsr, err := b.Tombstones()
+		require.NoError(t, err)
+		closers = append(closers, tombsr)
+
+		k, v := index.AllPostingsKey()
+		all, err := indexr.Postings(k, v)
+		require.NoError(t, err)
+		all = indexr.SortedPostings(all)
+		// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
+		ss := newBlockChunkSeriesSet(indexr, chunkr, tombsr, all, b.Meta().MinTime, b.Meta().MaxTime-1)
+
+		bw, err := NewBlockWriter(l, writeDir, DefaultBlockDuration*30)
+		require.NoError(t, err)
+
+		numSeries := 0
+		for ss.Next() {
+			s := ss.At()
+			lbls := s.Labels()
+			it := s.Iterator()
+			app := bw.Appender(context.Background())
+			counted := false
+			for it.Next() {
+				chk := it.At()
+				if chk.Chunk.Encoding() != chunkenc.EncSHS {
+					break
+				}
+				if !strings.HasPrefix(lbls.Get("job"), "cortex-dev-01/cortex-gw") {
+					continue
+				}
+				key := lbls.Get("instance") + "_" + lbls.Get("route") + "_" + lbls.Get("status_code")
+				if bidx == 0 && !allowedKeys[key] {
+					continue
+				}
+				if !counted {
+					metricNames[lbls.Get(labels.MetricName)] = struct{}{}
+					numSeries++
+					counted = true
+				}
+
+				chkIt := chk.Chunk.Iterator(nil)
+				ref := uint64(0)
+				for chkIt.Next() {
+					ts, h := chkIt.AtHistogram()
+					ref, err = app.AppendHistogram(ref, lbls, ts, h)
+					require.NoError(t, err)
+				}
+				require.NoError(t, chkIt.Err())
+			}
+			require.NoError(t, app.Commit())
+			require.NoError(t, it.Err())
+		}
+		require.NoError(t, ss.Err())
+
+		newULID, err := bw.Flush(context.Background())
+		require.NoError(t, err)
+		fmt.Println("New Block", newULID, "NumSeries", numSeries)
+	}
+
+	fmt.Printf("\n")
+	fmt.Println("Histo metric names")
+	for mn := range metricNames {
+		fmt.Println(mn)
+	}
+}
+
+//Stripping 01FEF0968DWCNNSSTN9AVC11GV
+//New Block 01FEXARBANMJEBWBS9AXYBBNF4 NumSeries 4233
+//Conventional metric names
+//cortex_request_duration_seconds_bucket 3735
+//cortex_request_duration_seconds_count 249
+//cortex_request_duration_seconds_sum 249
+//
+//Stripping 01FEFMS3X059HE4PNS8HSSS7J5
+//New Block 01FEXARH1VYCCK0PZ3CEQDGR56 NumSeries 2431
+//Conventional metric names
+//cortex_request_duration_seconds_sum 143
+//cortex_request_duration_seconds_bucket 2145
+//cortex_request_duration_seconds_count 143
+//
+//Stripping 01FEFVMV511PMWRCFH2ZFC7PWE
+//New Block 01FEXARNQRWWA7ZYBYC01R8X3A NumSeries 2448
+//Conventional metric names
+//cortex_request_duration_seconds_bucket 2160
+//cortex_request_duration_seconds_count 144
+//cortex_request_duration_seconds_sum 144
+func TestStripConventionalBlock(t *testing.T) {
+	pool := chunkenc.NewPool()
+	l := log.NewNopLogger()
+	blocksDir := "/home/ganesh/Desktop/histo/old"
+	writeDir := "/home/ganesh/Desktop/histo/old_stripped"
+
+	blocks, corrupted, err := openBlocks(l, blocksDir, nil, pool)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(corrupted))
+	var closers []io.Closer
+
+	t.Cleanup(func() {
+		for _, c := range closers {
+			require.NoError(t, c.Close())
+		}
+		for _, b := range blocks {
+			require.NoError(t, b.Close())
+		}
+	})
+
+	for bidx, b := range blocks {
+		fmt.Println("Stripping", b.meta.ULID)
+		indexr, err := b.Index()
+		require.NoError(t, err)
+		closers = append(closers, indexr)
+
+		chunkr, err := b.Chunks()
+		require.NoError(t, err)
+		closers = append(closers, chunkr)
+
+		tombsr, err := b.Tombstones()
+		require.NoError(t, err)
+		closers = append(closers, tombsr)
+
+		k, v := index.AllPostingsKey()
+		all, err := indexr.Postings(k, v)
+		require.NoError(t, err)
+		all = indexr.SortedPostings(all)
+		// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
+		ss := newBlockChunkSeriesSet(indexr, chunkr, tombsr, all, b.Meta().MinTime, b.Meta().MaxTime-1)
+
+		bw, err := NewBlockWriter(l, writeDir, DefaultBlockDuration*30)
+		require.NoError(t, err)
+
+		numSeries := 0
+		metricNames := make(map[string]int)
+		for ss.Next() {
+			s := ss.At()
+			lbls := s.Labels()
+			if !strings.HasPrefix(lbls.Get(labels.MetricName), "cortex_request_duration") {
+				continue
+			}
+			if !strings.HasPrefix(lbls.Get("job"), "cortex-dev-01/cortex-gw") {
+				continue
+			}
+			key := lbls.Get("instance") + "_" + lbls.Get("route") + "_" + lbls.Get("status_code")
+			if bidx == 0 && !allowedKeys[key] {
+				continue
+			}
+			metricNames[lbls.Get(labels.MetricName)]++
+			numSeries++
+			it := s.Iterator()
+			app := bw.Appender(context.Background())
+			for it.Next() {
+				chk := it.At()
+				chkIt := chk.Chunk.Iterator(nil)
+				ref := uint64(0)
+				for chkIt.Next() {
+					ts, v := chkIt.At()
+					ref, err = app.Append(ref, lbls, ts, v)
+					require.NoError(t, err)
+				}
+				require.NoError(t, chkIt.Err())
+
+			}
+			require.NoError(t, app.Commit())
+			require.NoError(t, it.Err())
+		}
+		require.NoError(t, ss.Err())
+
+		newULID, err := bw.Flush(context.Background())
+		require.NoError(t, err)
+		fmt.Println("New Block", newULID, "NumSeries", numSeries)
+
+		fmt.Println("Conventional metric names")
+		for mn, v := range metricNames {
+			fmt.Println(mn, v)
+		}
+		fmt.Printf("\n")
+	}
+}
+
+func TestSomeCounts(t *testing.T) {
+	pool := chunkenc.NewPool()
+	l := log.NewNopLogger()
+	blocksDir := "/home/ganesh/Desktop/histo/new_stripped"
+
+	blocks, corrupted, err := openBlocks(l, blocksDir, nil, pool)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(corrupted))
+	var closers []io.Closer
+
+	t.Cleanup(func() {
+		for _, c := range closers {
+			require.NoError(t, c.Close())
+		}
+		for _, b := range blocks {
+			require.NoError(t, b.Close())
+		}
+	})
+
+	numBucketsMap := make(map[int]int)
+	for _, b := range blocks {
+		fmt.Println("Stripping", b.meta.ULID)
+		indexr, err := b.Index()
+		require.NoError(t, err)
+		closers = append(closers, indexr)
+
+		chunkr, err := b.Chunks()
+		require.NoError(t, err)
+		closers = append(closers, chunkr)
+
+		tombsr, err := b.Tombstones()
+		require.NoError(t, err)
+		closers = append(closers, tombsr)
+
+		k, v := index.AllPostingsKey()
+		all, err := indexr.Postings(k, v)
+		require.NoError(t, err)
+		all = indexr.SortedPostings(all)
+		// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
+		ss := newBlockChunkSeriesSet(indexr, chunkr, tombsr, all, b.Meta().MinTime, b.Meta().MaxTime-1)
+
+		for ss.Next() {
+			s := ss.At()
+
+			it := s.Iterator()
+			for it.Next() {
+				chk := it.At()
+				chkIt := chk.Chunk.Iterator(nil)
+				for chkIt.Next() {
+					_, h := chkIt.AtHistogram()
+					numBucketsMap[len(h.PositiveBuckets)]++
+				}
+				require.NoError(t, chkIt.Err())
+			}
+			require.NoError(t, it.Err())
+		}
+		require.NoError(t, ss.Err())
+	}
+
+	//numBuckets := make([]int, 0, len(numBucketsMap))
+	//for nb := range numBucketsMap {
+	//	numBuckets = append(numBuckets, nb)
+	//}
+	//sort.Ints(numBuckets)
+	fmt.Println(numBucketsMap)
+}
+
+var allowedKeys = map[string]bool{
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_metadata_500":                            true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_400":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_series_200":                              true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_push_202":                                       true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_query_range_502":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_push_200":                                       true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_push_429":                     true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_label_name_values_200": true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_v1_push_502":                       true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_query_200":                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_range_429":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_push_400":                                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_push_504":                                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_rules_namespace_202":                            true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_push_500":                                       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_v1_push_504":                       true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_series_200":                              true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_push_400":                                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_push_502":                                       true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_rules_200":                               true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_other_404":                                               true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_204":                     true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_label_name_values_200": true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_push_200":                     true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_query_range_502":                         true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_range_400":       true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_v1_push_502":                       true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_204":                     true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_push_200":                                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_series_200":                              true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_rules_namespace_groupname_200":                  true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_root_200":                                                true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_other_404":                             true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_v1_rules_200":                                        true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_500":                               true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_query_range_200":       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_labels_499":            true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_query_499":             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_root_200":                              true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_504":             true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_rules_404":                                      true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_500":                   true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_500":                   true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_504":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_range_400":                         true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_range_500":                         true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_query_504":             true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_push_400":                     true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_other_404":                                               true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_499":             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_push_200":                     true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_v1_push_502":                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_rules_namespace_groupname_404":                  true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_push_202":                                       true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_400":                               true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_v1_push_400":                       true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_500":             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_range_200":       true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_rules_200":                                      true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_root_200":                                                true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_502":                     true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_label_name_values_499": true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_v1_push_200":                       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_query_500":             true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_labels_200":                              true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_push_400":                                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_v1_rules_200":                                        true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_labels_500":                              true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_root_200":                                                true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_push_200":                                       true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_series_499":            true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_labels_200":            true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_other_301":                                               true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_v1_push_200":                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_push_500":                                       true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_labels_200":                              true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_push_400":                                       true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_push_504":                                       true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_v1_push_400":                       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_other_404":                             true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_push_200":                                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_429":                               true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_range_502":                         true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_range_504":                         true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_push_502":                                       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_query_200":             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_series_499":            true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_rules_200":                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_other_301":                                               true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_other_301":                             true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_series_200":            true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_200":             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_push_502":                     true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_v1_push_400":                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_series_500":                              true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_labels_500":                              true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_200":                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_range_200":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_rules_200":                                      true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_200":                     true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_root_200":                              true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_push_502":                     true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_rules_404":                                      true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_push_500":                     true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_query_range_200":       true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_push_202":                                       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_labels_200":                              true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_query_502":             true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_label_name_values_499": true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_v1_push_200":                       true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_200":                     true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_root_200":                                                true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_push_400":                     true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_labels_200":                              true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_200":                   true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_504":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_200":                   true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_429":                               true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_query_range_499":       true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_query_range_200":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_204":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_range_429":                         true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_series_200":            true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_root_200":                              true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_200":                   true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_500":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_rules_namespace_groupname_200":                  true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_push_401":                                       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_push_200":                     true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_label_name_values_499": true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_labels_200":            true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_push_400":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_200":                               true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_v1_rules_200":                                        true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_metadata_200":          true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_series_200":            true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_v1_rules_namespace_groupname_202":                    true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_v1_rules_200":                                        true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_other_301":                                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_400":                               true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_labels_200":            true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_query_200":             true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_series_499":            true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_other_301":                             true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_rules_200":                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_range_400":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_range_500":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_root_500":                                                true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_rules_200":                                      true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_query_502":             true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_200":                     true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_query_range_200":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_502":                   true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_400":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_502":                   true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_502":             true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_label_name_values_200":                   true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_other_404":                                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_200":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_rules_404":                                      true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_rules_namespace_202":                            true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_v1_push_202":                       true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_metadata_200":                            true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_series_429":                              true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_root_500":                                                true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_labels_499":            true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_push_500":                     true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_api_v1_query_range_499":       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_api_prom_push_502":                     true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_rules_200":                               true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_series_200":                              true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_metadata_500":                            true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_push_500":                     true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_api_v1_query_range_429":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_500":                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_push_401":                                       true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_metadata_200":                            true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_metadata_502":                            true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_v1_push_202":                       true,
+	"cortex-gw-internal-56859d5655-87gl4:cortex-gw-internal:http-metrics_other_301":                             true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_query_200":                               true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_204":                     true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_query_range_429":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_502":                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_range_502":                         true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_series_429":                              true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_query_range_504":                         true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_other_404":                             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_v1_push_202":                       true,
+	"cortex-gw-6dfffc6ccf-n5dj5:cortex-gw:http-metrics_api_prom_api_v1_metadata_200":                            true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_v1_rules_namespace_202":                              true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_query_504":             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_label_name_values_200": true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_rules_namespace_groupname_404":                  true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_exemplars_502":                     true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_range_200":                         true,
+	"cortex-gw-internal-56859d5655-2xlgj:cortex-gw-internal:http-metrics_api_prom_api_v1_query_499":             true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_labels_499":            true,
+	"cortex-gw-internal-56859d5655-z88w8:cortex-gw-internal:http-metrics_api_prom_api_v1_query_range_499":       true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_other_404":                                               true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_api_v1_metadata_200":                            true,
+	"cortex-gw-6dfffc6ccf-pf6cd:cortex-gw:http-metrics_api_prom_rules_404":                                      true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_api_v1_query_502":                               true,
+	"cortex-gw-6dfffc6ccf-q9nt7:cortex-gw:http-metrics_api_prom_push_202":                                       true,
+	"cortex-gw-6dfffc6ccf-74jxg:cortex-gw:http-metrics_api_prom_rules_200":                                      true,
 }
