@@ -50,7 +50,7 @@ func (s String) MarshalJSON() ([]byte, error) {
 // Scalar is a data point that's explicitly not associated with a metric.
 type Scalar struct {
 	T int64
-	V float64
+	V float64 // TODO(codesome): Histogram here too?
 }
 
 func (s Scalar) String() string {
@@ -81,6 +81,10 @@ func (s Series) String() string {
 type Point struct {
 	T int64
 	V float64
+	// TODO(codesome): Populate this at right places.
+	// I think we dont need to indicate here what is valid, H or V.
+	// That information should be know by the caller and use appropriate variable.
+	H histogram.Histogram
 }
 
 func (p Point) String() string {
@@ -96,7 +100,7 @@ func (p Point) MarshalJSON() ([]byte, error) {
 
 // Sample is a single sample belonging to a metric.
 type Sample struct {
-	Point
+	Point // TODO(codesome): Remove this comment later. Just to point out that with update in `Point`, now the Sample nicely extends to be usable as histogram sample.
 
 	Metric labels.Labels
 }
@@ -269,6 +273,7 @@ type storageSeriesIterator struct {
 	curr   int
 }
 
+// TODO(codesome): Possibly have to pass the chunk encoding type here.
 func newStorageSeriesIterator(series Series) *storageSeriesIterator {
 	return &storageSeriesIterator{
 		points: series.Points,
@@ -300,11 +305,12 @@ func (ssi *storageSeriesIterator) At() (t int64, v float64) {
 // support for histogram values yet.
 // TODO(beorn7): Fix that for histogram support in PromQL.
 func (ssi *storageSeriesIterator) AtHistogram() (int64, histogram.Histogram) {
+	panic("Not ready for histogram yet")
 	return 0, histogram.Histogram{}
 }
 
 func (ssi *storageSeriesIterator) ChunkEncoding() chunkenc.Encoding {
-	return chunkenc.EncXOR
+	return chunkenc.EncXOR // TODO(codesome): Not always now.
 }
 
 func (ssi *storageSeriesIterator) Next() bool {

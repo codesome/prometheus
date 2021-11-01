@@ -40,6 +40,7 @@ import (
 	"github.com/prometheus/prometheus/pkg/value"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/stats"
 )
 
@@ -1324,6 +1325,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 				outVec := call(inArgs, e.Args, enh)
 				enh.Out = outVec[:0]
 				if len(outVec) > 0 {
+					// TODO(codesome): Depending on input, use V or H.
 					ss.Points = append(ss.Points, Point{V: outVec[0].Point.V, T: ts})
 				}
 				// Only buffer stepRange milliseconds from the second step on.
@@ -1735,18 +1737,23 @@ func (ev *evaluator) matrixIterSlice(it *storage.BufferedSeriesIterator, mint, m
 	}
 
 	buf := it.Buffer()
-	for buf.Next() {
-		t, v := buf.At()
-		if value.IsStaleNaN(v) {
-			continue
-		}
-		// Values in the buffer are guaranteed to be smaller than maxt.
-		if t >= mint {
-			if ev.currentSamples >= ev.maxSamples {
-				ev.error(ErrTooManySamples(env))
+	bufEnc := buf.ChunkEncoding()
+	if bufEnc == chunkenc.EncHistogram {
+		// TODO(codesome): Use it with AtHistogram()
+	} else {
+		for buf.Next() {
+			t, v := buf.At()
+			if value.IsStaleNaN(v) {
+				continue
 			}
-			ev.currentSamples++
-			out = append(out, Point{T: t, V: v})
+			// Values in the buffer are guaranteed to be smaller than maxt.
+			if t >= mint {
+				if ev.currentSamples >= ev.maxSamples {
+					ev.error(ErrTooManySamples(env))
+				}
+				ev.currentSamples++
+				out = append(out, Point{T: t, V: v})
+			}
 		}
 	}
 	// The seeked sample might also be in the range.

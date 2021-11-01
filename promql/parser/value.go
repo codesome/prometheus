@@ -29,6 +29,7 @@ const (
 	ValueTypeScalar ValueType = "scalar"
 	ValueTypeMatrix ValueType = "matrix"
 	ValueTypeString ValueType = "string"
+	// TODO(codesome): Likely need 2 more types for HistogramVector and HistogramMatrix.
 )
 
 // DocumentedType returns the internal type to the equivalent

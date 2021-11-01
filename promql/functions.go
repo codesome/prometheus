@@ -71,6 +71,8 @@ func extrapolatedRate(vals []parser.Value, args parser.Expressions, enh *EvalNod
 		return enh.Out
 	}
 
+	// TODO(codesome): Need to update the use of .V to .H and different logic of rate
+	// when we are dealing with histograms.
 	resultValue := samples.Points[len(samples.Points)-1].V - samples.Points[0].V
 	if isCounter {
 		var lastValue float64

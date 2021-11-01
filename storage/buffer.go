@@ -123,7 +123,11 @@ func (b *BufferedSeriesIterator) Next() bool {
 }
 
 // Values returns the current element of the iterator.
+// TODO(codesome): Make it work with histograms as well.
 func (b *BufferedSeriesIterator) Values() (int64, float64) {
+	if b.it.ChunkEncoding() == chunkenc.EncHistogram {
+		panic("Histogram is not ready!")
+	}
 	return b.it.At()
 }
 
@@ -202,6 +206,7 @@ func (it *sampleRingIterator) At() (int64, float64) {
 // support for histogram values yet.
 // TODO(beorn7): Fix that for histogram support in PromQL.
 func (it *sampleRingIterator) AtHistogram() (int64, histogram.Histogram) {
+	panic("Implement this!")
 	return 0, histogram.Histogram{}
 }
 
