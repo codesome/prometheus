@@ -1204,6 +1204,7 @@ func (h *Head) Close() error {
 		errs.Add(h.wal.Close())
 	}
 	if errs.Err() == nil && h.opts.EnableMemorySnapshotOnShutdown {
+		fmt.Println("Snapshot taken")
 		errs.Add(h.performChunkSnapshot())
 	}
 	return errs.Err()

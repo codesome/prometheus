@@ -2788,6 +2788,68 @@ func TestChunkSnapshot(t *testing.T) {
 	}
 }
 
+// https://github.com/prometheus/prometheus/issues/9725
+func TestChunkSnapshotQueryBug(t *testing.T) {
+	dir := t.TempDir()
+	wlog, err := wal.NewSize(nil, nil, filepath.Join(dir, "wal"), 32768, true)
+	require.NoError(t, err)
+
+	opts := DefaultHeadOptions()
+	opts.ChunkRange = 120 * 4
+	opts.ChunkDirRoot = dir
+	opts.EnableMemorySnapshotOnShutdown = true
+	head, err := NewHead(nil, nil, wlog, opts, nil)
+	require.NoError(t, err)
+	require.NoError(t, head.Init(math.MinInt64))
+	defer func() {
+		head.opts.EnableMemorySnapshotOnShutdown = false
+		require.NoError(t, head.Close())
+	}()
+
+	expSeries := make(map[string][]tsdbutil.Sample)
+
+	allSeries := []labels.Labels{
+		{{"__name__", "request_duration"}, {"status_code", "200"}},
+		{{"__name__", "request_duration"}, {"status_code", "500"}},
+	}
+	for _, lbls := range allSeries {
+		lblStr := lbls.String()
+		// Should m-map at least 1 chunk.
+		app := head.Appender(context.Background())
+		for ts := int64(1); ts <= 200; ts++ {
+			val := rand.Float64()
+			expSeries[lblStr] = append(expSeries[lblStr], sample{ts, val})
+			_, err := app.Append(0, lbls, ts, val)
+			require.NoError(t, err)
+		}
+		require.NoError(t, app.Commit())
+	}
+
+	require.NoError(t, head.Close())
+	w, err := wal.NewSize(nil, nil, head.wal.Dir(), 32768, false)
+	require.NoError(t, err)
+	head, err = NewHead(nil, nil, w, head.opts, nil)
+	require.NoError(t, err)
+	require.NoError(t, head.Init(math.MinInt64))
+
+	require.NoError(t, head.Close())
+	w, err = wal.NewSize(nil, nil, head.wal.Dir(), 32768, false)
+	require.NoError(t, err)
+	head, err = NewHead(nil, nil, w, head.opts, nil)
+	require.NoError(t, err)
+	require.NoError(t, head.Init(math.MinInt64))
+
+	q, err := NewBlockQuerier(head, math.MinInt64, math.MaxInt64)
+	require.NoError(t, err)
+	series := query(t, q,
+		labels.MustNewMatcher(labels.MatchEqual, "__name__", "request_duration"),
+		labels.MustNewMatcher(labels.MatchNotEqual, "status_code", "200"),
+	)
+	fmt.Println(len(series))
+	//require.Equal(t, expSeries, series)
+
+}
+
 func TestSnapshotError(t *testing.T) {
 	head, _ := newTestHead(t, 120*4, false)
 	defer func() {

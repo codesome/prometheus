@@ -590,7 +590,7 @@ func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 	stats := &ChunkSnapshotStats{}
 
 	wlast, woffset, err := h.wal.LastSegmentAndOffset()
-	if err != nil && err != record.ErrNotFound {
+	if err != nil && err != record.ErrNotFound { // TODO(codesome): record.ErrNotFound is the wrong error check.
 		return stats, errors.Wrap(err, "get last wal segment and offset")
 	}
 
@@ -777,6 +777,7 @@ func LastChunkSnapshot(dir string) (string, int, int, error) {
 
 		splits := strings.Split(fi.Name()[len(chunkSnapshotPrefix):], ".")
 		if len(splits) != 2 {
+			// TODO(codesome): ignore the temporary directories, and maybe delete them on startup.
 			return "", 0, 0, errors.Errorf("chunk snapshot %s is not in the right format", fi.Name())
 		}
 
