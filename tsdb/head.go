@@ -490,10 +490,12 @@ func (h *Head) Init(minValidTime int64) error {
 	refSeries := make(map[chunks.HeadSeriesRef]*memSeries)
 
 	if h.opts.EnableMemorySnapshotOnShutdown {
+		fmt.Println("loading snapshot")
 		level.Info(h.logger).Log("msg", "Chunk snapshot is enabled, replaying from the snapshot")
 		var err error
 		snapIdx, snapOffset, refSeries, err = h.loadChunkSnapshot()
 		if err != nil {
+			fmt.Println("Error!", err)
 			snapIdx, snapOffset = -1, 0
 			h.metrics.snapshotReplayErrorTotal.Inc()
 			level.Error(h.logger).Log("msg", "Failed to load chunk snapshot", "err", err)
@@ -505,6 +507,7 @@ func (h *Head) Init(minValidTime int64) error {
 		level.Info(h.logger).Log("msg", "Chunk snapshot loading time", "duration", time.Since(start).String())
 	}
 
+	fmt.Println("Loading mmap")
 	mmapChunkReplayStart := time.Now()
 	mmappedChunks, err := h.loadMmappedChunks(refSeries)
 	if err != nil {
@@ -542,6 +545,7 @@ func (h *Head) Init(minValidTime int64) error {
 
 	multiRef := map[chunks.HeadSeriesRef]chunks.HeadSeriesRef{}
 	if err == nil && startFrom >= snapIdx {
+		fmt.Println("Loading checkpoint")
 		sr, err := wal.NewSegmentsReader(dir)
 		if err != nil {
 			return errors.Wrap(err, "open checkpoint")
@@ -570,6 +574,7 @@ func (h *Head) Init(minValidTime int64) error {
 	}
 	// Backfill segments from the most recent checkpoint onwards.
 	for i := startFrom; i <= endAt; i++ {
+		fmt.Println("Loading WAL", i)
 		s, err := wal.OpenReadSegment(wal.SegmentName(h.wal.Dir(), i))
 		if err != nil {
 			return errors.Wrap(err, fmt.Sprintf("open WAL segment: %d", i))

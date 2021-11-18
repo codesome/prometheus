@@ -2806,48 +2806,70 @@ func TestChunkSnapshotQueryBug(t *testing.T) {
 		require.NoError(t, head.Close())
 	}()
 
-	expSeries := make(map[string][]tsdbutil.Sample)
-
-	allSeries := []labels.Labels{
-		{{"__name__", "request_duration"}, {"status_code", "200"}},
-		{{"__name__", "request_duration"}, {"status_code", "500"}},
+	var allSeries []labels.Labels
+	for i := 0; i < 10; i++ {
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration"}, {"status_code", "200"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration"}, {"status_code", "500"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
 	}
-	for _, lbls := range allSeries {
-		lblStr := lbls.String()
-		// Should m-map at least 1 chunk.
-		app := head.Appender(context.Background())
-		for ts := int64(1); ts <= 200; ts++ {
-			val := rand.Float64()
-			expSeries[lblStr] = append(expSeries[lblStr], sample{ts, val})
-			_, err := app.Append(0, lbls, ts, val)
-			require.NoError(t, err)
+	lastStart, lastEnd := int64(0), int64(0)
+	add200Samples := func() {
+		lastStart = lastEnd + 1
+		lastEnd += 200
+		for _, lbls := range allSeries {
+			app := head.Appender(context.Background())
+			for ts := lastStart; ts <= lastEnd; ts++ {
+				val := rand.Float64()
+				_, err := app.Append(0, lbls, ts, val)
+				require.NoError(t, err)
+			}
+			require.NoError(t, app.Commit())
 		}
-		require.NoError(t, app.Commit())
 	}
 
-	require.NoError(t, head.Close())
-	w, err := wal.NewSize(nil, nil, head.wal.Dir(), 32768, false)
-	require.NoError(t, err)
-	head, err = NewHead(nil, nil, w, head.opts, nil)
-	require.NoError(t, err)
-	require.NoError(t, head.Init(math.MinInt64))
+	restart := func(snapshotEnabled bool) {
+		require.NoError(t, head.Close())
+		w, err := wal.NewSize(nil, nil, head.wal.Dir(), 32768, false)
+		require.NoError(t, err)
+		head.opts.EnableMemorySnapshotOnShutdown = snapshotEnabled
+		fmt.Println()
+		fmt.Println("Starting")
+		head, err = NewHead(nil, nil, w, head.opts, nil)
+		require.NoError(t, err)
+		require.NoError(t, head.Init(math.MinInt64))
+	}
 
-	require.NoError(t, head.Close())
-	w, err = wal.NewSize(nil, nil, head.wal.Dir(), 32768, false)
+	// Add samples
+	add200Samples()
+	// restart with snapshot disabled, but takes a snapshot
+	restart(false)
+	// add samples
+	add200Samples()
+	// rename snapshot
+	snapDir, _, _, err := LastChunkSnapshot(head.opts.ChunkDirRoot)
 	require.NoError(t, err)
-	head, err = NewHead(nil, nil, w, head.opts, nil)
+	fmt.Println(snapDir)
+	err = os.Rename(snapDir, snapDir+".tmp")
 	require.NoError(t, err)
-	require.NoError(t, head.Init(math.MinInt64))
+	// restart with snapshot enabled
+	restart(true)
+	// Add samples
+	add200Samples()
 
 	q, err := NewBlockQuerier(head, math.MinInt64, math.MaxInt64)
 	require.NoError(t, err)
 	series := query(t, q,
-		labels.MustNewMatcher(labels.MatchEqual, "__name__", "request_duration"),
+		//labels.MustNewMatcher(labels.MatchEqual, "__name__", "request_duration"),
 		labels.MustNewMatcher(labels.MatchNotEqual, "status_code", "200"),
 	)
 	fmt.Println(len(series))
-	//require.Equal(t, expSeries, series)
-
+	//for x := range series {
+	//	fmt.Println(x)
+	//}
+	//fmt.Println(series)
 }
 
 func TestSnapshotError(t *testing.T) {
