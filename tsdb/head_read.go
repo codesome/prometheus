@@ -15,11 +15,10 @@ package tsdb
 
 import (
 	"context"
-	"math"
-	"sort"
-
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
+	"math"
+	"sort"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -104,7 +103,18 @@ func (h *headIndexReader) LabelNames(matchers ...*labels.Matcher) ([]string, err
 // Postings returns the postings list iterator for the label pairs.
 func (h *headIndexReader) Postings(name string, values ...string) (index.Postings, error) {
 	res := make([]index.Postings, 0, len(values))
+	//if name == "status_code" {
+	//	level.Info(h.head.logger).Log("msg", "getting postings for", "name", name, "values", strings.Join(values, ","))
+	//}
 	for _, value := range values {
+		//if name == "status_code" || (name == "__name__" && value == "cortex_kv_request_duration_seconds_count") {
+		//	pl := h.head.postings.Get(name, value)
+		//	var list []string
+		//	for pl.Next() {
+		//		list = append(list, fmt.Sprintf("%d", pl.At()))
+		//	}
+		//	level.Info(h.head.logger).Log("msg", "postings list", "name", name, "value", value, "list", strings.Join(list, ","))
+		//}
 		res = append(res, h.head.postings.Get(name, value))
 	}
 	return index.Merge(res...), nil

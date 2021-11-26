@@ -797,6 +797,36 @@ func (db *DB) run() {
 
 		select {
 		case <-time.After(1 * time.Minute):
+
+			calculate := func(name, value string) {
+				fromPostings := db.head.postings.Get(name, value)
+				var gotList []string
+				for fromPostings.Next() {
+					gotList = append(gotList, fmt.Sprintf("%d", fromPostings.At()))
+				}
+
+				var actList []string
+				for i, sl := range db.head.series.series {
+					db.head.series.locks[i].Lock()
+
+					for _, s := range sl {
+						if s.lset.Get(name) == value {
+							actList = append(actList, fmt.Sprintf("%d", s.ref))
+						}
+					}
+
+					db.head.series.locks[i].Unlock()
+				}
+
+				level.Warn(db.logger).Log("msg", "calculate postings diff", "name", name, "value", value, "actLen", len(actList), "gotLen", len(gotList))
+				level.Warn(db.logger).Log("msg", "printing act list", "name", name, "value", value, "actList", strings.Join(actList, ","))
+				level.Warn(db.logger).Log("msg", "printing got list", "name", name, "value", value, "gotList", strings.Join(gotList, ","))
+			}
+
+			calculate("__name__", "cortex_kv_request_duration_seconds_count")
+			calculate("status_code", "500")
+			calculate("status_code", "200")
+
 			db.cmtx.Lock()
 			if err := db.reloadBlocks(); err != nil {
 				level.Error(db.logger).Log("msg", "reloadBlocks", "err", err)

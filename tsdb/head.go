@@ -1251,6 +1251,9 @@ func (h *Head) getOrCreateWithID(id chunks.HeadSeriesRef, hash uint64, lset labe
 	h.metrics.seriesCreated.Inc()
 	h.numSeries.Inc()
 
+	//if lset.Get("__name__") == "cortex_kv_request_duration_seconds_count" {
+	//	level.Info(h.logger).Log("msg", "adding postings", "ref", id, "labels", lset)
+	//}
 	h.postings.Add(storage.SeriesRef(id), lset)
 	return s, true, nil
 }
