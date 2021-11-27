@@ -507,6 +507,11 @@ func (h *Head) Init(minValidTime int64) error {
 		level.Info(h.logger).Log("msg", "Chunk snapshot loading time", "duration", time.Since(start).String())
 	}
 
+	if refSeries == nil {
+		fmt.Println("WHAT?")
+		refSeries = make(map[chunks.HeadSeriesRef]*memSeries)
+	}
+
 	fmt.Println("Loading mmap")
 	mmapChunkReplayStart := time.Now()
 	mmappedChunks, err := h.loadMmappedChunks(refSeries)
@@ -574,7 +579,7 @@ func (h *Head) Init(minValidTime int64) error {
 	}
 	// Backfill segments from the most recent checkpoint onwards.
 	for i := startFrom; i <= endAt; i++ {
-		fmt.Println("Loading WAL", i)
+		// fmt.Println("Loading WAL", i)
 		s, err := wal.OpenReadSegment(wal.SegmentName(h.wal.Dir(), i))
 		if err != nil {
 			return errors.Wrap(err, fmt.Sprintf("open WAL segment: %d", i))

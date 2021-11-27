@@ -2797,7 +2797,7 @@ func TestChunkSnapshotQueryBug(t *testing.T) {
 	opts := DefaultHeadOptions()
 	opts.ChunkRange = 120 * 4
 	opts.ChunkDirRoot = dir
-	opts.EnableMemorySnapshotOnShutdown = true
+	opts.EnableMemorySnapshotOnShutdown = false
 	head, err := NewHead(nil, nil, wlog, opts, nil)
 	require.NoError(t, err)
 	require.NoError(t, head.Init(math.MinInt64))
@@ -2807,7 +2807,7 @@ func TestChunkSnapshotQueryBug(t *testing.T) {
 	}()
 
 	var allSeries []labels.Labels
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 1000; i++ {
 		allSeries = append(allSeries, labels.Labels{
 			{"__name__", "request_duration"}, {"status_code", "200"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
 		})
@@ -2815,13 +2815,23 @@ func TestChunkSnapshotQueryBug(t *testing.T) {
 			{"__name__", "request_duration"}, {"status_code", "500"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
 		})
 	}
+	for i := 0; i < 10000; i++ {
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration2"}, {"status_code", "200"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
+	}
+	for i := 0; i < 1000; i++ {
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration2"}, {"status_code", "500"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
+	}
 	lastStart, lastEnd := int64(0), int64(0)
-	add200Samples := func() {
+	add200Samples := func(n int64) {
 		lastStart = lastEnd + 1
-		lastEnd += 200
-		for _, lbls := range allSeries {
+		lastEnd += n
+		for ts := lastStart; ts <= lastEnd; ts++ {
 			app := head.Appender(context.Background())
-			for ts := lastStart; ts <= lastEnd; ts++ {
+			for _, lbls := range allSeries {
 				val := rand.Float64()
 				_, err := app.Append(0, lbls, ts, val)
 				require.NoError(t, err)
@@ -2843,26 +2853,27 @@ func TestChunkSnapshotQueryBug(t *testing.T) {
 	}
 
 	// Add samples
-	add200Samples()
-	// restart with snapshot disabled, but takes a snapshot
+	add200Samples(250)
+	restart(true)
+	add200Samples(20)
 	restart(false)
-	// add samples
-	add200Samples()
-	// rename snapshot
+	add200Samples(20)
+
 	snapDir, _, _, err := LastChunkSnapshot(head.opts.ChunkDirRoot)
 	require.NoError(t, err)
 	fmt.Println(snapDir)
 	err = os.Rename(snapDir, snapDir+".tmp")
 	require.NoError(t, err)
-	// restart with snapshot enabled
+
 	restart(true)
+
 	// Add samples
-	add200Samples()
+	add200Samples(5)
 
 	q, err := NewBlockQuerier(head, math.MinInt64, math.MaxInt64)
 	require.NoError(t, err)
 	series := query(t, q,
-		//labels.MustNewMatcher(labels.MatchEqual, "__name__", "request_duration"),
+		labels.MustNewMatcher(labels.MatchEqual, "__name__", "request_duration"),
 		labels.MustNewMatcher(labels.MatchNotEqual, "status_code", "200"),
 	)
 	fmt.Println(len(series))
