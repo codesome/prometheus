@@ -17,8 +17,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/tsdb"
 	"io/ioutil"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -475,4 +480,112 @@ func TestModeSpecificFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// https://github.com/prometheus/prometheus/issues/9725
+func TestChunkSnapshotQueryBug(t *testing.T) {
+	dir := t.TempDir()
+
+	opts := tsdb.DefaultOptions()
+	opts.EnableMemorySnapshotOnShutdown = true
+	db, err := tsdb.Open(dir, nil, nil, opts, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		db.Close()
+		//require.NoError(t, db.Close())
+	})
+	db.DisableCompactions()
+
+	var allSeries []labels.Labels
+	for i := 0; i < 1000; i++ {
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration"}, {"status_code", "200"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration"}, {"status_code", "500"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
+	}
+	for i := 0; i < 10000; i++ {
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration2"}, {"status_code", "200"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
+	}
+	for i := 0; i < 1000; i++ {
+		allSeries = append(allSeries, labels.Labels{
+			{"__name__", "request_duration2"}, {"status_code", "500"}, {"tar", fmt.Sprintf("baz%d", rand.Int())},
+		})
+	}
+	lastStart, lastEnd := int64(0), int64(0)
+	addSamples := func(n int64) {
+		lastStart = lastEnd + 1
+		lastEnd += n
+		for ts := lastStart; ts <= lastEnd; ts++ {
+			app := db.Appender(context.Background())
+			for _, lbls := range allSeries {
+				//val := rand.Float64()
+				_, err := app.Append(0, lbls, ts*1000, float64(ts))
+				require.NoError(t, err)
+			}
+			require.NoError(t, app.Commit())
+		}
+	}
+
+	restart := func(snapshotEnabled bool) {
+		require.NoError(t, db.Close())
+		opts.EnableMemorySnapshotOnShutdown = snapshotEnabled
+		db, err = tsdb.Open(dir, nil, nil, opts, nil)
+		require.NoError(t, err)
+	}
+
+	// Add samples
+	addSamples(50)
+	restart(true)
+	addSamples(20)
+	restart(false)
+	addSamples(20)
+
+	snapDir, _, _, err := tsdb.LastChunkSnapshot(dir)
+	require.NoError(t, err)
+	fmt.Println(snapDir)
+	err = os.Rename(snapDir, snapDir+".tmp")
+	require.NoError(t, err)
+
+	restart(true)
+
+	// Add samples
+	addSamples(5)
+
+	noStepSubqueryInterval := &safePromQLNoStepSubqueryInterval{}
+	noStepSubqueryInterval.Set(config.DefaultGlobalConfig.EvaluationInterval)
+	engine := promql.NewEngine(promql.EngineOpts{
+		Logger:                   nil,
+		Reg:                      nil,
+		MaxSamples:               1e6,
+		Timeout:                  10 * time.Second,
+		LookbackDelta:            5 * time.Minute,
+		NoStepSubqueryIntervalFn: noStepSubqueryInterval.Get,
+	})
+
+	iq, err := engine.NewInstantQuery(
+		db,
+		`sum by (status_code) (rate(request_duration{status_code!="200"}[1m]))`,
+		timestamp.Time(lastEnd*1000),
+	)
+	require.NoError(t, err)
+
+	fmt.Println("\nQuerying")
+	res := iq.Exec(context.Background())
+	require.NotNil(t, res)
+
+	fmt.Println(len(res.Value.(promql.Vector)))
+
+	//q, err := db.Querier(context.Background(), math.MinInt64, math.MaxInt64)
+	//require.NoError(t, err)
+	//ss := q.Select(false, nil, labels.MustNewMatcher(labels.MatchEqual, "__name__", "request_duration"),
+	//	labels.MustNewMatcher(labels.MatchNotEqual, "status_code", "200"))
+	//total := 0
+	//for ss.Next() {
+	//	total++
+	//}
+	//fmt.Println(total)
 }

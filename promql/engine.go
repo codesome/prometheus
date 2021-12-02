@@ -784,7 +784,6 @@ func (ng *Engine) populateSeries(querier storage.Querier, s *parser.EvalStmt) {
 			evalRange = 0
 			hints.By, hints.Grouping = extractGroupsFromPath(path)
 			n.UnexpandedSeriesSet = querier.Select(false, hints, n.LabelMatchers...)
-
 		case *parser.MatrixSelector:
 			evalRange = n.Range
 		}

@@ -621,7 +621,7 @@ func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 	// Ensures that an early return caused by an error doesn't leave any tmp files.
 	defer func() {
 		cp.Close()
-		os.RemoveAll(cpdirtmp)
+		//os.RemoveAll(cpdirtmp)
 	}()
 
 	var (
@@ -722,6 +722,9 @@ func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 	if err := cp.Close(); err != nil {
 		return stats, errors.Wrap(err, "close chunk snapshot")
 	}
+
+	return stats, errors.New("unwanted error")
+
 	if err := fileutil.Replace(cpdirtmp, cpdir); err != nil {
 		return stats, errors.Wrap(err, "rename chunk snapshot directory")
 	}

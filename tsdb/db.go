@@ -818,9 +818,9 @@ func (db *DB) run() {
 					db.head.series.locks[i].Unlock()
 				}
 
-				level.Warn(db.logger).Log("msg", "ganesh: calculate postings diff", "name", name, "value", value, "actLen", len(actList), "gotLen", len(gotList))
-				level.Warn(db.logger).Log("msg", "ganesh: printing act list", "name", name, "value", value, "actList", strings.Join(actList, ","))
-				level.Warn(db.logger).Log("msg", "ganesh: printing got list", "name", name, "value", value, "gotList", strings.Join(gotList, ","))
+				//level.Warn(db.logger).Log("msg", "ganesh: calculate postings diff", "name", name, "value", value, "actLen", len(actList), "gotLen", len(gotList))
+				//level.Warn(db.logger).Log("msg", "ganesh: printing act list", "name", name, "value", value, "actList", strings.Join(actList, ","))
+				//level.Warn(db.logger).Log("msg", "ganesh: printing got list", "name", name, "value", value, "gotList", strings.Join(gotList, ","))
 			}
 
 			calculate("__name__", "cortex_kv_request_duration_seconds_count")
