@@ -781,6 +781,7 @@ func (s *memSeries) append(t int64, v float64, appendID uint64, chunkDiskMapper 
 
 	c.maxTime = t
 
+	// TODO(codesome): if old chunk was histograms, should we clear out the sampleBuf?
 	s.sampleBuf[0] = s.sampleBuf[1]
 	s.sampleBuf[1] = s.sampleBuf[2]
 	s.sampleBuf[2] = s.sampleBuf[3]
@@ -838,6 +839,7 @@ func (s *memSeries) appendHistogram(t int64, h *histogram.Histogram, appendID ui
 	}
 
 	if chunkCreated {
+		// TODO(codesome): if old chunk was float, should we clear out the sampleBuf?
 		hc := s.headChunk.chunk.(*chunkenc.HistogramChunk)
 		header := chunkenc.UnknownCounterReset
 		if counterReset {
