@@ -134,6 +134,8 @@ type Options struct {
 
 	// Optional HTTP client options to use when scraping.
 	HTTPClientOptions []config_util.HTTPClientOption
+
+	EnableNativeHistograms bool // TODO(codesome): set this somewhere
 }
 
 // Manager maintains a set of scrape pools and manages start/stop cycles
@@ -264,6 +266,8 @@ func (m *Manager) ApplyConfig(cfg *config.Config) error {
 	m.mtxScrape.Lock()
 	defer m.mtxScrape.Unlock()
 
+	enableNativeHistograms := cfg.ExperimentalConfig != nil && cfg.ExperimentalConfig.EnableNativeHistograms
+
 	c := make(map[string]*config.ScrapeConfig)
 	for _, scfg := range cfg.ScrapeConfigs {
 		c[scfg.JobName] = scfg
@@ -281,7 +285,7 @@ func (m *Manager) ApplyConfig(cfg *config.Config) error {
 			sp.stop()
 			delete(m.scrapePools, name)
 		} else if !reflect.DeepEqual(sp.config, cfg) {
-			err := sp.reload(cfg)
+			err := sp.reload(cfg, enableNativeHistograms)
 			if err != nil {
 				level.Error(m.logger).Log("msg", "error reloading scrape pool", "err", err, "scrape_pool", name)
 				failed = true

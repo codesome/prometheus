@@ -242,6 +242,8 @@ type scrapePool struct {
 	newLoop func(scrapeLoopOptions) loop
 
 	noDefaultPort bool
+
+	enableNativeHistograms bool
 }
 
 type labelLimits struct {
@@ -251,16 +253,17 @@ type labelLimits struct {
 }
 
 type scrapeLoopOptions struct {
-	target          *Target
-	scraper         scraper
-	sampleLimit     int
-	labelLimits     *labelLimits
-	honorLabels     bool
-	honorTimestamps bool
-	interval        time.Duration
-	timeout         time.Duration
-	mrc             []*relabel.Config
-	cache           *scrapeCache
+	target                 *Target
+	scraper                scraper
+	sampleLimit            int
+	labelLimits            *labelLimits
+	honorLabels            bool
+	honorTimestamps        bool
+	interval               time.Duration
+	timeout                time.Duration
+	mrc                    []*relabel.Config
+	cache                  *scrapeCache
+	enableNativeHistograms bool
 }
 
 const maxAheadTime = 10 * time.Minute
@@ -283,15 +286,16 @@ func newScrapePool(cfg *config.ScrapeConfig, app storage.Appendable, jitterSeed 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sp := &scrapePool{
-		cancel:        cancel,
-		appendable:    app,
-		config:        cfg,
-		client:        client,
-		activeTargets: map[uint64]*Target{},
-		loops:         map[uint64]loop{},
-		logger:        logger,
-		httpOpts:      options.HTTPClientOptions,
-		noDefaultPort: options.NoDefaultPort,
+		cancel:                 cancel,
+		appendable:             app,
+		config:                 cfg,
+		client:                 client,
+		activeTargets:          map[uint64]*Target{},
+		loops:                  map[uint64]loop{},
+		logger:                 logger,
+		httpOpts:               options.HTTPClientOptions,
+		noDefaultPort:          options.NoDefaultPort,
+		enableNativeHistograms: options.EnableNativeHistograms,
 	}
 	sp.newLoop = func(opts scrapeLoopOptions) loop {
 		// Update the targets retrieval function for metadata to a new scrape cache.
@@ -322,6 +326,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app storage.Appendable, jitterSeed 
 			opts.target,
 			cache,
 			options.PassMetadataInContext,
+			opts.enableNativeHistograms,
 		)
 	}
 
@@ -383,11 +388,13 @@ func (sp *scrapePool) stop() {
 // reload the scrape pool with the given scrape configuration. The target state is preserved
 // but all scrape loops are restarted with the new scrape configuration.
 // This method returns after all scrape loops that were stopped have stopped scraping.
-func (sp *scrapePool) reload(cfg *config.ScrapeConfig) error {
+func (sp *scrapePool) reload(cfg *config.ScrapeConfig, enableNativeHistograms bool) error {
 	sp.mtx.Lock()
 	defer sp.mtx.Unlock()
 	targetScrapePoolReloads.Inc()
 	start := time.Now()
+
+	sp.enableNativeHistograms = enableNativeHistograms
 
 	client, err := config_util.NewClientFromConfig(cfg.HTTPClientConfig, cfg.JobName, sp.httpOpts...)
 	if err != nil {
@@ -435,16 +442,17 @@ func (sp *scrapePool) reload(cfg *config.ScrapeConfig) error {
 		var (
 			s       = &targetScraper{Target: t, client: sp.client, timeout: timeout, bodySizeLimit: bodySizeLimit}
 			newLoop = sp.newLoop(scrapeLoopOptions{
-				target:          t,
-				scraper:         s,
-				sampleLimit:     sampleLimit,
-				labelLimits:     labelLimits,
-				honorLabels:     honorLabels,
-				honorTimestamps: honorTimestamps,
-				mrc:             mrc,
-				cache:           cache,
-				interval:        interval,
-				timeout:         timeout,
+				target:                 t,
+				scraper:                s,
+				sampleLimit:            sampleLimit,
+				labelLimits:            labelLimits,
+				honorLabels:            honorLabels,
+				honorTimestamps:        honorTimestamps,
+				mrc:                    mrc,
+				cache:                  cache,
+				interval:               interval,
+				timeout:                timeout,
+				enableNativeHistograms: enableNativeHistograms,
 			})
 		)
 		if err != nil {
@@ -539,15 +547,16 @@ func (sp *scrapePool) sync(targets []*Target) {
 
 			s := &targetScraper{Target: t, client: sp.client, timeout: timeout, bodySizeLimit: bodySizeLimit}
 			l := sp.newLoop(scrapeLoopOptions{
-				target:          t,
-				scraper:         s,
-				sampleLimit:     sampleLimit,
-				labelLimits:     labelLimits,
-				honorLabels:     honorLabels,
-				honorTimestamps: honorTimestamps,
-				mrc:             mrc,
-				interval:        interval,
-				timeout:         timeout,
+				target:                 t,
+				scraper:                s,
+				sampleLimit:            sampleLimit,
+				labelLimits:            labelLimits,
+				honorLabels:            honorLabels,
+				honorTimestamps:        honorTimestamps,
+				mrc:                    mrc,
+				interval:               interval,
+				timeout:                timeout,
+				enableNativeHistograms: sp.enableNativeHistograms,
 			})
 			if err != nil {
 				l.setForcedError(err)
@@ -875,6 +884,8 @@ type scrapeLoop struct {
 	disabledEndOfRunStalenessMarkers bool
 
 	reportExtraMetrics bool
+
+	enableNativeHistograms bool
 }
 
 // scrapeCache tracks mappings of exposed metric strings to label sets and
@@ -1139,6 +1150,7 @@ func newScrapeLoop(ctx context.Context,
 	target *Target,
 	metricMetadataStore MetricMetadataStore,
 	passMetadataInContext bool,
+	enableNativeHistograms bool,
 ) *scrapeLoop {
 	if l == nil {
 		l = log.NewNopLogger()
@@ -1506,6 +1518,9 @@ loop:
 			continue
 		case textparse.EntryHistogram:
 			isHistogram = true
+			if !sl.enableNativeHistograms {
+				continue
+			}
 		default:
 		}
 		total++
