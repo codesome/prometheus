@@ -1,0 +1,685 @@
+// Copyright 2022 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package chunkenc
+
+import (
+	"encoding/binary"
+	"math"
+
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/value"
+)
+
+// FloatHistogramChunk holds encoded sample data for a sparse, high-resolution
+// float histogram.
+//
+// Each sample has multiple "fields", stored in the following way (raw = store
+// number directly, delta = store delta to the previous number, dod = store
+// delta of the delta to the previous number, xor = what we do for regular
+// sample values):
+//
+//	field →    ts    count zeroCount sum []posbuckets []negbuckets
+//	sample 1   raw   raw   raw       raw []raw        []raw
+//	sample 2   delta xor   xor       xor []xor        []xor
+//	sample >2  dod   xor   xor       xor []xor        []xor
+type FloatHistogramChunk struct {
+	b bstream
+}
+
+// NewFloatHistogramChunk returns a new chunk with float histogram encoding.
+func NewFloatHistogramChunk() *FloatHistogramChunk {
+	b := make([]byte, 3, 128)
+	return &FloatHistogramChunk{b: bstream{stream: b, count: 0}}
+}
+
+// Encoding returns the encoding type.
+func (c *FloatHistogramChunk) Encoding() Encoding {
+	return EncFloatHistogram
+}
+
+// Bytes returns the underlying byte slice of the chunk.
+func (c *FloatHistogramChunk) Bytes() []byte {
+	return c.b.bytes()
+}
+
+// NumSamples returns the number of samples in the chunk.
+func (c *FloatHistogramChunk) NumSamples() int {
+	return int(binary.BigEndian.Uint16(c.Bytes()))
+}
+
+// Layout returns the histogram layout. Only call this on chunks that have at
+// least one sample.
+func (c *FloatHistogramChunk) Layout() (
+	schema int32, zeroThreshold float64,
+	negativeSpans, positiveSpans []histogram.Span,
+	err error,
+) {
+	if c.NumSamples() == 0 {
+		panic("HistoChunk.Layout() called on an empty chunk")
+	}
+	b := newBReader(c.Bytes()[2:])
+	return readHistogramChunkLayout(&b)
+}
+
+// SetCounterResetHeader sets the counter reset header.
+func (c *FloatHistogramChunk) SetCounterResetHeader(h CounterResetHeader) {
+	switch h {
+	case CounterReset, NotCounterReset, GaugeType, UnknownCounterReset:
+		bytes := c.Bytes()
+		bytes[2] = (bytes[2] & 0b00111111) | byte(h)
+	default:
+		panic("invalid CounterResetHeader type")
+	}
+}
+
+// GetCounterResetHeader returns the info about the first 2 bits of the chunk
+// header.
+func (c *FloatHistogramChunk) GetCounterResetHeader() CounterResetHeader {
+	return CounterResetHeader(c.Bytes()[2] & 0b11000000)
+}
+
+// Compact implements the Chunk interface.
+func (c *FloatHistogramChunk) Compact() {
+	if l := len(c.b.stream); cap(c.b.stream) > l+chunkCompactCapacityThreshold {
+		buf := make([]byte, l)
+		copy(buf, c.b.stream)
+		c.b.stream = buf
+	}
+}
+
+// Appender implements the Chunk interface.
+func (c *FloatHistogramChunk) Appender() (Appender, error) {
+	it := c.iterator(nil)
+
+	// To get an appender, we must know the state it would have if we had
+	// appended all existing data from scratch. We iterate through the end
+	// and populate via the iterator's state.
+	for it.Next() == ValFloatHistogram {
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+
+	a := &FloatHistogramAppender{
+		b: &c.b,
+
+		schema:           it.schema,
+		zThreshold:       it.zThreshold,
+		pSpans:           it.pSpans,
+		nSpans:           it.nSpans,
+		t:                it.t,
+		tDelta:           it.tDelta,
+		cnt:              it.cnt,
+		cntLeading:       it.cntLeading,
+		cntTrailing:      it.cntTrailing,
+		zCnt:             it.zCnt,
+		zCntLeading:      it.zCntLeading,
+		zCntTrailing:     it.zCntTrailing,
+		pBuckets:         it.pBuckets,
+		pBucketsLeading:  it.pBucketsLeading,
+		pBucketsTrailing: it.pBucketsTrailing,
+		nBuckets:         it.nBuckets,
+		nBucketsLeading:  it.nBucketsLeading,
+		nBucketsTrailing: it.nBucketsTrailing,
+		sum:              it.sum,
+		sumLeading:       it.sumLeading,
+		sumTrailing:      it.sumTrailing,
+	}
+	if it.numTotal == 0 {
+		a.sumLeading = 0xff
+		a.cntLeading = 0xff
+		a.zCntLeading = 0xff
+	}
+	return a, nil
+}
+
+func (c *FloatHistogramChunk) iterator(it Iterator) *floatHistogramIterator {
+	// This commet is copied from XORChunk.iterator:
+	//   Should iterators guarantee to act on a copy of the data so it doesn't lock append?
+	//   When using striped locks to guard access to chunks, probably yes.
+	//   Could only copy data if the chunk is not completed yet.
+	if histogramIter, ok := it.(*floatHistogramIterator); ok {
+		histogramIter.Reset(c.b.bytes())
+		return histogramIter
+	}
+	return newFloatHistogramIterator(c.b.bytes())
+}
+
+func newFloatHistogramIterator(b []byte) *floatHistogramIterator {
+	it := &floatHistogramIterator{
+		br:       newBReader(b),
+		numTotal: binary.BigEndian.Uint16(b),
+		t:        math.MinInt64,
+	}
+	// The first 3 bytes contain chunk headers.
+	// We skip that for actual samples.
+	_, _ = it.br.readBits(24)
+	return it
+}
+
+// Iterator implements the Chunk interface.
+func (c *FloatHistogramChunk) Iterator(it Iterator) Iterator {
+	return c.iterator(it)
+}
+
+// FloatHistogramAppender is an Appender implementation for float histograms.
+type FloatHistogramAppender struct {
+	b *bstream
+
+	// Layout:
+	schema         int32
+	zThreshold     float64
+	pSpans, nSpans []histogram.Span
+
+	// dod encoded.
+	t      int64
+	tDelta int64
+
+	// All Gorilla xor encoded.
+	cnt, zCnt          float64
+	pBuckets, nBuckets []float64
+	sum                float64
+
+	// For the xor encoding.
+	cntLeading, zCntLeading            uint8
+	cntTrailing, zCntTrailing          uint8
+	pBucketsLeading, nBucketsLeading   []uint8
+	pBucketsTrailing, nBucketsTrailing []uint8
+	sumLeading                         uint8
+	sumTrailing                        uint8
+}
+
+// Append implements Appender. This implementation panics because normal float
+// samples must never be appended to a histogram chunk.
+func (a *FloatHistogramAppender) Append(int64, float64) {
+	panic("appended a float sample to a histogram chunk")
+}
+
+// AppendHistogram implements Appender. This implementation panics because integer
+// histogram samples must never be appended to a float histogram chunk.
+func (a *FloatHistogramAppender) AppendHistogram(int64, *histogram.Histogram) {
+	panic("appended an integer histogram to a float histogram chunk")
+}
+
+// Appendable returns whether the chunk can be appended to, and if so
+// whether any recoding needs to happen using the provided interjections
+// (in case of any new buckets, positive or negative range, respectively).
+//
+// The chunk is not appendable in the following cases:
+//
+// • The schema has changed.
+//
+// • The threshold for the zero bucket has changed.
+//
+// • Any buckets have disappeared.
+//
+// • There was a counter reset in the count of observations or in any bucket,
+// including the zero bucket.
+//
+// • The last sample in the chunk was stale while the current sample is not stale.
+//
+// The method returns an additional boolean set to true if it is not appendable
+// because of a counter reset. If the given sample is stale, it is always ok to
+// append. If counterReset is true, okToAppend is always false.
+func (a *FloatHistogramAppender) Appendable(h *histogram.FloatHistogram) (
+	positiveInterjections, negativeInterjections []Interjection,
+	okToAppend, counterReset bool,
+) {
+	if value.IsStaleNaN(h.Sum) {
+		// This is a stale sample whose buckets and spans don't matter.
+		okToAppend = true
+		return
+	}
+	if value.IsStaleNaN(a.sum) {
+		// If the last sample was stale, then we can only accept stale
+		// samples in this chunk.
+		return
+	}
+
+	if h.Count < a.cnt {
+		// There has been a counter reset.
+		counterReset = true
+		return
+	}
+
+	if h.Schema != a.schema || h.ZeroThreshold != a.zThreshold {
+		return
+	}
+
+	if h.ZeroCount < a.zCnt {
+		// There has been a counter reset since ZeroThreshold didn't change.
+		counterReset = true
+		return
+	}
+
+	var ok bool
+	positiveInterjections, ok = compareSpans(a.pSpans, h.PositiveSpans)
+	if !ok {
+		counterReset = true
+		return
+	}
+	negativeInterjections, ok = compareSpans(a.nSpans, h.NegativeSpans)
+	if !ok {
+		counterReset = true
+		return
+	}
+
+	if counterResetInAnyBucket(a.pBuckets, h.PositiveBuckets, a.pSpans, h.PositiveSpans, false) ||
+		counterResetInAnyBucket(a.nBuckets, h.NegativeBuckets, a.nSpans, h.NegativeSpans, false) {
+		counterReset, positiveInterjections, negativeInterjections = true, nil, nil
+		return
+	}
+
+	okToAppend = true
+	return
+}
+
+// AppendFloatHistogram appends a float histogram to the chunk. The caller must ensure that
+// the histogram is properly structured, e.g. the number of buckets used
+// corresponds to the number conveyed by the span structures. First call
+// Appendable() and act accordingly!
+func (a *FloatHistogramAppender) AppendFloatHistogram(t int64, h *histogram.FloatHistogram) {
+	var tDelta int64
+	num := binary.BigEndian.Uint16(a.b.bytes())
+
+	if value.IsStaleNaN(h.Sum) {
+		// Emptying out other fields to write no buckets, and an empty
+		// layout in case of first histogram in the chunk.
+		h = &histogram.FloatHistogram{Sum: h.Sum}
+	}
+
+	if num == 0 {
+		// The first append gets the privilege to dictate the layout
+		// but it's also responsible for encoding it into the chunk!
+		writeHistogramChunkLayout(a.b, h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans)
+		a.schema = h.Schema
+		a.zThreshold = h.ZeroThreshold
+
+		if len(h.PositiveSpans) > 0 {
+			a.pSpans = make([]histogram.Span, len(h.PositiveSpans))
+			copy(a.pSpans, h.PositiveSpans)
+		} else {
+			a.pSpans = nil
+		}
+		if len(h.NegativeSpans) > 0 {
+			a.nSpans = make([]histogram.Span, len(h.NegativeSpans))
+			copy(a.nSpans, h.NegativeSpans)
+		} else {
+			a.nSpans = nil
+		}
+
+		numPBuckets, numNBuckets := countSpans(h.PositiveSpans), countSpans(h.NegativeSpans)
+		if numPBuckets > 0 {
+			a.pBuckets = make([]float64, numPBuckets)
+		} else {
+			a.pBuckets = nil
+		}
+		if numNBuckets > 0 {
+			a.nBuckets = make([]float64, numNBuckets)
+		} else {
+			a.nBuckets = nil
+		}
+
+		// Now store the actual data.
+		putVarbitInt(a.b, t)
+		a.b.writeBits(math.Float64bits(h.Count), 64)
+		a.b.writeBits(math.Float64bits(h.ZeroCount), 64)
+		a.b.writeBits(math.Float64bits(h.Sum), 64)
+		for _, b := range h.PositiveBuckets {
+			a.b.writeBits(math.Float64bits(b), 64)
+		}
+		for _, b := range h.NegativeBuckets {
+			a.b.writeBits(math.Float64bits(b), 64)
+		}
+	} else {
+		// The case for the 2nd sample with single deltas is implicitly handled correctly with the double delta code,
+		// so we don't need a separate single delta logic for the 2nd sample.
+
+		tDelta = t - a.t
+
+		tDod := tDelta - a.tDelta
+
+		putVarbitInt(a.b, tDod)
+
+		xorWrite(a.b, h.Count, a.cnt, &a.cntLeading, &a.cntTrailing)
+		xorWrite(a.b, h.ZeroCount, a.zCnt, &a.zCntLeading, &a.zCntTrailing)
+		xorWrite(a.b, h.Sum, a.sum, &a.sumLeading, &a.sumTrailing)
+
+		for i, b := range h.PositiveBuckets {
+			xorWrite(a.b, b, a.pBuckets[i], &a.pBucketsLeading[i], &a.pBucketsTrailing[i])
+		}
+		for i, b := range h.NegativeBuckets {
+			xorWrite(a.b, b, a.nBuckets[i], &a.nBucketsLeading[i], &a.nBucketsTrailing[i])
+		}
+	}
+
+	binary.BigEndian.PutUint16(a.b.bytes(), num+1)
+
+	a.t = t
+	a.cnt = h.Count
+	a.zCnt = h.ZeroCount
+	a.tDelta = tDelta
+	a.sum = h.Sum
+
+	copy(a.pBuckets, h.PositiveBuckets)
+	copy(a.nBuckets, h.NegativeBuckets)
+}
+
+// Recode converts the current chunk to accommodate an expansion of the set of
+// (positive and/or negative) buckets used, according to the provided
+// interjections, resulting in the honoring of the provided new positive and
+// negative spans. To continue appending, use the returned Appender rather than
+// the receiver of this method.
+// TODO(codesome): support float histograms.
+func (a *FloatHistogramAppender) Recode(
+	positiveInterjections, negativeInterjections []Interjection,
+	positiveSpans, negativeSpans []histogram.Span,
+) (Chunk, Appender) {
+	// TODO(beorn7): This currently just decodes everything and then encodes
+	// it again with the new span layout. This can probably be done in-place
+	// by editing the chunk. But let's first see how expensive it is in the
+	// big picture. Also, in-place editing might create concurrency issues.
+	byts := a.b.bytes()
+	it := newHistogramIterator(byts)
+	hc := NewHistogramChunk()
+	app, err := hc.Appender()
+	if err != nil {
+		panic(err)
+	}
+	numPositiveBuckets, numNegativeBuckets := countSpans(positiveSpans), countSpans(negativeSpans)
+
+	for it.Next() == ValHistogram {
+		tOld, hOld := it.AtHistogram()
+
+		// We have to newly allocate slices for the modified buckets
+		// here because they are kept by the appender until the next
+		// append.
+		// TODO(beorn7): We might be able to optimize this.
+		var positiveBuckets, negativeBuckets []int64
+		if numPositiveBuckets > 0 {
+			positiveBuckets = make([]int64, numPositiveBuckets)
+		}
+		if numNegativeBuckets > 0 {
+			negativeBuckets = make([]int64, numNegativeBuckets)
+		}
+
+		// Save the modified histogram to the new chunk.
+		hOld.PositiveSpans, hOld.NegativeSpans = positiveSpans, negativeSpans
+		if len(positiveInterjections) > 0 {
+			hOld.PositiveBuckets = interject(hOld.PositiveBuckets, positiveBuckets, positiveInterjections)
+		}
+		if len(negativeInterjections) > 0 {
+			hOld.NegativeBuckets = interject(hOld.NegativeBuckets, negativeBuckets, negativeInterjections)
+		}
+		app.AppendHistogram(tOld, hOld)
+	}
+
+	hc.SetCounterResetHeader(CounterResetHeader(byts[2] & 0b11000000))
+	return hc, app
+}
+
+type floatHistogramIterator struct {
+	br       bstreamReader
+	numTotal uint16
+	numRead  uint16
+
+	// Layout:
+	schema         int32
+	zThreshold     float64
+	pSpans, nSpans []histogram.Span
+
+	// For the fields that are tracked as deltas and ultimately dod's.
+	t      int64
+	tDelta int64
+
+	// All Gorilla xor encoded.
+	cnt, zCnt                 float64
+	cntLeading, zCntLeading   uint8
+	cntTrailing, zCntTrailing uint8
+
+	pBuckets, nBuckets                 []float64
+	pBucketsLeading, nBucketsLeading   []uint8
+	pBucketsTrailing, nBucketsTrailing []uint8
+
+	// For sum.
+	sum         float64
+	sumLeading  uint8
+	sumTrailing uint8
+
+	err error
+
+	atFloatHistogramCalled bool
+}
+
+func (it *floatHistogramIterator) Seek(t int64) ValueType {
+	if it.err != nil {
+		return ValNone
+	}
+
+	for t > it.t || it.numRead == 0 {
+		if it.Next() == ValNone {
+			return ValNone
+		}
+	}
+	return ValFloatHistogram
+}
+
+func (it *floatHistogramIterator) At() (int64, float64) {
+	panic("cannot call floatHistogramIterator.At")
+}
+
+func (it *floatHistogramIterator) AtHistogram() (int64, *histogram.Histogram) {
+	panic("cannot call floatHistogramIterator.AtHistogram")
+}
+
+func (it *floatHistogramIterator) AtFloatHistogram() (int64, *histogram.FloatHistogram) {
+	if value.IsStaleNaN(it.sum) {
+		return it.t, &histogram.FloatHistogram{Sum: it.sum}
+	}
+	it.atFloatHistogramCalled = true
+	return it.t, &histogram.FloatHistogram{
+		Count:           it.cnt,
+		ZeroCount:       it.zCnt,
+		Sum:             it.sum,
+		ZeroThreshold:   it.zThreshold,
+		Schema:          it.schema,
+		PositiveSpans:   it.pSpans,
+		NegativeSpans:   it.nSpans,
+		PositiveBuckets: it.pBuckets,
+		NegativeBuckets: it.nBuckets,
+	}
+}
+
+func (it *floatHistogramIterator) AtT() int64 {
+	return it.t
+}
+
+func (it *floatHistogramIterator) Err() error {
+	return it.err
+}
+
+func (it *floatHistogramIterator) Reset(b []byte) {
+	// The first 2 bytes contain chunk headers.
+	// We skip that for actual samples.
+	it.br = newBReader(b[2:])
+	it.numTotal = binary.BigEndian.Uint16(b)
+	it.numRead = 0
+
+	it.t, it.cnt, it.zCnt, it.sum = 0, 0, 0, 0
+	it.sumLeading, it.sumTrailing = 0, 0
+	it.tDelta, it.cntLeading, it.cntTrailing, it.zCntLeading, it.zCntTrailing = 0, 0, 0, 0, 0
+
+	if it.atFloatHistogramCalled {
+		it.atFloatHistogramCalled = false
+		it.pBuckets, it.nBuckets = nil, nil
+		it.pBucketsLeading, it.pBucketsTrailing, it.nBucketsLeading, it.nBucketsTrailing = nil, nil, nil, nil
+	} else {
+		it.pBuckets, it.nBuckets = it.pBuckets[:0], it.nBuckets[:0]
+		it.pBucketsLeading, it.pBucketsTrailing = it.pBucketsLeading[:0], it.pBucketsTrailing[:0]
+		it.nBucketsLeading, it.nBucketsTrailing = it.nBucketsLeading[:0], it.nBucketsTrailing[:0]
+	}
+
+	it.err = nil
+}
+
+func (it *floatHistogramIterator) Next() ValueType {
+	if it.err != nil || it.numRead == it.numTotal {
+		return ValNone
+	}
+
+	if it.numRead == 0 {
+		// The first read is responsible for reading the chunk layout
+		// and for initializing fields that depend on it. We give
+		// counter reset info at chunk level, hence we discard it here.
+		schema, zeroThreshold, posSpans, negSpans, err := readHistogramChunkLayout(&it.br)
+		if err != nil {
+			it.err = err
+			return ValNone
+		}
+		it.schema = schema
+		it.zThreshold = zeroThreshold
+		it.pSpans, it.nSpans = posSpans, negSpans
+		numPBuckets, numNBuckets := countSpans(posSpans), countSpans(negSpans)
+		// Allocate bucket slices as needed, recycling existing slices
+		// in case this iterator was reset and already has slices of a
+		// sufficient capacity.
+		if numPBuckets > 0 {
+			it.pBuckets = make([]float64, numPBuckets)
+		}
+		if numNBuckets > 0 {
+			it.nBuckets = make([]float64, numNBuckets)
+		}
+
+		// Now read the actual data.
+		t, err := readVarbitInt(&it.br)
+		if err != nil {
+			it.err = err
+			return ValNone
+		}
+		it.t = t
+
+		cnt, err := it.br.readBits(64)
+		if err != nil {
+			it.err = err
+			return ValNone
+		}
+		it.cnt = math.Float64frombits(cnt)
+
+		zcnt, err := it.br.readBits(64)
+		if err != nil {
+			it.err = err
+			return ValNone
+		}
+		it.zCnt = math.Float64frombits(zcnt)
+
+		sum, err := it.br.readBits(64)
+		if err != nil {
+			it.err = err
+			return ValNone
+		}
+		it.sum = math.Float64frombits(sum)
+
+		for i := range it.pBuckets {
+			v, err := it.br.readBits(64)
+			if err != nil {
+				it.err = err
+				return ValNone
+			}
+			it.pBuckets[i] = math.Float64frombits(v)
+		}
+		for i := range it.nBuckets {
+			v, err := it.br.readBits(64)
+			if err != nil {
+				it.err = err
+				return ValNone
+			}
+			it.nBuckets[i] = math.Float64frombits(v)
+		}
+
+		it.numRead++
+		return ValFloatHistogram
+	}
+
+	// The case for the 2nd sample with single deltas is implicitly handled correctly with the double delta code,
+	// so we don't need a separate single delta logic for the 2nd sample.
+
+	// Recycle bucket slices that have not been returned yet. Otherwise,
+	// copy them.
+	if it.atFloatHistogramCalled {
+		it.atFloatHistogramCalled = false
+		if len(it.pBuckets) > 0 {
+			newBuckets := make([]float64, len(it.pBuckets))
+			copy(newBuckets, it.pBuckets)
+			it.pBuckets = newBuckets
+		} else {
+			it.pBuckets = nil
+		}
+		if len(it.nBuckets) > 0 {
+			newBuckets := make([]float64, len(it.nBuckets))
+			copy(newBuckets, it.nBuckets)
+			it.nBuckets = newBuckets
+		} else {
+			it.nBuckets = nil
+		}
+	}
+
+	tDod, err := readVarbitInt(&it.br)
+	if err != nil {
+		it.err = err
+		return ValNone
+	}
+	it.tDelta = it.tDelta + tDod
+	it.t += it.tDelta
+
+	if ok := it.readXor(&it.cnt, &it.cntLeading, &it.cntTrailing); !ok {
+		return ValNone
+	}
+
+	if ok := it.readXor(&it.zCnt, &it.zCntLeading, &it.zCntTrailing); !ok {
+		return ValNone
+	}
+
+	if ok := it.readXor(&it.sum, &it.sumLeading, &it.sumTrailing); !ok {
+		return ValNone
+	}
+
+	if value.IsStaleNaN(it.sum) {
+		it.numRead++
+		return ValFloatHistogram
+	}
+
+	for i := range it.pBuckets {
+		if ok := it.readXor(&it.pBuckets[i], &it.pBucketsLeading[i], &it.pBucketsTrailing[i]); !ok {
+			return ValNone
+		}
+	}
+
+	for i := range it.nBuckets {
+		if ok := it.readXor(&it.nBuckets[i], &it.nBucketsLeading[i], &it.nBucketsTrailing[i]); !ok {
+			return ValNone
+		}
+	}
+
+	it.numRead++
+	return ValFloatHistogram
+}
+
+func (it *floatHistogramIterator) readXor(v *float64, leading, trailing *uint8) bool {
+	err := xorRead(&it.br, v, leading, trailing)
+	if err != nil {
+		it.err = err
+		return false
+	}
+	return true
+}

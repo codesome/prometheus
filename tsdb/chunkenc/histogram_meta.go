@@ -280,6 +280,7 @@ loop:
 
 // interject merges 'in' with the provided interjections and writes them into
 // 'out', which must already have the appropriate length.
+// TODO(codesome): support float histogram
 func interject(in, out []int64, interjections []Interjection) []int64 {
 	var (
 		j      int   // Position in out.

@@ -223,6 +223,12 @@ func (a *HistogramAppender) Append(int64, float64) {
 	panic("appended a float sample to a histogram chunk")
 }
 
+// AppendFloatHistogram implements Appender. This implementation panics because float
+// histogram samples must never be appended to a histogram chunk.
+func (a *HistogramAppender) AppendFloatHistogram(int64, *histogram.FloatHistogram) {
+	panic("appended a float histogram to a histogram chunk")
+}
+
 // Appendable returns whether the chunk can be appended to, and if so
 // whether any recoding needs to happen using the provided interjections
 // (in case of any new buckets, positive or negative range, respectively).
@@ -286,8 +292,8 @@ func (a *HistogramAppender) Appendable(h *histogram.Histogram) (
 		return
 	}
 
-	if counterResetInAnyBucket(a.pBuckets, h.PositiveBuckets, a.pSpans, h.PositiveSpans) ||
-		counterResetInAnyBucket(a.nBuckets, h.NegativeBuckets, a.nSpans, h.NegativeSpans) {
+	if counterResetInAnyBucket(a.pBuckets, h.PositiveBuckets, a.pSpans, h.PositiveSpans, true) ||
+		counterResetInAnyBucket(a.nBuckets, h.NegativeBuckets, a.nSpans, h.NegativeSpans, true) {
 		counterReset, positiveInterjections, negativeInterjections = true, nil, nil
 		return
 	}
@@ -296,10 +302,14 @@ func (a *HistogramAppender) Appendable(h *histogram.Histogram) (
 	return
 }
 
+type bucketValue interface {
+	int64 | float64
+}
+
 // counterResetInAnyBucket returns true if there was a counter reset for any
 // bucket. This should be called only when the bucket layout is the same or new
 // buckets were added. It does not handle the case of buckets missing.
-func counterResetInAnyBucket(oldBuckets, newBuckets []int64, oldSpans, newSpans []histogram.Span) bool {
+func counterResetInAnyBucket[BV bucketValue](oldBuckets, newBuckets []BV, oldSpans, newSpans []histogram.Span, deltas bool) bool {
 	if len(oldSpans) == 0 || len(oldBuckets) == 0 {
 		return false
 	}
@@ -336,7 +346,11 @@ func counterResetInAnyBucket(oldBuckets, newBuckets []int64, oldSpans, newSpans 
 				oldIdx++
 			}
 			oldBucketSliceIdx++
-			oldVal += oldBuckets[oldBucketSliceIdx]
+			if deltas {
+				oldVal += oldBuckets[oldBucketSliceIdx]
+			} else {
+				oldVal = oldBuckets[oldBucketSliceIdx]
+			}
 		}
 
 		if oldIdx > newIdx {
@@ -356,7 +370,11 @@ func counterResetInAnyBucket(oldBuckets, newBuckets []int64, oldSpans, newSpans 
 				newIdx++
 			}
 			newBucketSliceIdx++
-			newVal += newBuckets[newBucketSliceIdx]
+			if deltas {
+				newVal += newBuckets[newBucketSliceIdx]
+			} else {
+				newVal = newBuckets[newBucketSliceIdx]
+			}
 		}
 	}
 
