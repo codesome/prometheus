@@ -1232,7 +1232,7 @@ func (s *memSeries) appendFloatHistogram(t int64, fh *histogram.FloatHistogram, 
 	// TODO(marctc): implement up to this point for appendFloatHistogram, including appendPreprocessor call.
 	// After this point, sync with Ganesh's work on float histogram chunk.
 	if app != nil {
-		positiveInterjections, negativeInterjections, okToAppend, counterReset = app.Appendable(s.lastHistogramValue) // TODO(marctc): change this to FloatHistogram
+		positiveInterjections, negativeInterjections, okToAppend, counterReset = app.Appendable(s.lastFloatHistogramValue) // TODO(marctc): change this to FloatHistogram
 	}
 
 	if !chunkCreated {
@@ -1269,7 +1269,7 @@ func (s *memSeries) appendFloatHistogram(t int64, fh *histogram.FloatHistogram, 
 		hc.SetCounterResetHeader(header)
 	}
 
-	s.app.AppendHistogram(t, s.lastHistogramValue) // TODO(marctc): change this to AppendFloatHistogram
+	s.app.AppendFloatHistogram(t, s.lastFloatHistogramValue)
 	s.isHistogramSeries = true
 
 	c.maxTime = t
