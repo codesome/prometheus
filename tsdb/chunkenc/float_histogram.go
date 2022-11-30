@@ -322,13 +322,29 @@ func (a *FloatHistogramAppender) AppendFloatHistogram(t int64, h *histogram.Floa
 		numPBuckets, numNBuckets := countSpans(h.PositiveSpans), countSpans(h.NegativeSpans)
 		if numPBuckets > 0 {
 			a.pBuckets = make([]float64, numPBuckets)
+			a.pBucketsLeading = make([]uint8, numPBuckets)
+			a.pBucketsTrailing = make([]uint8, numPBuckets)
+			for i := 0; i < numPBuckets; i++ {
+				a.pBucketsLeading[i] = 0xff
+				a.pBucketsTrailing[i] = 0xff
+			}
 		} else {
 			a.pBuckets = nil
+			a.pBucketsLeading = nil
+			a.pBucketsTrailing = nil
 		}
 		if numNBuckets > 0 {
 			a.nBuckets = make([]float64, numNBuckets)
+			a.nBucketsLeading = make([]uint8, numNBuckets)
+			a.nBucketsTrailing = make([]uint8, numNBuckets)
+			for i := 0; i < numNBuckets; i++ {
+				a.nBucketsLeading[i] = 0xff
+				a.nBucketsTrailing[i] = 0xff
+			}
 		} else {
 			a.nBuckets = nil
+			a.nBucketsLeading = nil
+			a.nBucketsTrailing = nil
 		}
 
 		// Now store the actual data.
@@ -391,38 +407,38 @@ func (a *FloatHistogramAppender) Recode(
 	// by editing the chunk. But let's first see how expensive it is in the
 	// big picture. Also, in-place editing might create concurrency issues.
 	byts := a.b.bytes()
-	it := newHistogramIterator(byts)
-	hc := NewHistogramChunk()
+	it := newFloatHistogramIterator(byts)
+	hc := NewFloatHistogramChunk()
 	app, err := hc.Appender()
 	if err != nil {
 		panic(err)
 	}
 	numPositiveBuckets, numNegativeBuckets := countSpans(positiveSpans), countSpans(negativeSpans)
 
-	for it.Next() == ValHistogram {
-		tOld, hOld := it.AtHistogram()
+	for it.Next() == ValFloatHistogram {
+		tOld, hOld := it.AtFloatHistogram()
 
 		// We have to newly allocate slices for the modified buckets
 		// here because they are kept by the appender until the next
 		// append.
 		// TODO(beorn7): We might be able to optimize this.
-		var positiveBuckets, negativeBuckets []int64
+		var positiveBuckets, negativeBuckets []float64
 		if numPositiveBuckets > 0 {
-			positiveBuckets = make([]int64, numPositiveBuckets)
+			positiveBuckets = make([]float64, numPositiveBuckets)
 		}
 		if numNegativeBuckets > 0 {
-			negativeBuckets = make([]int64, numNegativeBuckets)
+			negativeBuckets = make([]float64, numNegativeBuckets)
 		}
 
 		// Save the modified histogram to the new chunk.
 		hOld.PositiveSpans, hOld.NegativeSpans = positiveSpans, negativeSpans
 		if len(positiveInterjections) > 0 {
-			hOld.PositiveBuckets = interject(hOld.PositiveBuckets, positiveBuckets, positiveInterjections)
+			hOld.PositiveBuckets = interject(hOld.PositiveBuckets, positiveBuckets, positiveInterjections, false)
 		}
 		if len(negativeInterjections) > 0 {
-			hOld.NegativeBuckets = interject(hOld.NegativeBuckets, negativeBuckets, negativeInterjections)
+			hOld.NegativeBuckets = interject(hOld.NegativeBuckets, negativeBuckets, negativeInterjections, false)
 		}
-		app.AppendHistogram(tOld, hOld)
+		app.AppendFloatHistogram(tOld, hOld)
 	}
 
 	hc.SetCounterResetHeader(CounterResetHeader(byts[2] & 0b11000000))
@@ -510,9 +526,9 @@ func (it *floatHistogramIterator) Err() error {
 }
 
 func (it *floatHistogramIterator) Reset(b []byte) {
-	// The first 2 bytes contain chunk headers.
+	// The first 3 bytes contain chunk headers.
 	// We skip that for actual samples.
-	it.br = newBReader(b[2:])
+	it.br = newBReader(b[3:])
 	it.numTotal = binary.BigEndian.Uint16(b)
 	it.numRead = 0
 
@@ -520,15 +536,9 @@ func (it *floatHistogramIterator) Reset(b []byte) {
 	it.sumLeading, it.sumTrailing = 0, 0
 	it.tDelta, it.cntLeading, it.cntTrailing, it.zCntLeading, it.zCntTrailing = 0, 0, 0, 0, 0
 
-	if it.atFloatHistogramCalled {
-		it.atFloatHistogramCalled = false
-		it.pBuckets, it.nBuckets = nil, nil
-		it.pBucketsLeading, it.pBucketsTrailing, it.nBucketsLeading, it.nBucketsTrailing = nil, nil, nil, nil
-	} else {
-		it.pBuckets, it.nBuckets = it.pBuckets[:0], it.nBuckets[:0]
-		it.pBucketsLeading, it.pBucketsTrailing = it.pBucketsLeading[:0], it.pBucketsTrailing[:0]
-		it.nBucketsLeading, it.nBucketsTrailing = it.nBucketsLeading[:0], it.nBucketsTrailing[:0]
-	}
+	it.atFloatHistogramCalled = false
+	it.pBuckets, it.nBuckets = nil, nil
+	it.pBucketsLeading, it.pBucketsTrailing, it.nBucketsLeading, it.nBucketsTrailing = nil, nil, nil, nil
 
 	it.err = nil
 }
@@ -556,9 +566,13 @@ func (it *floatHistogramIterator) Next() ValueType {
 		// sufficient capacity.
 		if numPBuckets > 0 {
 			it.pBuckets = make([]float64, numPBuckets)
+			it.pBucketsLeading = make([]uint8, numPBuckets)
+			it.pBucketsTrailing = make([]uint8, numPBuckets)
 		}
 		if numNBuckets > 0 {
 			it.nBuckets = make([]float64, numNBuckets)
+			it.nBucketsLeading = make([]uint8, numNBuckets)
+			it.nBucketsTrailing = make([]uint8, numNBuckets)
 		}
 
 		// Now read the actual data.
