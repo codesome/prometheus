@@ -260,7 +260,9 @@ func TestFloatHistogramChunkAppendable(t *testing.T) {
 		require.True(t, cr)
 	}
 
-	{ // New histogram that has a counter reset while new buckets were added.
+	{
+		// New histogram that has a counter reset while new buckets were added.
+		// The counter reset in the bucket does not matter for float histogram.
 		h2 := h1
 		h2.PositiveSpans = []histogram.Span{
 			{Offset: 0, Length: 3},
@@ -276,10 +278,10 @@ func TestFloatHistogramChunkAppendable(t *testing.T) {
 
 		hApp, _ := app.(*FloatHistogramAppender)
 		posInterjections, negInterjections, ok, cr := hApp.Appendable(h2.ToFloat())
-		require.Equal(t, 0, len(posInterjections))
+		require.Greater(t, len(posInterjections), 0)
 		require.Equal(t, 0, len(negInterjections))
-		require.False(t, ok) // Need to cut a new chunk.
-		require.True(t, cr)
+		require.True(t, ok)
+		require.False(t, cr)
 	}
 
 	{
@@ -287,6 +289,7 @@ func TestFloatHistogramChunkAppendable(t *testing.T) {
 		// added before the first bucket and reset on first bucket.  (to
 		// catch the edge case where the new bucket should be forwarded
 		// ahead until first old bucket at start)
+		// The counter reset in the bucket does not matter for float histogram.
 		h2 := h1
 		h2.PositiveSpans = []histogram.Span{
 			{Offset: -3, Length: 2},
@@ -304,9 +307,9 @@ func TestFloatHistogramChunkAppendable(t *testing.T) {
 
 		hApp, _ := app.(*FloatHistogramAppender)
 		posInterjections, negInterjections, ok, cr := hApp.Appendable(h2.ToFloat())
-		require.Equal(t, 0, len(posInterjections))
+		require.Greater(t, len(posInterjections), 0)
 		require.Equal(t, 0, len(negInterjections))
-		require.False(t, ok) // Need to cut a new chunk.
-		require.True(t, cr)
+		require.True(t, ok)
+		require.False(t, cr)
 	}
 }

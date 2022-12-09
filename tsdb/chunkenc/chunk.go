@@ -30,7 +30,7 @@ const (
 	EncNone Encoding = iota
 	EncXOR
 	EncHistogram
-	EncFloatHistogram // TODO(codesome): update other places where this should be considered.
+	EncFloatHistogram
 )
 
 func (e Encoding) String() string {

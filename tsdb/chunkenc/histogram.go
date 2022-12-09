@@ -67,7 +67,7 @@ func (c *HistogramChunk) Layout() (
 	err error,
 ) {
 	if c.NumSamples() == 0 {
-		panic("HistoChunk.Layout() called on an empty chunk")
+		panic("HistogramChunk.Layout() called on an empty chunk")
 	}
 	b := newBReader(c.Bytes()[2:])
 	return readHistogramChunkLayout(&b)
@@ -292,8 +292,8 @@ func (a *HistogramAppender) Appendable(h *histogram.Histogram) (
 		return
 	}
 
-	if counterResetInAnyBucket(a.pBuckets, h.PositiveBuckets, a.pSpans, h.PositiveSpans, true) ||
-		counterResetInAnyBucket(a.nBuckets, h.NegativeBuckets, a.nSpans, h.NegativeSpans, true) {
+	if counterResetInAnyBucket(a.pBuckets, h.PositiveBuckets, a.pSpans, h.PositiveSpans) ||
+		counterResetInAnyBucket(a.nBuckets, h.NegativeBuckets, a.nSpans, h.NegativeSpans) {
 		counterReset, positiveInterjections, negativeInterjections = true, nil, nil
 		return
 	}
@@ -309,7 +309,7 @@ type bucketValue interface {
 // counterResetInAnyBucket returns true if there was a counter reset for any
 // bucket. This should be called only when the bucket layout is the same or new
 // buckets were added. It does not handle the case of buckets missing.
-func counterResetInAnyBucket[BV bucketValue](oldBuckets, newBuckets []BV, oldSpans, newSpans []histogram.Span, deltas bool) bool {
+func counterResetInAnyBucket(oldBuckets, newBuckets []int64, oldSpans, newSpans []histogram.Span) bool {
 	if len(oldSpans) == 0 || len(oldBuckets) == 0 {
 		return false
 	}
@@ -346,11 +346,7 @@ func counterResetInAnyBucket[BV bucketValue](oldBuckets, newBuckets []BV, oldSpa
 				oldIdx++
 			}
 			oldBucketSliceIdx++
-			if deltas {
-				oldVal += oldBuckets[oldBucketSliceIdx]
-			} else {
-				oldVal = oldBuckets[oldBucketSliceIdx]
-			}
+			oldVal += oldBuckets[oldBucketSliceIdx]
 		}
 
 		if oldIdx > newIdx {
@@ -370,11 +366,7 @@ func counterResetInAnyBucket[BV bucketValue](oldBuckets, newBuckets []BV, oldSpa
 				newIdx++
 			}
 			newBucketSliceIdx++
-			if deltas {
-				newVal += newBuckets[newBucketSliceIdx]
-			} else {
-				newVal = newBuckets[newBucketSliceIdx]
-			}
+			newVal += newBuckets[newBucketSliceIdx]
 		}
 	}
 

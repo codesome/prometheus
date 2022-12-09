@@ -66,7 +66,7 @@ func (c *FloatHistogramChunk) Layout() (
 	err error,
 ) {
 	if c.NumSamples() == 0 {
-		panic("HistoChunk.Layout() called on an empty chunk")
+		panic("FloatHistogramChunk.Layout() called on an empty chunk")
 	}
 	b := newBReader(c.Bytes()[2:])
 	return readHistogramChunkLayout(&b)
@@ -111,35 +111,42 @@ func (c *FloatHistogramChunk) Appender() (Appender, error) {
 		return nil, err
 	}
 
+	pBuckets := make([]xorValue, len(it.pBuckets))
+	for i := 0; i < len(it.pBuckets); i++ {
+		pBuckets[i] = xorValue{
+			value:    it.pBuckets[i],
+			leading:  it.pBucketsLeading[i],
+			trailing: it.pBucketsTrailing[i],
+		}
+	}
+	nBuckets := make([]xorValue, 0, len(it.nBuckets))
+	for i := 0; i < len(it.nBuckets); i++ {
+		nBuckets[i] = xorValue{
+			value:    it.nBuckets[i],
+			leading:  it.nBucketsLeading[i],
+			trailing: it.nBucketsTrailing[i],
+		}
+	}
+
 	a := &FloatHistogramAppender{
 		b: &c.b,
 
-		schema:           it.schema,
-		zThreshold:       it.zThreshold,
-		pSpans:           it.pSpans,
-		nSpans:           it.nSpans,
-		t:                it.t,
-		tDelta:           it.tDelta,
-		cnt:              it.cnt,
-		cntLeading:       it.cntLeading,
-		cntTrailing:      it.cntTrailing,
-		zCnt:             it.zCnt,
-		zCntLeading:      it.zCntLeading,
-		zCntTrailing:     it.zCntTrailing,
-		pBuckets:         it.pBuckets,
-		pBucketsLeading:  it.pBucketsLeading,
-		pBucketsTrailing: it.pBucketsTrailing,
-		nBuckets:         it.nBuckets,
-		nBucketsLeading:  it.nBucketsLeading,
-		nBucketsTrailing: it.nBucketsTrailing,
-		sum:              it.sum,
-		sumLeading:       it.sumLeading,
-		sumTrailing:      it.sumTrailing,
+		schema:     it.schema,
+		zThreshold: it.zThreshold,
+		pSpans:     it.pSpans,
+		nSpans:     it.nSpans,
+		t:          it.t,
+		tDelta:     it.tDelta,
+		cnt:        it.cnt,
+		zCnt:       it.zCnt,
+		pBuckets:   pBuckets,
+		nBuckets:   nBuckets,
+		sum:        it.sum,
 	}
 	if it.numTotal == 0 {
-		a.sumLeading = 0xff
-		a.cntLeading = 0xff
-		a.zCntLeading = 0xff
+		a.sum.leading = 0xff
+		a.cnt.leading = 0xff
+		a.zCnt.leading = 0xff
 	}
 	return a, nil
 }
@@ -173,6 +180,12 @@ func (c *FloatHistogramChunk) Iterator(it Iterator) Iterator {
 	return c.iterator(it)
 }
 
+type xorValue struct {
+	value    float64
+	leading  uint8
+	trailing uint8
+}
+
 // FloatHistogramAppender is an Appender implementation for float histograms.
 type FloatHistogramAppender struct {
 	b *bstream
@@ -182,22 +195,9 @@ type FloatHistogramAppender struct {
 	zThreshold     float64
 	pSpans, nSpans []histogram.Span
 
-	// dod encoded.
-	t      int64
-	tDelta int64
-
-	// All Gorilla xor encoded.
-	cnt, zCnt          float64
-	pBuckets, nBuckets []float64
-	sum                float64
-
-	// For the xor encoding.
-	cntLeading, zCntLeading            uint8
-	cntTrailing, zCntTrailing          uint8
-	pBucketsLeading, nBucketsLeading   []uint8
-	pBucketsTrailing, nBucketsTrailing []uint8
-	sumLeading                         uint8
-	sumTrailing                        uint8
+	t, tDelta          int64
+	sum, cnt, zCnt     xorValue
+	pBuckets, nBuckets []xorValue
 }
 
 // Append implements Appender. This implementation panics because normal float
@@ -224,32 +224,23 @@ func (a *FloatHistogramAppender) AppendHistogram(int64, *histogram.Histogram) {
 //
 // • Any buckets have disappeared.
 //
-// • There was a counter reset in the count of observations or in any bucket,
-// including the zero bucket.
-//
 // • The last sample in the chunk was stale while the current sample is not stale.
 //
 // The method returns an additional boolean set to true if it is not appendable
-// because of a counter reset. If the given sample is stale, it is always ok to
-// append. If counterReset is true, okToAppend is always false.
+// because of buckets missing. If the given sample is stale, it is always ok to
+// append. If bucketsMissing is true, okToAppend is always false.
 func (a *FloatHistogramAppender) Appendable(h *histogram.FloatHistogram) (
 	positiveInterjections, negativeInterjections []Interjection,
-	okToAppend, counterReset bool,
+	okToAppend, bucketsMissing bool,
 ) {
 	if value.IsStaleNaN(h.Sum) {
 		// This is a stale sample whose buckets and spans don't matter.
 		okToAppend = true
 		return
 	}
-	if value.IsStaleNaN(a.sum) {
+	if value.IsStaleNaN(a.sum.value) {
 		// If the last sample was stale, then we can only accept stale
 		// samples in this chunk.
-		return
-	}
-
-	if h.Count < a.cnt {
-		// There has been a counter reset.
-		counterReset = true
 		return
 	}
 
@@ -257,27 +248,15 @@ func (a *FloatHistogramAppender) Appendable(h *histogram.FloatHistogram) (
 		return
 	}
 
-	if h.ZeroCount < a.zCnt {
-		// There has been a counter reset since ZeroThreshold didn't change.
-		counterReset = true
-		return
-	}
-
 	var ok bool
 	positiveInterjections, ok = compareSpans(a.pSpans, h.PositiveSpans)
 	if !ok {
-		counterReset = true
+		bucketsMissing = true
 		return
 	}
 	negativeInterjections, ok = compareSpans(a.nSpans, h.NegativeSpans)
 	if !ok {
-		counterReset = true
-		return
-	}
-
-	if counterResetInAnyBucket(a.pBuckets, h.PositiveBuckets, a.pSpans, h.PositiveSpans, false) ||
-		counterResetInAnyBucket(a.nBuckets, h.NegativeBuckets, a.nSpans, h.NegativeSpans, false) {
-		counterReset, positiveInterjections, negativeInterjections = true, nil, nil
+		bucketsMissing = true
 		return
 	}
 
@@ -321,30 +300,28 @@ func (a *FloatHistogramAppender) AppendFloatHistogram(t int64, h *histogram.Floa
 
 		numPBuckets, numNBuckets := countSpans(h.PositiveSpans), countSpans(h.NegativeSpans)
 		if numPBuckets > 0 {
-			a.pBuckets = make([]float64, numPBuckets)
-			a.pBucketsLeading = make([]uint8, numPBuckets)
-			a.pBucketsTrailing = make([]uint8, numPBuckets)
+			a.pBuckets = make([]xorValue, numPBuckets)
 			for i := 0; i < numPBuckets; i++ {
-				a.pBucketsLeading[i] = 0xff
-				a.pBucketsTrailing[i] = 0xff
+				a.pBuckets[i] = xorValue{
+					value:    h.PositiveBuckets[i],
+					leading:  0xff,
+					trailing: 0xff,
+				}
 			}
 		} else {
 			a.pBuckets = nil
-			a.pBucketsLeading = nil
-			a.pBucketsTrailing = nil
 		}
 		if numNBuckets > 0 {
-			a.nBuckets = make([]float64, numNBuckets)
-			a.nBucketsLeading = make([]uint8, numNBuckets)
-			a.nBucketsTrailing = make([]uint8, numNBuckets)
+			a.nBuckets = make([]xorValue, numNBuckets)
 			for i := 0; i < numNBuckets; i++ {
-				a.nBucketsLeading[i] = 0xff
-				a.nBucketsTrailing[i] = 0xff
+				a.nBuckets[i] = xorValue{
+					value:    h.NegativeBuckets[i],
+					leading:  0xff,
+					trailing: 0xff,
+				}
 			}
 		} else {
 			a.nBuckets = nil
-			a.nBucketsLeading = nil
-			a.nBucketsTrailing = nil
 		}
 
 		// Now store the actual data.
@@ -352,6 +329,9 @@ func (a *FloatHistogramAppender) AppendFloatHistogram(t int64, h *histogram.Floa
 		a.b.writeBits(math.Float64bits(h.Count), 64)
 		a.b.writeBits(math.Float64bits(h.ZeroCount), 64)
 		a.b.writeBits(math.Float64bits(h.Sum), 64)
+		a.cnt.value = h.Count
+		a.zCnt.value = h.ZeroCount
+		a.sum.value = h.Sum
 		for _, b := range h.PositiveBuckets {
 			a.b.writeBits(math.Float64bits(b), 64)
 		}
@@ -368,28 +348,27 @@ func (a *FloatHistogramAppender) AppendFloatHistogram(t int64, h *histogram.Floa
 
 		putVarbitInt(a.b, tDod)
 
-		xorWrite(a.b, h.Count, a.cnt, &a.cntLeading, &a.cntTrailing)
-		xorWrite(a.b, h.ZeroCount, a.zCnt, &a.zCntLeading, &a.zCntTrailing)
-		xorWrite(a.b, h.Sum, a.sum, &a.sumLeading, &a.sumTrailing)
+		a.writeXorValue(&a.cnt, h.Count)
+		a.writeXorValue(&a.zCnt, h.ZeroCount)
+		a.writeXorValue(&a.sum, h.Sum)
 
 		for i, b := range h.PositiveBuckets {
-			xorWrite(a.b, b, a.pBuckets[i], &a.pBucketsLeading[i], &a.pBucketsTrailing[i])
+			a.writeXorValue(&a.pBuckets[i], b)
 		}
 		for i, b := range h.NegativeBuckets {
-			xorWrite(a.b, b, a.nBuckets[i], &a.nBucketsLeading[i], &a.nBucketsTrailing[i])
+			a.writeXorValue(&a.nBuckets[i], b)
 		}
 	}
 
 	binary.BigEndian.PutUint16(a.b.bytes(), num+1)
 
 	a.t = t
-	a.cnt = h.Count
-	a.zCnt = h.ZeroCount
 	a.tDelta = tDelta
-	a.sum = h.Sum
+}
 
-	copy(a.pBuckets, h.PositiveBuckets)
-	copy(a.nBuckets, h.NegativeBuckets)
+func (a *FloatHistogramAppender) writeXorValue(old *xorValue, v float64) {
+	xorWrite(a.b, v, old.value, &old.leading, &old.trailing)
+	old.value = v
 }
 
 // Recode converts the current chunk to accommodate an expansion of the set of
@@ -397,7 +376,6 @@ func (a *FloatHistogramAppender) AppendFloatHistogram(t int64, h *histogram.Floa
 // interjections, resulting in the honoring of the provided new positive and
 // negative spans. To continue appending, use the returned Appender rather than
 // the receiver of this method.
-// TODO(codesome): support float histograms.
 func (a *FloatHistogramAppender) Recode(
 	positiveInterjections, negativeInterjections []Interjection,
 	positiveSpans, negativeSpans []histogram.Span,
@@ -460,18 +438,13 @@ type floatHistogramIterator struct {
 	tDelta int64
 
 	// All Gorilla xor encoded.
-	cnt, zCnt                 float64
-	cntLeading, zCntLeading   uint8
-	cntTrailing, zCntTrailing uint8
+	sum, cnt, zCnt xorValue
 
+	// Buckets are not of type xorValue to avoid creating
+	// new slices for every AtFloatHistogram call.
 	pBuckets, nBuckets                 []float64
 	pBucketsLeading, nBucketsLeading   []uint8
 	pBucketsTrailing, nBucketsTrailing []uint8
-
-	// For sum.
-	sum         float64
-	sumLeading  uint8
-	sumTrailing uint8
 
 	err error
 
@@ -500,14 +473,14 @@ func (it *floatHistogramIterator) AtHistogram() (int64, *histogram.Histogram) {
 }
 
 func (it *floatHistogramIterator) AtFloatHistogram() (int64, *histogram.FloatHistogram) {
-	if value.IsStaleNaN(it.sum) {
-		return it.t, &histogram.FloatHistogram{Sum: it.sum}
+	if value.IsStaleNaN(it.sum.value) {
+		return it.t, &histogram.FloatHistogram{Sum: it.sum.value}
 	}
 	it.atFloatHistogramCalled = true
 	return it.t, &histogram.FloatHistogram{
-		Count:           it.cnt,
-		ZeroCount:       it.zCnt,
-		Sum:             it.sum,
+		Count:           it.cnt.value,
+		ZeroCount:       it.zCnt.value,
+		Sum:             it.sum.value,
 		ZeroThreshold:   it.zThreshold,
 		Schema:          it.schema,
 		PositiveSpans:   it.pSpans,
@@ -532,9 +505,8 @@ func (it *floatHistogramIterator) Reset(b []byte) {
 	it.numTotal = binary.BigEndian.Uint16(b)
 	it.numRead = 0
 
-	it.t, it.cnt, it.zCnt, it.sum = 0, 0, 0, 0
-	it.sumLeading, it.sumTrailing = 0, 0
-	it.tDelta, it.cntLeading, it.cntTrailing, it.zCntLeading, it.zCntTrailing = 0, 0, 0, 0, 0
+	it.t, it.tDelta = 0, 0
+	it.cnt, it.zCnt, it.sum = xorValue{}, xorValue{}, xorValue{}
 
 	it.atFloatHistogramCalled = false
 	it.pBuckets, it.nBuckets = nil, nil
@@ -568,11 +540,19 @@ func (it *floatHistogramIterator) Next() ValueType {
 			it.pBuckets = make([]float64, numPBuckets)
 			it.pBucketsLeading = make([]uint8, numPBuckets)
 			it.pBucketsTrailing = make([]uint8, numPBuckets)
+			for i := 0; i < numPBuckets; i++ {
+				it.pBucketsLeading[i] = 0xff
+				it.pBucketsTrailing[i] = 0xff
+			}
 		}
 		if numNBuckets > 0 {
 			it.nBuckets = make([]float64, numNBuckets)
 			it.nBucketsLeading = make([]uint8, numNBuckets)
 			it.nBucketsTrailing = make([]uint8, numNBuckets)
+			for i := 0; i < numNBuckets; i++ {
+				it.nBucketsLeading[i] = 0xff
+				it.nBucketsTrailing[i] = 0xff
+			}
 		}
 
 		// Now read the actual data.
@@ -588,21 +568,21 @@ func (it *floatHistogramIterator) Next() ValueType {
 			it.err = err
 			return ValNone
 		}
-		it.cnt = math.Float64frombits(cnt)
+		it.cnt.value = math.Float64frombits(cnt)
 
 		zcnt, err := it.br.readBits(64)
 		if err != nil {
 			it.err = err
 			return ValNone
 		}
-		it.zCnt = math.Float64frombits(zcnt)
+		it.zCnt.value = math.Float64frombits(zcnt)
 
 		sum, err := it.br.readBits(64)
 		if err != nil {
 			it.err = err
 			return ValNone
 		}
-		it.sum = math.Float64frombits(sum)
+		it.sum.value = math.Float64frombits(sum)
 
 		for i := range it.pBuckets {
 			v, err := it.br.readBits(64)
@@ -656,19 +636,19 @@ func (it *floatHistogramIterator) Next() ValueType {
 	it.tDelta = it.tDelta + tDod
 	it.t += it.tDelta
 
-	if ok := it.readXor(&it.cnt, &it.cntLeading, &it.cntTrailing); !ok {
+	if ok := it.readXor(&it.cnt.value, &it.cnt.leading, &it.cnt.trailing); !ok {
 		return ValNone
 	}
 
-	if ok := it.readXor(&it.zCnt, &it.zCntLeading, &it.zCntTrailing); !ok {
+	if ok := it.readXor(&it.zCnt.value, &it.zCnt.leading, &it.zCnt.trailing); !ok {
 		return ValNone
 	}
 
-	if ok := it.readXor(&it.sum, &it.sumLeading, &it.sumTrailing); !ok {
+	if ok := it.readXor(&it.sum.value, &it.sum.leading, &it.sum.trailing); !ok {
 		return ValNone
 	}
 
-	if value.IsStaleNaN(it.sum) {
+	if value.IsStaleNaN(it.sum.value) {
 		it.numRead++
 		return ValFloatHistogram
 	}
