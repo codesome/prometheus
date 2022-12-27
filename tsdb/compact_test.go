@@ -1314,10 +1314,10 @@ func TestHeadCompactionWithHistograms(t *testing.T) {
 				for tsMinute := from; tsMinute <= to; tsMinute++ {
 					var err error
 					if floatTest {
-						_, err = app.AppendHistogram(0, lbls, minute(tsMinute), nil, h.ToFloat())
+						_, err = app.AppendHistogram(0, lbls, minute(tsMinute), nil, h.ToFloat(), nil)
 						*exp = append(*exp, sample{t: minute(tsMinute), fh: h.ToFloat()})
 					} else {
-						_, err = app.AppendHistogram(0, lbls, minute(tsMinute), h, nil)
+						_, err = app.AppendHistogram(0, lbls, minute(tsMinute), h, nil, nil)
 						*exp = append(*exp, sample{t: minute(tsMinute), h: h.Copy()})
 					}
 					require.NoError(t, err)
@@ -1520,7 +1520,7 @@ func TestSparseHistogramSpaceSavings(t *testing.T) {
 						)
 						for i := 0; i < numHistograms; i++ {
 							ts := int64(i) * timeStep
-							ref, err = sparseApp.AppendHistogram(ref, ah.baseLabels, ts, ah.hists[i], nil)
+							ref, err = sparseApp.AppendHistogram(ref, ah.baseLabels, ts, ah.hists[i], nil, nil)
 							require.NoError(t, err)
 						}
 					}

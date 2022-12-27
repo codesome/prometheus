@@ -528,10 +528,10 @@ func createHead(tb testing.TB, w *wlog.WL, series []storage.Series, chunkDir str
 				ref, err = app.Append(ref, lset, t, v)
 			case chunkenc.ValHistogram:
 				t, h := it.AtHistogram()
-				ref, err = app.AppendHistogram(ref, lset, t, h, nil)
+				ref, err = app.AppendHistogram(ref, lset, t, h, nil, nil)
 			case chunkenc.ValFloatHistogram:
 				t, fh := it.AtFloatHistogram()
-				ref, err = app.AppendHistogram(ref, lset, t, nil, fh)
+				ref, err = app.AppendHistogram(ref, lset, t, nil, fh, nil)
 			default:
 				err = fmt.Errorf("unknown sample type %s", typ.String())
 			}

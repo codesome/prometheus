@@ -502,29 +502,29 @@ func TestAmendHistogramDatapointCausesError(t *testing.T) {
 	fh := h.ToFloat()
 
 	app = db.Appender(ctx)
-	_, err = app.AppendHistogram(0, labels.FromStrings("a", "c"), 0, h.Copy(), nil)
+	_, err = app.AppendHistogram(0, labels.FromStrings("a", "c"), 0, h.Copy(), nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
 	app = db.Appender(ctx)
-	_, err = app.AppendHistogram(0, labels.FromStrings("a", "c"), 0, h.Copy(), nil)
+	_, err = app.AppendHistogram(0, labels.FromStrings("a", "c"), 0, h.Copy(), nil, nil)
 	require.NoError(t, err)
 	h.Schema = 2
-	_, err = app.AppendHistogram(0, labels.FromStrings("a", "c"), 0, h.Copy(), nil)
+	_, err = app.AppendHistogram(0, labels.FromStrings("a", "c"), 0, h.Copy(), nil, nil)
 	require.Equal(t, storage.ErrDuplicateSampleForTimestamp, err)
 	require.NoError(t, app.Rollback())
 
 	// Float histogram.
 	app = db.Appender(ctx)
-	_, err = app.AppendHistogram(0, labels.FromStrings("a", "d"), 0, nil, fh.Copy())
+	_, err = app.AppendHistogram(0, labels.FromStrings("a", "d"), 0, nil, fh.Copy(), nil)
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
 	app = db.Appender(ctx)
-	_, err = app.AppendHistogram(0, labels.FromStrings("a", "d"), 0, nil, fh.Copy())
+	_, err = app.AppendHistogram(0, labels.FromStrings("a", "d"), 0, nil, fh.Copy(), nil)
 	require.NoError(t, err)
 	fh.Schema = 2
-	_, err = app.AppendHistogram(0, labels.FromStrings("a", "d"), 0, nil, fh.Copy())
+	_, err = app.AppendHistogram(0, labels.FromStrings("a", "d"), 0, nil, fh.Copy(), nil)
 	require.Equal(t, storage.ErrDuplicateSampleForTimestamp, err)
 	require.NoError(t, app.Rollback())
 }
@@ -5845,10 +5845,10 @@ func testHistogramAppendAndQueryHelper(t *testing.T, floatHistogram bool) {
 		var err error
 		app := db.Appender(ctx)
 		if floatHistogram {
-			_, err = app.AppendHistogram(0, lbls, minute(tsMinute), nil, h.ToFloat())
+			_, err = app.AppendHistogram(0, lbls, minute(tsMinute), nil, h.ToFloat(), nil)
 			*exp = append(*exp, sample{t: minute(tsMinute), fh: h.ToFloat()})
 		} else {
-			_, err = app.AppendHistogram(0, lbls, minute(tsMinute), h.Copy(), nil)
+			_, err = app.AppendHistogram(0, lbls, minute(tsMinute), h.Copy(), nil, nil)
 			*exp = append(*exp, sample{t: minute(tsMinute), h: h.Copy()})
 		}
 		require.NoError(t, err)
@@ -6249,22 +6249,22 @@ func TestNativeHistogramFlag(t *testing.T) {
 	app := db.Appender(context.Background())
 
 	// Disabled by default.
-	_, err = app.AppendHistogram(0, l, 100, h, nil)
+	_, err = app.AppendHistogram(0, l, 100, h, nil, nil)
 	require.Equal(t, storage.ErrNativeHistogramsDisabled, err)
-	_, err = app.AppendHistogram(0, l, 105, nil, h.ToFloat())
+	_, err = app.AppendHistogram(0, l, 105, nil, h.ToFloat(), nil)
 	require.Equal(t, storage.ErrNativeHistogramsDisabled, err)
 
 	// Enable and append.
 	db.EnableNativeHistograms()
-	_, err = app.AppendHistogram(0, l, 200, h, nil)
+	_, err = app.AppendHistogram(0, l, 200, h, nil, nil)
 	require.NoError(t, err)
-	_, err = app.AppendHistogram(0, l, 205, nil, h.ToFloat())
+	_, err = app.AppendHistogram(0, l, 205, nil, h.ToFloat(), nil)
 	require.NoError(t, err)
 
 	db.DisableNativeHistograms()
-	_, err = app.AppendHistogram(0, l, 300, h, nil)
+	_, err = app.AppendHistogram(0, l, 300, h, nil, nil)
 	require.Equal(t, storage.ErrNativeHistogramsDisabled, err)
-	_, err = app.AppendHistogram(0, l, 305, nil, h.ToFloat())
+	_, err = app.AppendHistogram(0, l, 305, nil, h.ToFloat(), nil)
 	require.Equal(t, storage.ErrNativeHistogramsDisabled, err)
 
 	require.NoError(t, app.Commit())

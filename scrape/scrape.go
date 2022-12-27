@@ -1636,9 +1636,9 @@ loop:
 
 		if isHistogram {
 			if h != nil {
-				ref, err = app.AppendHistogram(ref, lset, t, h, nil)
+				ref, err = app.AppendHistogram(ref, lset, t, h, nil, nil)
 			} else {
-				ref, err = app.AppendHistogram(ref, lset, t, nil, fh)
+				ref, err = app.AppendHistogram(ref, lset, t, nil, fh, nil)
 			}
 		} else {
 			ref, err = app.Append(ref, lset, t, val)

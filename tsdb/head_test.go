@@ -2830,7 +2830,7 @@ func TestAppendHistogram(t *testing.T) {
 			}
 			expHistograms := make([]timedHistogram, 0, numHistograms)
 			for _, h := range GenerateTestHistograms(numHistograms) {
-				_, err := app.AppendHistogram(0, l, ingestTs, h, nil)
+				_, err := app.AppendHistogram(0, l, ingestTs, h, nil, nil)
 				require.NoError(t, err)
 				expHistograms = append(expHistograms, timedHistogram{ingestTs, h})
 				ingestTs++
@@ -2846,7 +2846,7 @@ func TestAppendHistogram(t *testing.T) {
 			}
 			expFloatHistograms := make([]timedFloatHistogram, 0, numHistograms)
 			for _, fh := range GenerateTestFloatHistograms(numHistograms) {
-				_, err := app.AppendHistogram(0, l, ingestTs, nil, fh)
+				_, err := app.AppendHistogram(0, l, ingestTs, nil, fh, nil)
 				require.NoError(t, err)
 				expFloatHistograms = append(expFloatHistograms, timedFloatHistogram{ingestTs, fh})
 				ingestTs++
@@ -2906,7 +2906,7 @@ func TestHistogramInWALAndMmapChunk(t *testing.T) {
 		h.Count = h.Count * 2
 		h.NegativeSpans = h.PositiveSpans
 		h.NegativeBuckets = h.PositiveBuckets
-		_, err := app.AppendHistogram(0, s1, ts, h, nil)
+		_, err := app.AppendHistogram(0, s1, ts, h, nil, nil)
 		require.NoError(t, err)
 		exp[k1] = append(exp[k1], sample{t: ts, h: h.Copy()})
 		ts++
@@ -2921,7 +2921,7 @@ func TestHistogramInWALAndMmapChunk(t *testing.T) {
 		h.Count = h.Count * 2
 		h.NegativeSpans = h.PositiveSpans
 		h.NegativeBuckets = h.PositiveBuckets
-		_, err := app.AppendHistogram(0, s1, ts, nil, h)
+		_, err := app.AppendHistogram(0, s1, ts, nil, h, nil)
 		require.NoError(t, err)
 		exp[k1] = append(exp[k1], sample{t: ts, fh: h.Copy()})
 		ts++
@@ -2954,7 +2954,7 @@ func TestHistogramInWALAndMmapChunk(t *testing.T) {
 		h.Count = h.Count * 2
 		h.NegativeSpans = h.PositiveSpans
 		h.NegativeBuckets = h.PositiveBuckets
-		_, err := app.AppendHistogram(0, s2, int64(ts), h, nil)
+		_, err := app.AppendHistogram(0, s2, int64(ts), h, nil, nil)
 		require.NoError(t, err)
 		exp[k2] = append(exp[k2], sample{t: int64(ts), h: h.Copy()})
 		if ts%20 == 0 {
@@ -2978,7 +2978,7 @@ func TestHistogramInWALAndMmapChunk(t *testing.T) {
 		h.Count = h.Count * 2
 		h.NegativeSpans = h.PositiveSpans
 		h.NegativeBuckets = h.PositiveBuckets
-		_, err := app.AppendHistogram(0, s2, int64(ts), nil, h)
+		_, err := app.AppendHistogram(0, s2, int64(ts), nil, h, nil)
 		require.NoError(t, err)
 		exp[k2] = append(exp[k2], sample{t: int64(ts), fh: h.Copy()})
 		if ts%20 == 0 {
@@ -3334,14 +3334,14 @@ func TestHistogramMetrics(t *testing.T) {
 		l := labels.FromStrings("a", fmt.Sprintf("b%d", x))
 		for i, h := range GenerateTestHistograms(numHistograms) {
 			app := head.Appender(context.Background())
-			_, err := app.AppendHistogram(0, l, int64(i), h, nil)
+			_, err := app.AppendHistogram(0, l, int64(i), h, nil, nil)
 			require.NoError(t, err)
 			require.NoError(t, app.Commit())
 			expHSamples++
 		}
 		for i, fh := range GenerateTestFloatHistograms(numHistograms) {
 			app := head.Appender(context.Background())
-			_, err := app.AppendHistogram(0, l, int64(numHistograms+i), nil, fh)
+			_, err := app.AppendHistogram(0, l, int64(numHistograms+i), nil, fh, nil)
 			require.NoError(t, err)
 			require.NoError(t, app.Commit())
 			expHSamples++
@@ -3418,7 +3418,7 @@ func TestHistogramStaleSample(t *testing.T) {
 	// Adding stale in the same appender.
 	app := head.Appender(context.Background())
 	for _, h := range GenerateTestHistograms(numHistograms) {
-		_, err := app.AppendHistogram(0, l, 100*int64(len(expHistograms)), h, nil)
+		_, err := app.AppendHistogram(0, l, 100*int64(len(expHistograms)), h, nil, nil)
 		require.NoError(t, err)
 		expHistograms = append(expHistograms, timedHistogram{100 * int64(len(expHistograms)), h})
 	}
@@ -3437,7 +3437,7 @@ func TestHistogramStaleSample(t *testing.T) {
 	// Adding stale in different appender and continuing series after a stale sample.
 	app = head.Appender(context.Background())
 	for _, h := range GenerateTestHistograms(2 * numHistograms)[numHistograms:] {
-		_, err := app.AppendHistogram(0, l, 100*int64(len(expHistograms)), h, nil)
+		_, err := app.AppendHistogram(0, l, 100*int64(len(expHistograms)), h, nil, nil)
 		require.NoError(t, err)
 		expHistograms = append(expHistograms, timedHistogram{100 * int64(len(expHistograms)), h})
 	}
@@ -3473,9 +3473,9 @@ func TestHistogramCounterResetHeader(t *testing.T) {
 				app := head.Appender(context.Background())
 				var err error
 				if floatHisto {
-					_, err = app.AppendHistogram(0, l, ts, nil, h.ToFloat())
+					_, err = app.AppendHistogram(0, l, ts, nil, h.ToFloat(), nil)
 				} else {
-					_, err = app.AppendHistogram(0, l, ts, h, nil)
+					_, err = app.AppendHistogram(0, l, ts, h, nil, nil)
 				}
 				require.NoError(t, err)
 				require.NoError(t, app.Commit())
@@ -3687,7 +3687,7 @@ func TestAppendingDifferentEncodingToSameSeries(t *testing.T) {
 		for _, s := range a.samples {
 			var err error
 			if s.H() != nil || s.FH() != nil {
-				_, err = app.AppendHistogram(0, lbls, s.T(), s.H(), s.FH())
+				_, err = app.AppendHistogram(0, lbls, s.T(), s.H(), s.FH(), nil)
 			} else {
 				_, err = app.Append(0, lbls, s.T(), s.V())
 			}

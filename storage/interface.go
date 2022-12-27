@@ -282,7 +282,18 @@ type HistogramAppender interface {
 	// For efficiency reasons, the histogram is passed as a
 	// pointer. AppendHistogram won't mutate the histogram, but in turn
 	// depends on the caller to not mutate it either.
-	AppendHistogram(ref SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (SeriesRef, error)
+	//
+	// By default, the storage should assume the histogram to be a counter histogram
+	// unless the hints say it is a gauge histogram.
+	AppendHistogram(ref SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram, hints *AppendHints) (SeriesRef, error)
+}
+
+// AppendHints are the hints given to the storage
+// about the sample being appended.
+type AppendHints struct {
+	// GaugeHistogram indicates that the histogram being appended
+	// is a gauge histogram.
+	GaugeHistogram bool
 }
 
 // MetadataUpdater provides an interface for associating metadata to stored series.

@@ -68,14 +68,14 @@ func (a *initAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e 
 	return a.app.AppendExemplar(ref, l, e)
 }
 
-func (a *initAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+func (a *initAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram, hints *storage.AppendHints) (storage.SeriesRef, error) {
 	if a.app != nil {
-		return a.app.AppendHistogram(ref, l, t, h, fh)
+		return a.app.AppendHistogram(ref, l, t, h, fh, hints)
 	}
 	a.head.initTime(t)
 	a.app = a.head.appender()
 
-	return a.app.AppendHistogram(ref, l, t, h, fh)
+	return a.app.AppendHistogram(ref, l, t, h, fh, hints)
 }
 
 func (a *initAppender) UpdateMetadata(ref storage.SeriesRef, l labels.Labels, m metadata.Metadata) (storage.SeriesRef, error) {
@@ -352,7 +352,7 @@ func (a *headAppender) Append(ref storage.SeriesRef, lset labels.Labels, t int64
 
 	if value.IsStaleNaN(v) && s.isHistogramSeries {
 		// TODO(marctc): do we have do to the same for float histograms?
-		return a.AppendHistogram(ref, lset, t, &histogram.Histogram{Sum: v}, nil)
+		return a.AppendHistogram(ref, lset, t, &histogram.Histogram{Sum: v}, nil, nil)
 	}
 
 	s.Lock()
@@ -515,7 +515,8 @@ func (a *headAppender) AppendExemplar(ref storage.SeriesRef, lset labels.Labels,
 	return storage.SeriesRef(s.ref), nil
 }
 
-func (a *headAppender) AppendHistogram(ref storage.SeriesRef, lset labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+func (a *headAppender) AppendHistogram(ref storage.SeriesRef, lset labels.Labels,
+	t int64, h *histogram.Histogram, fh *histogram.FloatHistogram, hints *storage.AppendHints) (storage.SeriesRef, error) {
 	if !a.head.opts.EnableNativeHistograms.Load() {
 		return 0, storage.ErrNativeHistogramsDisabled
 	}

@@ -3137,7 +3137,7 @@ func TestSparseHistogramRate(t *testing.T) {
 
 	app := test.Storage().Appender(context.TODO())
 	for i, h := range tsdb.GenerateTestHistograms(100) {
-		_, err := app.AppendHistogram(0, lbls, int64(i)*int64(15*time.Second/time.Millisecond), h, nil)
+		_, err := app.AppendHistogram(0, lbls, int64(i)*int64(15*time.Second/time.Millisecond), h, nil, nil)
 		require.NoError(t, err)
 	}
 	require.NoError(t, app.Commit())
@@ -3178,7 +3178,7 @@ func TestSparseFloatHistogramRate(t *testing.T) {
 
 	app := test.Storage().Appender(context.TODO())
 	for i, fh := range tsdb.GenerateTestFloatHistograms(100) {
-		_, err := app.AppendHistogram(0, lbls, int64(i)*int64(15*time.Second/time.Millisecond), nil, fh)
+		_, err := app.AppendHistogram(0, lbls, int64(i)*int64(15*time.Second/time.Millisecond), nil, fh, nil)
 		require.NoError(t, err)
 	}
 	require.NoError(t, app.Commit())
@@ -3240,9 +3240,9 @@ func TestSparseHistogram_HistogramCountAndSum(t *testing.T) {
 			ts := int64(10 * time.Minute / time.Millisecond)
 			app := test.Storage().Appender(context.TODO())
 			if floatHisto {
-				_, err = app.AppendHistogram(0, lbls, ts, nil, h.ToFloat())
+				_, err = app.AppendHistogram(0, lbls, ts, nil, h.ToFloat(), nil)
 			} else {
-				_, err = app.AppendHistogram(0, lbls, ts, h, nil)
+				_, err = app.AppendHistogram(0, lbls, ts, h, nil, nil)
 			}
 			require.NoError(t, err)
 			require.NoError(t, app.Commit())
@@ -3492,9 +3492,9 @@ func TestSparseHistogram_HistogramQuantile(t *testing.T) {
 				ts := idx * int64(10*time.Minute/time.Millisecond)
 				app := test.Storage().Appender(context.TODO())
 				if floatHisto {
-					_, err = app.AppendHistogram(0, lbls, ts, nil, c.h.ToFloat())
+					_, err = app.AppendHistogram(0, lbls, ts, nil, c.h.ToFloat(), nil)
 				} else {
-					_, err = app.AppendHistogram(0, lbls, ts, c.h, nil)
+					_, err = app.AppendHistogram(0, lbls, ts, c.h, nil, nil)
 				}
 				require.NoError(t, err)
 				require.NoError(t, app.Commit())
@@ -3923,9 +3923,9 @@ func TestSparseHistogram_HistogramFraction(t *testing.T) {
 				ts := idx * int64(10*time.Minute/time.Millisecond)
 				app := test.Storage().Appender(context.TODO())
 				if floatHisto {
-					_, err = app.AppendHistogram(0, lbls, ts, nil, c.h.ToFloat())
+					_, err = app.AppendHistogram(0, lbls, ts, nil, c.h.ToFloat(), nil)
 				} else {
-					_, err = app.AppendHistogram(0, lbls, ts, c.h, nil)
+					_, err = app.AppendHistogram(0, lbls, ts, c.h, nil, nil)
 				}
 				require.NoError(t, err)
 				require.NoError(t, app.Commit())
@@ -4061,9 +4061,9 @@ func TestSparseHistogram_Sum_Count_AddOperator(t *testing.T) {
 					lbls := labels.FromStrings("__name__", seriesName, "idx", fmt.Sprintf("%d", idx1))
 					// Since we mutate h later, we need to create a copy here.
 					if floatHisto {
-						_, err = app.AppendHistogram(0, lbls, ts, nil, h.Copy().ToFloat())
+						_, err = app.AppendHistogram(0, lbls, ts, nil, h.Copy().ToFloat(), nil)
 					} else {
-						_, err = app.AppendHistogram(0, lbls, ts, h.Copy(), nil)
+						_, err = app.AppendHistogram(0, lbls, ts, h.Copy(), nil, nil)
 					}
 					require.NoError(t, err)
 				}
