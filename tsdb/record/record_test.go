@@ -165,6 +165,14 @@ func TestRecord_EncodeDecode(t *testing.T) {
 	decFloatHistograms, err := dec.FloatHistogramSamples(enc.FloatHistogramSamples(floatHistograms, nil), nil)
 	require.NoError(t, err)
 	require.Equal(t, floatHistograms, decFloatHistograms)
+
+	// Gauge float histograms.
+	for i := range floatHistograms {
+		floatHistograms[i].GaugeType = true
+	}
+	decFloatHistograms, err = dec.FloatHistogramSamples(enc.FloatHistogramSamples(floatHistograms, nil), nil)
+	require.NoError(t, err)
+	require.Equal(t, floatHistograms, decFloatHistograms)
 }
 
 // TestRecord_Corrupted ensures that corrupted records return the correct error.

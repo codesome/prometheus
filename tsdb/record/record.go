@@ -179,9 +179,10 @@ type RefHistogramSample struct {
 
 // RefFloatHistogramSample is a float histogram.
 type RefFloatHistogramSample struct {
-	Ref chunks.HeadSeriesRef
-	T   int64
-	FH  *histogram.FloatHistogram
+	Ref       chunks.HeadSeriesRef
+	T         int64
+	GaugeType bool // If true, FH is a gauge float histogram.
+	FH        *histogram.FloatHistogram
 }
 
 // RefMmapMarker marks that the all the samples of the given series until now have been m-mapped to disk.
@@ -517,6 +518,8 @@ func (d *Decoder) FloatHistogramSamples(rec []byte, histograms []RefFloatHistogr
 			FH:  &histogram.FloatHistogram{},
 		}
 
+		rh.GaugeType = dec.Byte() == 1
+
 		rh.FH.Schema = int32(dec.Varint64())
 		rh.FH.ZeroThreshold = dec.Be64Float64()
 
@@ -765,6 +768,12 @@ func (e *Encoder) FloatHistogramSamples(histograms []RefFloatHistogramSample, b 
 	for _, h := range histograms {
 		buf.PutVarint64(int64(h.Ref) - int64(first.Ref))
 		buf.PutVarint64(h.T - first.T)
+
+		var gaugeType byte
+		if h.GaugeType {
+			gaugeType = 1
+		}
+		buf.PutByte(gaugeType)
 
 		buf.PutVarint64(int64(h.FH.Schema))
 		buf.PutBEFloat64(h.FH.ZeroThreshold)
