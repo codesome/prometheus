@@ -46,10 +46,11 @@ import (
 // histogramRecord combines both RefHistogramSample and RefFloatHistogramSample
 // to simplify the WAL replay.
 type histogramRecord struct {
-	ref chunks.HeadSeriesRef
-	t   int64
-	h   *histogram.Histogram
-	fh  *histogram.FloatHistogram
+	ref       chunks.HeadSeriesRef
+	t         int64
+	h         *histogram.Histogram
+	fh        *histogram.FloatHistogram
+	gaugeType bool
 }
 
 func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.HeadSeriesRef, mmappedChunks, oooMmappedChunks map[chunks.HeadSeriesRef][]*mmappedChunk) (err error) {
@@ -401,7 +402,7 @@ Outer:
 						sam.Ref = r
 					}
 					mod := uint64(sam.Ref) % uint64(n)
-					histogramShards[mod] = append(histogramShards[mod], histogramRecord{ref: sam.Ref, t: sam.T, fh: sam.FH})
+					histogramShards[mod] = append(histogramShards[mod], histogramRecord{ref: sam.Ref, t: sam.T, fh: sam.FH, gaugeType: sam.GaugeType})
 				}
 				for i := 0; i < n; i++ {
 					if len(histogramShards[i]) > 0 {
@@ -642,7 +643,7 @@ func (wp *walSubsetProcessor) processWALSamples(h *Head, mmappedChunks, oooMmapp
 			if s.h != nil {
 				_, chunkCreated = ms.appendHistogram(s.t, s.h, 0, h.chunkDiskMapper, chunkRange)
 			} else {
-				_, chunkCreated = ms.appendFloatHistogram(s.t, s.fh, 0, h.chunkDiskMapper, chunkRange)
+				_, chunkCreated = ms.appendFloatHistogram(s.t, s.fh, 0, h.chunkDiskMapper, chunkRange, s.gaugeType)
 			}
 			if chunkCreated {
 				h.metrics.chunksCreated.Inc()

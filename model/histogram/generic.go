@@ -395,7 +395,6 @@ func getBound(idx, schema int32) float64 {
 // UnionOfSpans returns a superset of given spans
 // that cover the buckets in both set of spans.
 func UnionOfSpans(s1, s2 []Span) []Span {
-	//var result []Span
 	var bucketRanges [][2]int32 // Inclusive.
 	var s1idx, s2idx int
 	var b1, b2 int32
