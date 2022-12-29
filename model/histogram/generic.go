@@ -392,6 +392,116 @@ func getBound(idx, schema int32) float64 {
 	return math.Ldexp(frac, exp)
 }
 
+// UnionOfSpans returns a superset of given spans
+// that cover the buckets in both set of spans.
+func UnionOfSpans(s1, s2 []Span) []Span {
+	//var result []Span
+	var bucketRanges [][2]int32 // Inclusive.
+	var s1idx, s2idx int
+	var b1, b2 int32
+	for {
+		if s1idx >= len(s1) && s2idx >= len(s2) {
+			break
+		}
+		var currS1, currS2 *Span
+		var s1EndB, s2EndB int32
+
+		if s1idx < len(s1) {
+			currS1 = &s1[s1idx]
+			b1 += currS1.Offset
+			s1idx++
+			if currS1.Length == 0 {
+				// We add consecutive spans until we find a non-zero span.
+				for ; s1idx < len(s1) && s1[s1idx].Length == 0; s1idx++ {
+					currS1.Offset += s1[s1idx].Offset
+					b1 += s1[s1idx].Offset
+				}
+				if currS1.Length == 0 && s1idx < len(s1) {
+					currS1.Offset += s1[s1idx].Offset
+					currS1.Length = s1[s1idx].Length
+					b1 += s1[s1idx].Offset
+					s1idx++
+				}
+			}
+			s1EndB = b1 + int32(currS1.Length) - 1
+			if currS1.Length == 0 {
+				currS1 = nil
+			}
+		}
+		if s2idx < len(s2) {
+			currS2 = &s2[s2idx]
+			b2 += currS2.Offset
+			s2idx++
+			if currS2.Length == 0 {
+				// We add consecutive spans until we find a non-zero span.
+				for ; s2idx < len(s2) && s2[s2idx].Length == 0; s2idx++ {
+					currS2.Offset += s2[s2idx].Offset
+					b2 += s2[s2idx].Offset
+				}
+				if s2idx < len(s2) {
+					currS2.Offset += s2[s2idx].Offset
+					currS2.Length = s2[s2idx].Length
+					b2 += s2[s2idx].Offset
+					s2idx++
+				}
+			}
+			s2EndB = b2 + int32(currS2.Length) - 1
+			if currS2.Length == 0 {
+				currS2 = nil
+			}
+		}
+
+		if currS1 == nil && currS2 == nil {
+			break
+		}
+		if currS1 == nil {
+			bucketRanges = append(bucketRanges, [2]int32{b2, s2EndB})
+			b2 += int32(currS2.Length)
+			continue
+		}
+		if currS2 == nil {
+			bucketRanges = append(bucketRanges, [2]int32{b1, s1EndB})
+			b1 += int32(currS1.Length)
+			continue
+		}
+
+		if b1 < b2 || (b1 == b2 && s1EndB < s2EndB) {
+			bucketRanges = append(bucketRanges, [2]int32{b1, s1EndB}, [2]int32{b2, s2EndB})
+		} else {
+			bucketRanges = append(bucketRanges, [2]int32{b2, s2EndB}, [2]int32{b1, s1EndB})
+		}
+
+		b1 += int32(currS1.Length)
+		b2 += int32(currS2.Length)
+	}
+
+	if len(bucketRanges) == 0 {
+		return nil
+	}
+
+	result := []Span{
+		{Offset: bucketRanges[0][0], Length: uint32(bucketRanges[0][1] - bucketRanges[0][0] + 1)},
+	}
+
+	lastEnd := bucketRanges[0][1]
+	for i := 1; i < len(bucketRanges); i++ {
+		start, end := bucketRanges[i][0], bucketRanges[i][1]
+		offset := start - lastEnd - 1
+		if offset > 0 {
+			result = append(result, Span{
+				Offset: start - lastEnd - 1,
+				Length: uint32(end - start + 1),
+			})
+			lastEnd = end
+		} else if end > lastEnd {
+			result[len(result)-1].Length += uint32(end - lastEnd)
+			lastEnd = end
+		}
+	}
+
+	return result
+}
+
 // exponentialBounds is a precalculated table of bucket bounds in the interval
 // [0.5,1) in schema 0 to 8.
 var exponentialBounds = [][]float64{
