@@ -196,6 +196,14 @@ type FloatHistogramAppender struct {
 	pBuckets, nBuckets []xorValue
 }
 
+func (a *FloatHistogramAppender) GetCounterResetHeader() CounterResetHeader {
+	return CounterResetHeader(a.b.bytes()[2] & 0b11000000)
+}
+
+func (a *FloatHistogramAppender) NumSamples() int {
+	return int(binary.BigEndian.Uint16(a.b.bytes()))
+}
+
 // Append implements Appender. This implementation panics because normal float
 // samples must never be appended to a histogram chunk.
 func (a *FloatHistogramAppender) Append(int64, float64) {
@@ -211,6 +219,7 @@ func (a *FloatHistogramAppender) AppendHistogram(int64, *histogram.Histogram) {
 // Appendable returns whether the chunk can be appended to, and if so
 // whether any recoding needs to happen using the provided interjections
 // (in case of any new buckets, positive or negative range, respectively).
+// If the sample is a gauge type, AppendableGauge must be used instead.
 //
 // The chunk is not appendable in the following cases:
 //
@@ -228,6 +237,9 @@ func (a *FloatHistogramAppender) Appendable(h *histogram.FloatHistogram) (
 	positiveInterjections, negativeInterjections []Interjection,
 	okToAppend, counterReset bool,
 ) {
+	if a.NumSamples() > 0 && a.GetCounterResetHeader() == GaugeType {
+		return
+	}
 	if value.IsStaleNaN(h.Sum) {
 		// This is a stale sample whose buckets and spans don't matter.
 		okToAppend = true
@@ -284,6 +296,8 @@ func (a *FloatHistogramAppender) Appendable(h *histogram.FloatHistogram) (
 //  2. Any recoding needs to happen for the histogram being appended, using the backward interjections
 //     (in case of any missing buckets, positive or negative range, respectively).
 //
+// This method must be only used for gauge type histograms.
+//
 // The chunk is not appendable in the following cases:
 //
 // • The schema has changed.
@@ -294,6 +308,9 @@ func (a *FloatHistogramAppender) AppendableGauge(h *histogram.FloatHistogram) (
 	backwardPositiveInterjections, backwardNegativeInterjections []Interjection,
 	okToAppend bool,
 ) {
+	if a.NumSamples() > 0 && a.GetCounterResetHeader() != GaugeType {
+		return
+	}
 	if value.IsStaleNaN(h.Sum) {
 		// This is a stale sample whose buckets and spans don't matter.
 		okToAppend = true
@@ -534,6 +551,24 @@ func (a *FloatHistogramAppender) Recode(
 
 	hc.SetCounterResetHeader(CounterResetHeader(byts[2] & 0b11000000))
 	return hc, app
+}
+
+// RecodeHistogramm converts the current histogram (in-place) to accommodate an expansion of the set of
+// (positive and/or negative) buckets used.
+func (a *FloatHistogramAppender) RecodeHistogramm(
+	fh *histogram.FloatHistogram,
+	pBackwardInter, nBackwardInter []Interjection,
+) {
+	if len(pBackwardInter) > 0 {
+		fh.PositiveSpans = histogram.UnionOfSpans(fh.PositiveSpans, a.pSpans)
+		numPositiveBuckets := countSpans(fh.PositiveSpans)
+		fh.PositiveBuckets = interject(fh.PositiveBuckets, make([]float64, numPositiveBuckets), pBackwardInter, false)
+	}
+	if len(nBackwardInter) > 0 {
+		fh.NegativeSpans = histogram.UnionOfSpans(fh.NegativeSpans, a.nSpans)
+		numNegativeBuckets := countSpans(fh.NegativeSpans)
+		fh.NegativeBuckets = interject(fh.NegativeBuckets, make([]float64, numNegativeBuckets), nBackwardInter, false)
+	}
 }
 
 type floatHistogramIterator struct {

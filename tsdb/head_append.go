@@ -1138,9 +1138,10 @@ func (s *memSeries) append(t int64, v float64, appendID uint64, chunkDiskMapper 
 
 // appendHistogram adds the histogram.
 // It is unsafe to call this concurrently with s.iterator(...) without holding the series lock.
+// TODO(codesome): Support gauge histograms here.
 func (s *memSeries) appendHistogram(t int64, h *histogram.Histogram, appendID uint64, chunkDiskMapper *chunks.ChunkDiskMapper, chunkRange int64) (sampleInOrder, chunkCreated bool) {
 	// Head controls the execution of recoding, so that we own the proper
-	// chunk reference afterwards.  We check for Appendable before
+	// chunk reference afterwards. We check for Appendable from appender before
 	// appendPreprocessor because in case it ends up creating a new chunk,
 	// we need to know if there was also a counter reset or not to set the
 	// meta properly.
@@ -1209,24 +1210,33 @@ func (s *memSeries) appendHistogram(t int64, h *histogram.Histogram, appendID ui
 // It is unsafe to call this concurrently with s.iterator(...) without holding the series lock.
 func (s *memSeries) appendFloatHistogram(t int64, fh *histogram.FloatHistogram, appendID uint64, chunkDiskMapper *chunks.ChunkDiskMapper, chunkRange int64) (sampleInOrder, chunkCreated bool) {
 	// Head controls the execution of recoding, so that we own the proper
-	// chunk reference afterwards.  We check for Appendable before
+	// chunk reference afterwards.  We check for Appendable from appender before
 	// appendPreprocessor because in case it ends up creating a new chunk,
 	// we need to know if there was also a counter reset or not to set the
 	// meta properly.
 	app, _ := s.app.(*chunkenc.FloatHistogramAppender)
 	var (
 		positiveInterjections, negativeInterjections []chunkenc.Interjection
+		pBackwardInter, nBackwardInter               []chunkenc.Interjection
 		okToAppend, counterReset                     bool
 	)
 	c, sampleInOrder, chunkCreated := s.appendPreprocessor(t, chunkenc.EncFloatHistogram, chunkDiskMapper, chunkRange)
 	if !sampleInOrder {
 		return sampleInOrder, chunkCreated
 	}
+	gauge := fh.Type == histogram.HistogramTypeGauge
 	if app != nil {
-		positiveInterjections, negativeInterjections, okToAppend, counterReset = app.Appendable(fh)
+		if gauge {
+			positiveInterjections, negativeInterjections, pBackwardInter, nBackwardInter, okToAppend = app.AppendableGauge(fh)
+		} else {
+			positiveInterjections, negativeInterjections, okToAppend, counterReset = app.Appendable(fh)
+		}
 	}
 
 	if !chunkCreated {
+		if gauge && okToAppend && (len(pBackwardInter) > 0 || len(nBackwardInter) > 0) {
+			app.RecodeHistogramm(fh, pBackwardInter, nBackwardInter)
+		}
 		// We have 3 cases here
 		// - !okToAppend -> We need to cut a new chunk.
 		// - okToAppend but we have interjections → Existing chunk needs
@@ -1251,7 +1261,9 @@ func (s *memSeries) appendFloatHistogram(t int64, fh *histogram.FloatHistogram, 
 	if chunkCreated {
 		hc := s.headChunk.chunk.(*chunkenc.FloatHistogramChunk)
 		header := chunkenc.UnknownCounterReset
-		if counterReset {
+		if gauge {
+			header = chunkenc.GaugeType
+		} else if counterReset {
 			header = chunkenc.CounterReset
 		} else if okToAppend {
 			header = chunkenc.NotCounterReset
