@@ -19,6 +19,15 @@ import (
 	"strings"
 )
 
+type HistogramType byte
+
+const (
+	// HistogramTypeCounter means the histogram is a counter.
+	HistogramTypeCounter HistogramType = 0b00000000
+	// HistogramTypeGauge means the histogram is a gauge.
+	HistogramTypeGauge HistogramType = 0b00000001
+)
+
 // Histogram encodes a sparse, high-resolution histogram. See the design
 // document for full details:
 // https://docs.google.com/document/d/1cLNv3aufPZb3fNfaJgdaRBZsInZKKIHo9E6HinJVbpM/edit#
@@ -35,6 +44,9 @@ import (
 //
 // Which bucket indices are actually used is determined by the spans.
 type Histogram struct {
+	// Type tells if this histograms is a counter or gauge.
+	// By default, a counter histogram is assumed.
+	Type HistogramType
 	// Currently valid schema numbers are -4 <= n <= 8.  They are all for
 	// base-2 bucket schemas, where 1 is a bucket boundary in each case, and
 	// then each power of two is divided into 2^n logarithmic buckets.  Or
@@ -295,6 +307,7 @@ func (h *Histogram) ToFloat() *FloatHistogram {
 	}
 
 	return &FloatHistogram{
+		Type:            h.Type,
 		Schema:          h.Schema,
 		ZeroThreshold:   h.ZeroThreshold,
 		ZeroCount:       float64(h.ZeroCount),

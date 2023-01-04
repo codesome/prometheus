@@ -27,6 +27,9 @@ import (
 // used to represent a histogram with integer counts and thus serves as a more
 // generalized representation.
 type FloatHistogram struct {
+	// Type tells if this histograms is a counter or gauge.
+	// By default, a counter histogram is assumed.
+	Type HistogramType
 	// Currently valid schema numbers are -4 <= n <= 8.  They are all for
 	// base-2 bucket schemas, where 1 is a bucket boundary in each case, and
 	// then each power of two is divided into 2^n logarithmic buckets.  Or
