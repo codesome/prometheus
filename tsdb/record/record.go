@@ -748,15 +748,12 @@ func (e *Encoder) MmapMarkers(markers []RefMmapMarker, b []byte) []byte {
 	return buf.Get()
 }
 
-func (e *Encoder) HistogramSamples(histograms []RefHistogramSample, b []byte) ([]byte, []byte) {
+func (e *Encoder) HistogramSamples(histograms []RefHistogramSample, b []byte) ([]byte, bool) {
 	buf := encoding.Encbuf{B: b}
 	buf.PutByte(byte(HistogramSamples))
 
-	customBucketHistBuf := encoding.Encbuf{B: b}
-	customBucketHistBuf.PutByte(byte(CustomBucketHistogramSamples))
-
 	if len(histograms) == 0 {
-		return buf.Get(), customBucketHistBuf.Get()
+		return buf.Get(), false
 	}
 
 	// Store base timestamp and base reference number of first histogram.
@@ -765,10 +762,34 @@ func (e *Encoder) HistogramSamples(histograms []RefHistogramSample, b []byte) ([
 	buf.PutBE64(uint64(first.Ref))
 	buf.PutBE64int64(first.T)
 
+	histsAdded := 0
+	customBucketHistsExists := false
+	for _, h := range histograms {
+		if !h.H.UsesCustomBuckets() {
+			buf.PutVarint64(int64(h.Ref) - int64(first.Ref))
+			buf.PutVarint64(h.T - first.T)
+
+			EncodeHistogram(&buf, h.H)
+			histsAdded++
+		} else {
+			customBucketHistsExists = true
+		}
+	}
+
+	if histsAdded == 0 {
+		buf.Reset()
+	}
+
+	return buf.Get(), customBucketHistsExists
+}
+
+func (e *Encoder) CustomBucketHistogramSamples(histograms []RefHistogramSample, b []byte) []byte {
+	customBucketHistBuf := encoding.Encbuf{B: b}
+	customBucketHistBuf.PutByte(byte(CustomBucketHistogramSamples))
+
 	customBucketHistBuf.PutBE64(uint64(first.Ref))
 	customBucketHistBuf.PutBE64int64(first.T)
 
-	histsAdded := 0
 	customBucketHistsAdded := 0
 	for _, h := range histograms {
 		if h.H.UsesCustomBuckets() {
@@ -777,22 +798,14 @@ func (e *Encoder) HistogramSamples(histograms []RefHistogramSample, b []byte) ([
 
 			EncodeHistogram(&customBucketHistBuf, h.H)
 			customBucketHistsAdded++
-		} else {
-			buf.PutVarint64(int64(h.Ref) - int64(first.Ref))
-			buf.PutVarint64(h.T - first.T)
-
-			EncodeHistogram(&buf, h.H)
-			histsAdded++
 		}
 	}
 
 	if customBucketHistsAdded == 0 {
 		customBucketHistBuf.Reset()
-	} else if histsAdded == 0 {
-		buf.Reset()
 	}
 
-	return buf.Get(), customBucketHistBuf.Get()
+	return customBucketHistBuf.Get()
 }
 
 // EncodeHistogram encodes a Histogram into a byte slice.
