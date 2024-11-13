@@ -139,7 +139,8 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 		dec := record.NewDecoder(syms)
 		for r.Next() {
 			rec := r.Record()
-			switch dec.Type(rec) {
+			recType := dec.Type(rec)
+			switch recType {
 			case record.Series:
 				series := seriesPool.Get()[:0]
 				series, err = dec.Series(rec, series)
@@ -188,7 +189,7 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 					return
 				}
 				decoded <- exemplars
-			case record.HistogramSamples:
+			case record.HistogramSamples, record.CustomBucketHistogramSamples:
 				hists := histogramsPool.Get()[:0]
 				hists, err = dec.HistogramSamples(rec, hists)
 				if err != nil {
@@ -200,7 +201,7 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 					return
 				}
 				decoded <- hists
-			case record.FloatHistogramSamples:
+			case record.FloatHistogramSamples, record.CustomBucketFloatHistogramSamples:
 				hists := floatHistogramsPool.Get()[:0]
 				hists, err = dec.FloatHistogramSamples(rec, hists)
 				if err != nil {
@@ -740,7 +741,7 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 					return
 				}
 				decodedCh <- markers
-			case record.HistogramSamples:
+			case record.HistogramSamples, record.CustomBucketHistogramSamples:
 				hists := histogramSamplesPool.Get().([]record.RefHistogramSample)[:0]
 				hists, err = dec.HistogramSamples(rec, hists)
 				if err != nil {
@@ -752,7 +753,7 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 					return
 				}
 				decodedCh <- hists
-			case record.FloatHistogramSamples:
+			case record.FloatHistogramSamples, record.CustomBucketFloatHistogramSamples:
 				hists := floatHistogramSamplesPool.Get().([]record.RefFloatHistogramSample)[:0]
 				hists, err = dec.FloatHistogramSamples(rec, hists)
 				if err != nil {
