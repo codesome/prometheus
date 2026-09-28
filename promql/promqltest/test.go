@@ -39,6 +39,8 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/almost"
 	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/prometheus/prometheus/util/convertnhcb"
@@ -71,8 +73,12 @@ var testStartTime = time.Unix(0, 0).UTC()
 
 // LoadedStorage returns storage with generated data using the provided load statements.
 // Non-load statements will cause test errors.
-func LoadedStorage(t testing.TB, input string) *teststorage.TestStorage {
-	test, err := newTest(t, input, false, newTestStorage)
+// Optional teststorage.Option functions can be passed to configure the underlying TSDB storage.
+func LoadedStorage(t testing.TB, input string, opts ...teststorage.Option) *teststorage.TestStorage {
+	testStorage := func(t testing.TB) storage.Storage {
+		return teststorage.New(t, opts...)
+	}
+	test, err := newTest(t, input, false, testStorage)
 	require.NoError(t, err)
 
 	for _, cmd := range test.cmds {
@@ -88,10 +94,8 @@ func LoadedStorage(t testing.TB, input string) *teststorage.TestStorage {
 
 // TestParserOpts are the parser options used for all built-in test engines.
 var TestParserOpts = parser.Options{
-	EnableExperimentalFunctions:  true,
-	ExperimentalDurationExpr:     true,
-	EnableExtendedRangeSelectors: true,
-	EnableBinopFillModifiers:     true,
+	EnableExperimentalFunctions: true,
+	EnableBinopFillModifiers:    true,
 }
 
 // NewTestEngine creates a promql.Engine with enablePerStepStats, lookbackDelta and maxSamples, and returns it.
@@ -107,6 +111,7 @@ func NewTestEngine(tb testing.TB, enablePerStepStats bool, lookbackDelta time.Du
 		EnablePerStepStats:       enablePerStepStats,
 		LookbackDelta:            lookbackDelta,
 		EnableDelayedNameRemoval: true,
+		UseStartTimestamps:       true,
 		Parser:                   parser.NewParser(TestParserOpts),
 	})
 }
@@ -156,7 +161,13 @@ func GetBuiltInExprs() ([]string, error) {
 
 // RunBuiltinTests runs an acceptance test suite against the provided engine.
 func RunBuiltinTests(t TBRun, engine promql.QueryEngine) {
-	RunBuiltinTestsWithStorage(t, engine, newTestStorage)
+	RunBuiltinTestsWithStorage(t, engine, func(t testing.TB) storage.Storage {
+		return teststorage.New(t, func(opt *tsdb.Options) {
+			opt.EnableSTStorage = true
+			opt.FloatChunkEncoding = chunkenc.EncXOR2
+			opt.EnableHistogramSTEncoding = true
+		})
+	})
 }
 
 // RunBuiltinTestsWithStorage runs an acceptance test suite against the provided engine and storage.
@@ -1170,7 +1181,7 @@ func (ev *evalCmd) expectMetric(pos int, m labels.Labels, vals ...parser.Sequenc
 }
 
 // validateExpectedAnnotationsOfType validates expected messages and regex match actual annotations.
-func validateExpectedAnnotationsOfType(expr string, expectedAnnotationsOfType []expectCmd, actualAnnotationsOfType []string, line int, annotationType string, allAnnos annotations.Annotations) error {
+func validateExpectedAnnotationsOfType(expr string, expectedAnnotationsOfType []expectCmd, actualAnnotationsOfType []string, line int, annotationType string) error {
 	if len(expectedAnnotationsOfType) == 0 {
 		return nil
 	}
@@ -1183,7 +1194,7 @@ func validateExpectedAnnotationsOfType(expr string, expectedAnnotationsOfType []
 	for _, e := range expectedAnnotationsOfType {
 		matchFound := slices.ContainsFunc(actualAnnotationsOfType, e.CheckMatch)
 		if !matchFound {
-			return fmt.Errorf(`expected %s annotation matching %s %q but no matching annotation was found for query %q (line %d), found: %v`, annotationType, e.Type(), e.String(), expr, line, allAnnos.AsErrors())
+			return fmt.Errorf(`expected %s annotation matching %s %q but no matching annotation was found for query %q (line %d), found: %v`, annotationType, e.Type(), e.String(), expr, line, actualAnnotationsOfType)
 		}
 	}
 
@@ -1210,22 +1221,16 @@ func (ev *evalCmd) checkAnnotations(expr string, annos annotations.Annotations) 
 		return fmt.Errorf("expected info annotations evaluating query %q (line %d) but got none", expr, ev.line)
 	}
 
-	var warnings, infos []string
-
 	for _, err := range annos {
-		switch {
-		case errors.Is(err, annotations.PromQLWarning):
-			warnings = append(warnings, err.Error())
-		case errors.Is(err, annotations.PromQLInfo):
-			infos = append(infos, err.Error())
-		default:
+		if !errors.Is(err, annotations.PromQLWarning) && !errors.Is(err, annotations.PromQLInfo) {
 			return fmt.Errorf("unexpected annotation type, must be either info or warn but got: %w", err)
 		}
 	}
-	if err := validateExpectedAnnotationsOfType(expr, ev.expectedCmds[Warn], warnings, ev.line, "warn", annos); err != nil {
+	warnings, infos := annos.AsStrings(expr, 0, 0)
+	if err := validateExpectedAnnotationsOfType(expr, ev.expectedCmds[Warn], warnings, ev.line, "warn"); err != nil {
 		return err
 	}
-	if err := validateExpectedAnnotationsOfType(expr, ev.expectedCmds[Info], infos, ev.line, "info", annos); err != nil {
+	if err := validateExpectedAnnotationsOfType(expr, ev.expectedCmds[Info], infos, ev.line, "info"); err != nil {
 		return err
 	}
 	if ev.expectedCmds[NoWarn] != nil && len(warnings) > 0 {
@@ -1579,10 +1584,14 @@ type atModifierTestCase struct {
 	evalTime time.Time
 }
 
-// parserForBuiltinTests is the parser used when parsing expressions in the
-// built-in test framework (e.g. atModifierTestCases). It must match the Parser
-// used by NewTestEngine so that expressions parse consistently.
-var parserForBuiltinTests = parser.NewParser(TestParserOpts)
+var (
+	// parserForBuiltinTests is the parser used when parsing expressions in the
+	// built-in test framework (e.g. atModifierTestCases). It must match the Parser
+	// used by NewTestEngine so that expressions parse consistently.
+	parserForBuiltinTests = parser.NewParser(TestParserOpts)
+	// reQueryContextFuncs matches start(), end(), range(), and step() calls, which depend on query context.
+	reQueryContextFuncs = regexp.MustCompile(`(start|end|range|step)\(\)`)
+)
 
 func atModifierTestCases(exprStr string, evalTime time.Time) ([]atModifierTestCase, error) {
 	expr, err := parserForBuiltinTests.ParseExpr(exprStr)
@@ -1794,8 +1803,8 @@ func (t *test) runInstantQuery(iq atModifierTestCase, cmd *evalCmd, engine promq
 
 	// Check query returns same result in range mode,
 	// by checking against the middle step.
-	// Skip this check for queries containing range() since it would resolve differently.
-	if strings.Contains(iq.expr, "range()") {
+	// Skip this check for queries containing range(), step(), start(), or end() since they would resolve differently.
+	if reQueryContextFuncs.MatchString(iq.expr) {
 		return nil
 	}
 	q, err = engine.NewRangeQuery(t.context, t.storage, nil, iq.expr, iq.evalTime.Add(-time.Minute), iq.evalTime.Add(time.Minute), time.Minute)

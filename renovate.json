@@ -12,7 +12,7 @@
     "gomodUpdateImportPaths"
   ],
   "schedule": [
-    "* * 21 * *"
+    "* * 7,21 * *"
   ],
   "timezone": "UTC",
   "github-actions": {
@@ -28,6 +28,27 @@
   "prConcurrentLimit": 20,
   "prHourlyLimit": 5,
   "packageRules": [
+    {
+      "description": "Keep the legacy app on the TypeScript major supported by react-scripts 5",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "web/ui/react-app/package.json"
+      ],
+      "matchPackageNames": [
+        "typescript"
+      ],
+      "allowedVersions": "<5"
+    },
+    {
+      "description": "Wait for npm releases to satisfy pnpm's cooldown",
+      "matchDatasources": [
+        "npm"
+      ],
+      "minimumReleaseAge": "3 days",
+      "internalChecksFilter": "strict"
+    },
     {
       "description": "Don't update replace directives",
       "matchPackageNames": [

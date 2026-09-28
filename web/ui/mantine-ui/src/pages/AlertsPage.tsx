@@ -1,4 +1,5 @@
 import {
+  Accordion,
   Card,
   Group,
   Table,
@@ -13,6 +14,8 @@ import {
   Pagination,
   rem,
   Divider,
+  CopyButton,
+  ActionIcon,
 } from "@mantine/core";
 import { useSuspenseAPIQuery } from "../api/api";
 import { AlertingRule, AlertingRulesResult } from "../api/responseTypes/rules";
@@ -22,7 +25,7 @@ import RuleDefinition from "../components/RuleDefinition";
 import { humanizeDurationRelative, now } from "../lib/formatTime";
 import { Fragment, useEffect, useMemo } from "react";
 import { StateMultiSelect } from "../components/StateMultiSelect";
-import { IconInfoCircle, IconSearch } from "@tabler/icons-react";
+import { IconCheck, IconCopy, IconInfoCircle, IconSearch } from "@tabler/icons-react";
 import { LabelBadges } from "../components/LabelBadges";
 import { useLocalStorage } from "@mantine/hooks";
 import { useSettings } from "../state/settingsSlice";
@@ -38,7 +41,6 @@ import { KVSearch } from "@nexucis/kvsearch";
 import { inputIconStyle } from "../styles";
 import CustomInfiniteScroll from "../components/CustomInfiniteScroll";
 import classes from "./AlertsPage.module.css";
-import { Accordion } from "../components/Accordion";
 
 type AlertsPageData = {
   // How many rules are in each state across all groups.
@@ -230,7 +232,7 @@ export default function AlertsPage() {
         <Card shadow="xs" withBorder p="md" key={`${g.file}-${g.name}`}>
           <Group mb="sm" justify="space-between">
             <Group align="baseline">
-              <Text fz="xl" fw={600} c="var(--mantine-primary-color-filled)">
+              <Text fz="xl" fw={600}>
                 {g.name}
               </Text>
               <Text fz="sm" c="gray.6">
@@ -287,7 +289,7 @@ export default function AlertsPage() {
             <CustomInfiniteScroll
               allItems={g.rules}
               child={({ items }) => (
-                <Accordion multiple variant="separated" classNames={classes}>
+                <Accordion multiple variant="separated" keepMounted={false} classNames={classes}>
                   {items.map((r, j) => {
                     return (
                       <Accordion.Item
@@ -305,10 +307,28 @@ export default function AlertsPage() {
                         }
                       >
                         <Accordion.Control
+                          className={classes.ruleControl}
                           styles={{ label: { paddingBlock: rem(10) } }}
                         >
                           <Group wrap="nowrap" justify="space-between" mr="lg">
-                            <Text>{r.rule.name}</Text>
+                            <Group gap="xs" wrap="nowrap">
+                              <Text>{r.rule.name}</Text>
+                              <CopyButton value={r.rule.name}>
+                                {({ copied, copy }) => (
+                                  <ActionIcon
+                                    className={classes.copyAlertNameButton}
+                                    variant="subtle"
+                                    color="gray"
+                                    onClick={(e) => {
+                                      e.stopPropagation(); copy();
+                                    }}
+                                    size="xs"
+                                  >
+                                    {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
+                                  </ActionIcon>
+                                )}
+                              </CopyButton>
+                            </Group>
                             <Group gap="xs">
                               {r.counts.firing > 0 && (
                                 <Badge className={badgeClasses.healthErr}>
@@ -438,7 +458,7 @@ export default function AlertsPage() {
           }
           optionCount={(o) =>
             alertsPageData.globalCounts[
-              o as keyof typeof alertsPageData.globalCounts
+            o as keyof typeof alertsPageData.globalCounts
             ]
           }
           placeholder="Filter by rule group state"

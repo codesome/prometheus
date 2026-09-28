@@ -1,8 +1,11 @@
 import {
+  Accordion,
+  ActionIcon,
   Alert,
   Anchor,
   Badge,
   Card,
+  CopyButton,
   Group,
   Pagination,
   rem,
@@ -19,6 +22,8 @@ import {
 import {
   IconAlertTriangle,
   IconBell,
+  IconCheck,
+  IconCopy,
   IconHourglass,
   IconInfoCircle,
   IconRefresh,
@@ -45,7 +50,6 @@ import classes from "./RulesPage.module.css";
 import { useDebouncedValue, useLocalStorage } from "@mantine/hooks";
 import { KVSearch } from "@nexucis/kvsearch";
 import { StateMultiSelect } from "../components/StateMultiSelect";
-import { Accordion } from "../components/Accordion";
 
 const kvSearch = new KVSearch<Rule>({
   shouldSort: true,
@@ -164,7 +168,7 @@ export default function RulesPage() {
         <Card shadow="xs" withBorder p="md" key={`${g.file}-${g.name}`}>
           <Group mb="sm" justify="space-between">
             <Group align="baseline">
-              <Text fz="xl" fw={600} c="var(--mantine-primary-color-filled)">
+              <Text fz="xl" fw={600}>
                 {g.name}
               </Text>
               <Text fz="sm" c="gray.6">
@@ -231,7 +235,7 @@ export default function RulesPage() {
             <CustomInfiniteScroll
               allItems={g.rules}
               child={({ items }) => (
-                <Accordion multiple variant="separated" classNames={classes}>
+                <Accordion multiple variant="separated" keepMounted={false} classNames={classes}>
                   {items.map((r, j) => (
                     <Accordion.Item
                       mt={rem(5)}
@@ -247,6 +251,7 @@ export default function RulesPage() {
                       }}
                     >
                       <Accordion.Control
+                        className={classes.ruleControl}
                         styles={{ label: { paddingBlock: rem(10) } }}
                       >
                         <Group justify="space-between" mr="lg">
@@ -265,6 +270,21 @@ export default function RulesPage() {
                               </Tooltip>
                             )}
                             <Text>{r.name}</Text>
+                            <CopyButton value={r.name}>
+                              {({ copied, copy }) => (
+                                <ActionIcon
+                                  className={classes.copyRuleNameButton}
+                                  variant="subtle"
+                                  color="gray"
+                                  onClick={(e) => {
+                                    e.stopPropagation(); copy();
+                                  }}
+                                  size="xs"
+                                >
+                                  {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
+                                </ActionIcon>
+                              )}
+                            </CopyButton>
                           </Group>
                           <Group gap="xs">
                             <Group gap="xs" wrap="wrap">

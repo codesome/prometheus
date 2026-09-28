@@ -83,7 +83,7 @@ Series records encode the labels that identifies a series and its unique ID.
 
 #### Concurrent series records (experimental)
 
-Type `12` has the same payload as a Series record (type `1`). It defines IDs
+Type `15` has the same payload as a Series record (type `1`). It defines IDs
 allocated while historical WAL replay was running concurrently with ingestion.
 A definition with an existing label set adds an independent source; unlike a
 normal Series definition, it does not indicate that earlier data were compacted.
@@ -102,7 +102,7 @@ WAL watchers may treat this record as an ordinary series definition.
 
 #### Replay boundary records (experimental)
 
-Type `13` is a single byte with no payload. It is the first record of a new WAL
+Type `16` is a single byte with no payload. It is the first record of a new WAL
 segment and is synchronized before concurrent ingestion is admitted. Replay of
 the preceding historical WAL stops before this segment. On a later restart,
 ordinary replay continues through the boundary and processes the whole WAL.
@@ -382,4 +382,21 @@ This record format is backwards compatible with type 8.
 │ └─────────────────────────────┴───────┴─────────────────────────────┘ │
 │                              . . .                                    │
 └───────────────────────────────────────────────────────────────────────┘
+```
+
+#### Min valid time records
+
+Min valid time records are checkpoint-only: never written to a live WAL segment. Each
+checkpoint carries at most one, recording the highest `mint` any WAL truncation has used
+so far. On restart, this lets the min valid time used to gate WAL replay be read directly
+from the checkpoint, rather than solely re-derived from block max times on disk.
+
+```
+┌────────────────────┐
+│ type = 14 <1b>     │
+├────────────────────┤
+│ ┌────────────────┐ │
+│ │ mint <8b>      │ │
+│ └────────────────┘ │
+└────────────────────┘
 ```

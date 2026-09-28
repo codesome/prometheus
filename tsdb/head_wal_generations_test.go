@@ -131,7 +131,7 @@ func TestHeadFastStartupMixedSamples(t *testing.T) {
 			}
 			appendMixed := func(h *Head, offset int64) {
 				h.opts.EnableSTStorage.Store(true)
-				h.opts.EnableXOR2Encoding.Store(true)
+				h.opts.FloatChunkEncoding.Store(uint32(chunkenc.EncXOR2))
 				a := h.AppenderV2(context.Background())
 				for i := range 20 {
 					ts := 1000 + int64(i)*10 + offset
@@ -190,7 +190,7 @@ func TestHeadFastStartupMixedSamples(t *testing.T) {
 			for range 2 {
 				h := newFastStartupTestHead(t, dir, false, nil)
 				h.opts.EnableSTStorage.Store(true)
-				h.opts.EnableXOR2Encoding.Store(true)
+				h.opts.FloatChunkEncoding.Store(uint32(chunkenc.EncXOR2))
 				require.NoError(t, h.Init(0))
 				check(h)
 				require.NoError(t, h.Close())
@@ -474,7 +474,7 @@ func TestHeadConcurrentWALMetadataCheckpointOrder(t *testing.T) {
 	))
 	next, err := w.NextSegment()
 	require.NoError(t, err)
-	_, err = wlog.Checkpoint(slog.New(slog.DiscardHandler), w, 0, next-1, func(chunks.HeadSeriesRef) bool { return true }, 0, false)
+	_, err = wlog.Checkpoint(slog.New(slog.DiscardHandler), w, 0, next-1, func(chunks.HeadSeriesRef) bool { return true }, 0, false, true)
 	require.NoError(t, err)
 	require.NoError(t, w.Close())
 	h := newFastStartupTestHead(t, dir, false, nil)
@@ -545,7 +545,7 @@ func TestHeadConcurrentWALMetadataAliasExpiry(t *testing.T) {
 				require.False(t, keep(2))
 				next, err := h.wal.NextSegment()
 				require.NoError(t, err)
-				_, err = wlog.Checkpoint(h.logger, h.wal, 0, next-1, keep, 150, false)
+				_, err = wlog.Checkpoint(h.logger, h.wal, 0, next-1, keep, 150, false, true)
 				require.NoError(t, err)
 				require.NoError(t, h.wal.Truncate(next))
 				require.NoError(t, closeHead())

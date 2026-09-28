@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"slices"
 
+	"go.uber.org/atomic"
+
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -121,6 +123,10 @@ func (g *walReplayGenerations) finish(h *Head, target *stripeSeries, multiRef ma
 		all = append(all, sources...)
 		slices.SortFunc(all, func(a, b *memSeries) int { return cmp.Compare(a.ref, b.ref) })
 		for _, s := range all {
+			// Only parent survives the fold below; it is recounted afterwards.
+			if s.headChunkCount.Load() >= 2 {
+				target.decMmapReady(s.ref)
+			}
 			h.updateWALExpiry(s.ref, s.maxTime())
 			if s.ooo != nil {
 				for _, c := range s.ooo.oooMmappedChunks {
@@ -147,6 +153,9 @@ func (g *walReplayGenerations) finish(h *Head, target *stripeSeries, multiRef ma
 			// Subsequent appends use parent's WAL ref, whereas the adopted tail
 			// can contain another source. It cannot serve as a replay cache.
 			parent.uncached = true
+		}
+		if parent.headChunkCount.Load() >= 2 {
+			target.incMmapReady(parent.ref)
 		}
 		if len(oooChunks) > 0 {
 			// OOO chunk IDs follow mapper order, not sample timestamp order.
@@ -216,11 +225,11 @@ func removeReplaySource(target *stripeSeries, ref chunks.HeadSeriesRef) {
 // state of either series. Callers must ensure there are no readers of the source.
 func (s *memSeries) adoptChunks(from *memSeries) {
 	s.mmappedChunks = from.mmappedChunks
-	s.headChunks = from.headChunks
+	s.setHeadChunks(from.headChunks, from.headChunkCount.Load())
 	s.firstChunkID = from.firstChunkID
 	s.mmMaxTime = from.mmMaxTime
 	s.nextAt = from.nextAt
-	s.histogramChunkHasComputedEndTime = from.histogramChunkHasComputedEndTime
+	s.setComputedHistogramChunkEndTime(from.hasComputedHistogramChunkEndTime())
 	s.lastValue = from.lastValue
 	s.lastHistogramValue = from.lastHistogramValue
 	s.lastFloatHistogramValue = from.lastFloatHistogramValue
@@ -231,9 +240,9 @@ func (s *memSeries) adoptChunks(from *memSeries) {
 func (h *Head) mergeSeries(live, hist *memSeries) error {
 	liveIntervals, _ := h.tombstones.Get(storage.SeriesRef(live.ref))
 	histIntervals, _ := h.tombstones.Get(storage.SeriesRef(hist.ref))
-	staleBefore := live.staleCount() + hist.staleCount()
+	gaugesBefore := sampleGauges{}.add(live).add(hist)
 	if len(liveIntervals) == 0 && len(histIntervals) == 0 && !live.prependHistory(hist, h.chunkDiskMapper) {
-		h.updateStaleCount(staleBefore, live.staleCount())
+		h.updateSampleGauges(gaugesBefore, sampleGauges{}.add(live))
 		return nil
 	}
 	// A boundary retry should not decode hours of disjoint historical chunks.
@@ -261,7 +270,9 @@ func (h *Head) mergeSeries(live, hist *memSeries) error {
 		chunkDiskMapper: h.chunkDiskMapper,
 		chunkRange:      h.chunkRange.Load(),
 		samplesPerChunk: h.opts.SamplesPerChunk,
-		useXOR2:         h.opts.EnableXOR2Encoding.Load(),
+		useXOR2:         h.opts.UseXOR2FloatEncoding(),
+		useHistogramST:  h.opts.EnableHistogramSTEncoding.Load(),
+		storeST:         h.opts.EnableSTStorage.Load(),
 	}
 	li.next()
 	hi.next()
@@ -279,7 +290,10 @@ func (h *Head) mergeSeries(live, hist *memSeries) error {
 			hi.next()
 		}
 		st := it.it.AtST()
-		opts.useXOR2 = opts.useXOR2 || st != 0
+		if st != 0 {
+			// Keep start timestamps already stored in either source.
+			opts.useXOR2, opts.useHistogramST = true, true
+		}
 		var created bool
 		switch it.typ {
 		case chunkenc.ValFloat:
@@ -319,7 +333,7 @@ func (h *Head) mergeSeries(live, hist *memSeries) error {
 	h.metrics.chunksCreated.Add(float64(newChunks - prefix))
 	h.metrics.chunksRemoved.Add(float64(oldChunks - prefix))
 	h.metrics.chunks.Add(float64(newChunks - oldChunks))
-	h.updateStaleCount(staleBefore, live.staleCount())
+	h.updateSampleGauges(gaugesBefore, sampleGauges{}.add(live))
 	h.tombstones.DeleteTombstones(map[storage.SeriesRef]struct{}{
 		storage.SeriesRef(live.ref): {},
 		storage.SeriesRef(hist.ref): {},
@@ -335,12 +349,35 @@ func (s *memSeries) chunkCount() int {
 	return n
 }
 
-func (h *Head) updateStaleCount(before, after uint64) {
-	if before < after {
-		h.numStaleSeries.Add(after - before)
-	} else if before > after {
-		h.numStaleSeries.Sub(before - after)
+// sampleGauges sums series contributions to the gauges derived from the latest
+// in-order sample: stale series, native histogram series and their buckets.
+type sampleGauges struct{ stale, histograms, buckets int }
+
+func (g sampleGauges) add(s *memSeries) sampleGauges {
+	stale, isHist, buckets := s.sampleState()
+	if stale {
+		g.stale++
 	}
+	if isHist {
+		g.histograms++
+		g.buckets += buckets
+	}
+	return g
+}
+
+// updateSampleGauges replaces the contributions before with after.
+func (h *Head) updateSampleGauges(before, after sampleGauges) {
+	addToGauge(&h.numStaleSeries, after.stale-before.stale)
+	addToGauge(&h.numNativeHistogramSeries, after.histograms-before.histograms)
+	h.addNativeHistogramBuckets(after.buckets - before.buckets)
+}
+
+func addToGauge(g *atomic.Uint64, delta int) {
+	if delta >= 0 {
+		g.Add(uint64(delta))
+		return
+	}
+	g.Sub(uint64(-delta))
 }
 
 type replayMergeIterator struct {

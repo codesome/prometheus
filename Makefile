@@ -12,14 +12,9 @@
 # limitations under the License.
 
 # Needs to be defined before including Makefile.common to auto-generate targets
-DOCKER_ARCHS ?= amd64 armv7 arm64 ppc64le riscv64 s390x
-DOCKERFILE_ARCH_EXCLUSIONS ?= Dockerfile.distroless:riscv64
-DOCKER_REGISTRY_ARCH_EXCLUSIONS ?= quay.io:riscv64
-
 UI_PATH = web/ui
 BUILD_UI ?= all
 UI_NODE_MODULES_PATH = $(UI_PATH)/node_modules
-REACT_APP_NPM_LICENSES_TARBALL = "npm_licenses.tar.bz2"
 
 PROMTOOL = ./promtool
 TSDB_BENCHMARK_NUM_METRICS ?= 1000
@@ -60,40 +55,45 @@ upgrade-npm-deps:
 .PHONY: ui-bump-version
 ui-bump-version:
 	version=$$(./scripts/get_module_version.sh) && ./scripts/ui_release.sh --bump-version "$${version}"
-	cd web/ui && npm install
-	git add "./web/ui/package-lock.json" "./**/package.json"
+	cd web/ui && pnpm install
+	cd web/ui/react-app && pnpm install
+	git add "./web/ui/pnpm-lock.yaml" "./web/ui/react-app/pnpm-lock.yaml" "./**/package.json"
 
 .PHONY: ui-install
 ui-install:
-	cd $(UI_PATH) && npm install
+	cd $(UI_PATH) && pnpm install
 	# The old React app has been separated from the npm workspaces setup to avoid
 	# issues with conflicting dependencies. This is a temporary solution until the
 	# new Mantine-based UI is fully integrated and the old app can be removed.
-	cd $(UI_PATH)/react-app && npm install
+	cd $(UI_PATH)/react-app && pnpm install
 
 .PHONY: ui-build
 ui-build:
 ifeq ($(BUILD_UI),mantine)
-	cd $(UI_PATH) && CI="" npm run build:mantine-ui
+	cd $(UI_PATH) && CI="" pnpm run build:mantine-ui
 else
-	cd $(UI_PATH) && CI="" npm run build
+	cd $(UI_PATH) && CI="" pnpm run build
 endif
 
 .PHONY: ui-build-module
 ui-build-module:
-	cd $(UI_PATH) && npm run build:module
+	cd $(UI_PATH) && pnpm run build:module
 
 .PHONY: ui-test
-ui-test:
-	cd $(UI_PATH) && CI=true npm run test
-
-.PHONY: ui-lint
-ui-lint:
-	cd $(UI_PATH) && npm run lint
+ui-test: ui-build-module
+	cd $(UI_PATH) && CI=true pnpm run test
 	# The old React app has been separated from the npm workspaces setup to avoid
 	# issues with conflicting dependencies. This is a temporary solution until the
 	# new Mantine-based UI is fully integrated and the old app can be removed.
-	cd $(UI_PATH)/react-app && npm run lint
+	cd $(UI_PATH)/react-app && CI=true pnpm run test
+
+.PHONY: ui-lint
+ui-lint:
+	cd $(UI_PATH) && pnpm run lint
+	# The old React app has been separated from the npm workspaces setup to avoid
+	# issues with conflicting dependencies. This is a temporary solution until the
+	# new Mantine-based UI is fully integrated and the old app can be removed.
+	cd $(UI_PATH)/react-app && pnpm run lint
 
 .PHONY: generate-promql-functions
 generate-promql-functions: ui-install
@@ -102,7 +102,7 @@ generate-promql-functions: ui-install
 	@echo ">> generating PromQL function documentation"
 	@cd $(UI_PATH)/mantine-ui/src/promql/tools && $(GO) run ./gen_functions_docs $(CURDIR)/docs/querying/functions.md > ../functionDocs.tsx
 	@echo ">> formatting generated files"
-	@cd $(UI_PATH)/mantine-ui && npx prettier --write --print-width 120 src/promql/functionSignatures.ts src/promql/functionDocs.tsx
+	@cd $(UI_PATH)/mantine-ui && pnpm exec prettier --write --print-width 120 src/promql/functionSignatures.ts src/promql/functionDocs.tsx
 
 .PHONY: check-generated-promql-functions
 check-generated-promql-functions: generate-promql-functions
@@ -112,20 +112,9 @@ check-generated-promql-functions: generate-promql-functions
 .PHONY: assets
 ifndef SKIP_UI_BUILD
 assets: check-node-version ui-install ui-build
-
-.PHONY: npm_licenses
-npm_licenses: ui-install
-	@echo ">> bundling npm licenses"
-	rm -f $(REACT_APP_NPM_LICENSES_TARBALL) npm_licenses
-	ln -s . npm_licenses
-	find npm_licenses/$(UI_NODE_MODULES_PATH) -iname "license*" | tar cfj $(REACT_APP_NPM_LICENSES_TARBALL) --files-from=-
-	rm -f npm_licenses
 else
 assets:
 	@echo '>> skipping assets build, pre-built assets provided'
-
-npm_licenses:
-	@echo '>> skipping assets npm licenses, pre-built assets provided'
 endif
 
 .PHONY: assets-compress
@@ -164,7 +153,12 @@ promql/parser/generated_parser.y.go: promql/parser/generated_parser.y
 .PHONY: clean-parser
 clean-parser:
 	@echo ">> cleaning generated parser"
+ifeq (, $(shell command -v goyacc 2> /dev/null))
+	@echo "goyacc not installed so skipping"
+	@echo "To install: \"go install golang.org/x/tools/cmd/goyacc@$(GOYACC_VERSION)\" or run \"make install-goyacc\""
+else
 	@rm -f promql/parser/generated_parser.y.go
+endif
 
 .PHONY: check-generated-parser
 check-generated-parser: clean-parser promql/parser/generated_parser.y.go
@@ -177,22 +171,22 @@ install-goyacc:
 	@go install golang.org/x/tools/cmd/goyacc@$(GOYACC_VERSION)
 
 .PHONY: test
-# If we only want to only test go code we have to change the test target
+# If we only want to test go code we have to change the test target
 # which is called by all.
 ifeq ($(GO_ONLY),1)
 test: common-test check-go-mod-version
 else
-test: check-generated-parser common-test check-node-version ui-build-module ui-test ui-lint check-go-mod-version
+test: check-generated-parser common-test check-node-version ui-test ui-lint check-go-mod-version
 endif
 
 .PHONY: tarball
-tarball: npm_licenses common-tarball
+tarball: common-tarball
 
 .PHONY: docker
-docker: npm_licenses common-docker
+docker: common-docker
 
 .PHONY: build
-build: assets npm_licenses assets-compress common-build
+build: assets assets-compress common-build
 
 .PHONY: bench_tsdb
 bench_tsdb: $(PROMU)
@@ -232,8 +226,9 @@ update-all-go-deps: update-go-deps
 .PHONY: update-go-deps-in-dir
 update-go-deps-in-dir:
 	@echo ">> updating Go dependencies in ./$(DIR)/"
+	# GOTOOLCHAIN prevents go get from pulling deps that require a newer Go version.
 	@cd ./$(DIR) && for m in $$($(GO) list -mod=readonly -m -f '{{ if and (not .Indirect) (not .Main)}}{{.Path}}{{end}}' all); do \
-		$(GO) get $$m; \
+		GOTOOLCHAIN=go$$($(GO) mod edit -json | jq -r .Go) $(GO) get $$m; \
 	done
 	@cd ./$(DIR) && $(GO) mod tidy
 

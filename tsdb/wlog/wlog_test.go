@@ -133,7 +133,7 @@ func TestWALRepair_ReadingError(t *testing.T) {
 			func(f *os.File) {
 				_, err := f.Seek(pageSize+100, 0)
 				require.NoError(t, err)
-				_, err = f.Write([]byte("beef"))
+				_, err = f.WriteString("beef")
 				require.NoError(t, err)
 			},
 			4,

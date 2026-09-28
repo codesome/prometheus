@@ -202,7 +202,7 @@ func TestHeadFastStartupIDScanCheckpoint(t *testing.T) {
 	require.NoError(t, h.wal.Log(enc.Series([]record.RefSeries{{Ref: 100, Labels: labels.FromStrings("__name__", "checkpoint")}}, nil)))
 	_, err := h.wal.NextSegment()
 	require.NoError(t, err)
-	_, err = wlog.Checkpoint(h.logger, h.wal, 0, 0, func(chunks.HeadSeriesRef) bool { return true }, 0, false)
+	_, err = wlog.Checkpoint(h.logger, h.wal, 0, 0, func(chunks.HeadSeriesRef) bool { return true }, 0, false, true)
 	require.NoError(t, err)
 	require.NoError(t, h.wal.Truncate(1))
 	id, err := h.findLastSeriesID(SeriesLifecycleState{}, 1)
@@ -576,7 +576,7 @@ func TestHeadFastStartupGenerationRecovery(t *testing.T) {
 				require.NoError(t, err)
 				next, err := h.wal.NextSegment()
 				require.NoError(t, err)
-				_, err = wlog.Checkpoint(h.logger, h.wal, first, next-1, h.keepSeriesInWALCheckpointFn(0), 0, false)
+				_, err = wlog.Checkpoint(h.logger, h.wal, first, next-1, h.keepSeriesInWALCheckpointFn(0), 0, false, true)
 				require.NoError(t, err)
 				require.NoError(t, h.Close())
 			}

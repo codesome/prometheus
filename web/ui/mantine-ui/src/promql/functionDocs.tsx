@@ -525,6 +525,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -550,9 +553,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -589,8 +589,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -643,7 +642,10 @@ const funcDocs: Record<string, React.ReactNode> = {
           Return an empty vector if <code>min &gt; max</code>
         </li>
         <li>
-          Float samples are clamped to <code>NaN</code> if <code>min</code> or <code>max</code> is <code>NaN</code>
+          The function returns <code>NaN</code> if <code>min</code> or <code>max</code> is <code>NaN</code>
+        </li>
+        <li>
+          Float samples are unchanged if <code>min</code> is <code>-Inf</code> and <code>max</code> is <code>+Inf</code>
         </li>
       </ul>
     </>
@@ -654,6 +656,20 @@ const funcDocs: Record<string, React.ReactNode> = {
         <code>clamp_max(v instant-vector, max scalar)</code> clamps the values of all float samples in <code>v</code> to
         have an upper limit of <code>max</code>. Histogram samples in the input vector are ignored silently.
       </p>
+
+      <p>Special cases:</p>
+
+      <ul>
+        <li>
+          The function returns <code>NaN</code> if the <code>max</code> argument is <code>NaN</code>
+        </li>
+        <li>
+          Float samples are unchanged if <code>max</code> is <code>+Inf</code>
+        </li>
+        <li>
+          All float samples are set to <code>-Inf</code> if <code>max</code> is <code>-Inf</code>
+        </li>
+      </ul>
     </>
   ),
   clamp_min: (
@@ -662,6 +678,20 @@ const funcDocs: Record<string, React.ReactNode> = {
         <code>clamp_min(v instant-vector, min scalar)</code> clamps the values of all float samples in <code>v</code> to
         have a lower limit of <code>min</code>. Histogram samples in the input vector are ignored silently.
       </p>
+
+      <p>Special cases:</p>
+
+      <ul>
+        <li>
+          The function returns <code>NaN</code> if the <code>min</code> argument is <code>NaN</code>
+        </li>
+        <li>
+          Float samples are unchanged if <code>min</code> is <code>-Inf</code>
+        </li>
+        <li>
+          All float samples are set to <code>+Inf</code> if <code>min</code> is <code>+Inf</code>
+        </li>
+      </ul>
     </>
   ),
   cos: (
@@ -845,6 +875,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -870,9 +903,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -909,8 +939,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -1102,6 +1131,22 @@ const funcDocs: Record<string, React.ReactNode> = {
       </p>
     </>
   ),
+  end: (
+    <>
+      <p>
+        <strong>
+          This function has to be enabled via the{" "}
+          <a href="../feature_flags.md#experimental-promql-functions">feature flag</a>
+          <code>--enable-feature=promql-experimental-functions</code>.
+        </strong>
+      </p>
+
+      <p>
+        <code>end()</code> returns the end timestamp of the current query range evaluation as the number of seconds
+        since January 1, 1970 UTC. For instant queries, this is equal to the evaluation timestamp.
+      </p>
+    </>
+  ),
   exp: (
     <>
       <p>
@@ -1160,6 +1205,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -1185,9 +1233,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -1224,8 +1269,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -1822,11 +1866,58 @@ const funcDocs: Record<string, React.ReactNode> = {
       </p>
 
       <p>
+        When only negated <code>__name__</code> matchers are provided (e.g.
+        <code>
+          {"{"}__name__!=&quot;target_info&quot;{"}"}
+        </code>
+        ), <code>info</code> considers all metrics matching
+        <code>.+_info</code> and then applies the negated matchers as filters. This is because negated matchers alone
+        cannot positively identify which info metrics to consider.
+      </p>
+
+      <p>
+        Identifying-label presence is evaluated per input series. Inputs containing only <code>job</code>, only{" "}
+        <code>instance</code>, or both can therefore gain data labels from the corresponding info-series group; a
+        missing identifying label is not treated as a wildcard.
+      </p>
+
+      <p>
         These limitations are partially defeating the purpose of the <code>info</code> function. At the current stage,
         this is an experiment to find out how useful the approach turns out to be in practice. A final version of the{" "}
         <code>info</code> function will indeed consider all matching info series and with their appropriate identifying
         labels.
       </p>
+    </>
+  ),
+  integral: (
+    <>
+      <p>
+        <strong>
+          This function has to be enabled via the{" "}
+          <a href="../feature_flags.md#experimental-promql-functions">feature flag</a>
+          <code>--enable-feature=promql-experimental-functions</code>.
+        </strong>
+      </p>
+
+      <p>
+        <code>integral(v range-vector, strategy=2 scalar)</code> calculates the integral of the time series over time in
+        seconds. The optional <code>strategy</code> controls which quadrature rule is used for each interval:{" "}
+        <code>0</code> for the left-point rectangle rule, <code>1</code> for the right-point rectangle rule, and{" "}
+        <code>2</code> for the trapezoidal rule using the average of the adjacent samples. The default is <code>2</code>
+        .
+      </p>
+
+      <p>
+        <code>integral</code> should only be used with gauges, most likely representing a rate in units per second.
+      </p>
+
+      <p>For example, to calculate the total nodes cost accumulated the last 7 days, given its hourly cost:</p>
+
+      <pre>
+        <code>
+          integral(hourly_cost{"{"}job=&quot;nodes&quot;{"}"}[7d]) / 3600
+        </code>
+      </pre>
     </>
   ),
   irate: (
@@ -1982,6 +2073,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -2007,9 +2101,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -2046,8 +2137,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -2133,6 +2223,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -2158,9 +2251,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -2197,8 +2287,23 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
+      </p>
+    </>
+  ),
+  max_of: (
+    <>
+      <p>
+        <strong>
+          This function has to be enabled via the{" "}
+          <a href="../feature_flags.md#experimental-promql-functions">feature flag</a>
+          <code>--enable-feature=promql-experimental-functions</code>.
+        </strong>
+      </p>
+
+      <p>
+        <code>max_of(a scalar, b scalar)</code> returns the larger of the two scalar values <code>a</code>
+        and <code>b</code>.
       </p>
     </>
   ),
@@ -2243,6 +2348,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -2268,9 +2376,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -2307,8 +2412,23 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
+      </p>
+    </>
+  ),
+  min_of: (
+    <>
+      <p>
+        <strong>
+          This function has to be enabled via the{" "}
+          <a href="../feature_flags.md#experimental-promql-functions">feature flag</a>
+          <code>--enable-feature=promql-experimental-functions</code>.
+        </strong>
+      </p>
+
+      <p>
+        <code>min_of(a scalar, b scalar)</code> returns the smaller of the two scalar values <code>a</code>
+        and <code>b</code>.
       </p>
     </>
   ),
@@ -2353,6 +2473,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -2378,9 +2501,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -2417,8 +2537,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -2569,6 +2688,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -2594,9 +2716,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -2633,8 +2752,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -2679,6 +2797,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -2704,9 +2825,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -2743,8 +2861,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -2816,6 +2933,22 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>rad(v instant-vector)</code>: converts degrees to radians for all float samples in <code>v</code>.
         </li>
       </ul>
+    </>
+  ),
+  range: (
+    <>
+      <p>
+        <strong>
+          This function has to be enabled via the{" "}
+          <a href="../feature_flags.md#experimental-promql-functions">feature flag</a>
+          <code>--enable-feature=promql-experimental-functions</code>.
+        </strong>
+      </p>
+
+      <p>
+        <code>range()</code> returns the range duration of the current query range evaluation in seconds and is
+        equivalent to <code>end() - start()</code>. For instant queries, this returns <code>0</code>.
+      </p>
     </>
   ),
   rate: (
@@ -3120,6 +3253,37 @@ const funcDocs: Record<string, React.ReactNode> = {
       </p>
     </>
   ),
+  start: (
+    <>
+      <p>
+        <strong>
+          This function has to be enabled via the{" "}
+          <a href="../feature_flags.md#experimental-promql-functions">feature flag</a>
+          <code>--enable-feature=promql-experimental-functions</code>.
+        </strong>
+      </p>
+
+      <p>
+        <code>start()</code> returns the start timestamp of the current query range evaluation as the number of seconds
+        since January 1, 1970 UTC. For instant queries, this is equal to the evaluation timestamp.
+      </p>
+    </>
+  ),
+  start_timestamp: (
+    <>
+      <p>
+        <code>start_timestamp(v instant-vector)</code> returns the start timestamp of each of the samples of the given
+        vector as the number of seconds since January 1, 1970 UTC. It acts on float and histogram samples in the same
+        way.
+      </p>
+
+      <p>
+        This function only works when used directly on an instant vector and when <code>use-start-timestamps</code>{" "}
+        feature flag is enabled. Otherwise, if it&rsquo;s used on an expression or if <code>use-start-timestamps</code>{" "}
+        is disabled, it returns empty results.
+      </p>
+    </>
+  ),
   stddev_over_time: (
     <>
       <p>
@@ -3161,6 +3325,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -3186,9 +3353,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -3225,8 +3389,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -3271,6 +3434,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -3296,9 +3462,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -3335,8 +3498,23 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
+      </p>
+    </>
+  ),
+  step: (
+    <>
+      <p>
+        <strong>
+          This function has to be enabled via the{" "}
+          <a href="../feature_flags.md#experimental-promql-functions">feature flag</a>
+          <code>--enable-feature=promql-experimental-functions</code>.
+        </strong>
+      </p>
+
+      <p>
+        <code>step()</code> returns the query resolution step as the number of seconds. For instant queries, this
+        returns <code>0</code>.
       </p>
     </>
   ),
@@ -3381,6 +3559,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -3406,9 +3587,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -3445,8 +3623,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -3647,6 +3824,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -3672,9 +3852,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -3711,8 +3888,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -3757,6 +3933,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -3782,9 +3961,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -3821,8 +3997,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -3867,6 +4042,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -3892,9 +4070,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -3931,8 +4106,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
@@ -3977,6 +4151,9 @@ const funcDocs: Record<string, React.ReactNode> = {
           <code>last_over_time(range-vector)</code>: the most recent sample in the specified interval.
         </li>
         <li>
+          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
+        </li>
+        <li>
           <code>present_over_time(range-vector)</code>: the value 1 for any series in the specified interval.
         </li>
       </ul>
@@ -4002,9 +4179,6 @@ const funcDocs: Record<string, React.ReactNode> = {
         </li>
         <li>
           <code>ts_of_last_over_time(range-vector)</code>: the timestamp of last sample in the specified interval.
-        </li>
-        <li>
-          <code>first_over_time(range-vector)</code>: the oldest sample in the specified interval.
         </li>
         <li>
           <code>ts_of_first_over_time(range-vector)</code>: the timestamp of earliest sample in the specified interval.
@@ -4041,8 +4215,7 @@ const funcDocs: Record<string, React.ReactNode> = {
         first sample of <code>m</code> <em>within</em> the 1m range, where <code>m offset 1m</code> will select the most
         recent sample within the lookback interval <em>outside and prior to</em> the 1m offset. This is particularly
         useful with <code>first_over_time(m[step()])</code>
-        in range queries (available when <code>--enable-feature=promql-duration-expr</code> is set) to ensure that the
-        sample selected is within the range step.
+        in range queries to ensure that the sample selected is within the range step.
       </p>
     </>
   ),
