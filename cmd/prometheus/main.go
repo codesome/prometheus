@@ -608,7 +608,7 @@ func main() {
 	a.Flag("scrape.discovery-reload-interval", "Interval used by scrape manager to throttle target groups updates.").
 		Hidden().Default("5s").SetValue(&cfg.scrape.DiscoveryReloadInterval)
 
-	a.Flag("enable-feature", "Comma separated feature names to enable. Valid options: exemplar-storage, expand-external-labels, memory-snapshot-on-shutdown, promql-per-step-stats, promql-experimental-functions, extra-scrape-metrics, auto-gomaxprocs, created-timestamp-zero-ingestion, st-storage, concurrent-rule-eval, delayed-compaction, old-ui, otlp-deltatocumulative, promql-duration-expr, use-uncached-io, promql-extended-range-selectors, promql-binop-fill-modifiers, xor2-encoding. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details.").
+	a.Flag("enable-feature", "Comma separated feature names to enable. Valid options: exemplar-storage, expand-external-labels, memory-snapshot-on-shutdown, promql-per-step-stats, promql-experimental-functions, extra-scrape-metrics, auto-gomaxprocs, created-timestamp-zero-ingestion, st-storage, concurrent-rule-eval, delayed-compaction, old-ui, otlp-deltatocumulative, promql-duration-expr, use-uncached-io, promql-extended-range-selectors, promql-binop-fill-modifiers, xor2-encoding, fast-startup. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details.").
 		Default("").StringsVar(&cfg.featureList)
 
 	a.Flag("agent", "Run Prometheus in 'Agent mode'.").BoolVar(&agentMode)
@@ -1164,6 +1164,10 @@ func main() {
 			close(reloadReady.C)
 		})
 	}
+	queryReady := make(chan struct{})
+	if agentMode {
+		close(queryReady)
+	}
 
 	listeners, err := webHandler.Listeners()
 	if err != nil {
@@ -1234,14 +1238,21 @@ func main() {
 	}
 	if !agentMode {
 		// Rule manager.
+		cancel := make(chan struct{})
 		g.Add(
 			func() error {
 				<-reloadReady.C
+				select {
+				case <-queryReady:
+				case <-cancel:
+					return nil
+				}
 				ruleManager.Run()
 				logger.Info("Rule manager stopped")
 				return nil
 			},
 			func(error) {
+				close(cancel)
 				logger.Info("Stopping rule manager manager...")
 				ruleManager.Stop()
 			},
@@ -1390,6 +1401,11 @@ func main() {
 
 				reloadReady.Close()
 
+				select {
+				case <-queryReady:
+				case <-cancel:
+					return nil
+				}
 				webHandler.SetReady(web.Ready)
 				notifs.DeleteNotification(notifications.StartingUp)
 				logger.Info("Server is ready to receive web requests.")
@@ -1450,18 +1466,18 @@ func main() {
 				localStorage.Set(db, startTimeMargin)
 				db.SetWriteNotified(remoteStorage)
 
-				if cfg.tsdb.EnableFastStartup {
-					go func() {
-						// Wait for queries to become enabled.
-						<-db.Head().WaitForWALReplay()
-						localStorage.SetQueryReady()
-						logger.Info("WAL replay finished. Queries are now enabled.")
-					}()
-				} else {
-					localStorage.SetQueryReady()
-				}
-
 				close(dbOpen)
+				select {
+				case <-db.Head().WaitForWALReplay():
+					if err := db.Head().WALReplayError(); err != nil {
+						return fmt.Errorf("background WAL replay: %w", err)
+					}
+				case <-cancel:
+					return nil
+				}
+				localStorage.SetQueryReady()
+				close(queryReady)
+				logger.Info("WAL replay finished. Queries are now enabled.")
 				<-cancel
 				logger.Info("TSDB stopped")
 				return nil

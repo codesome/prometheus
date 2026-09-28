@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/common/promslog"
 
 	"github.com/prometheus/prometheus/tsdb/fileutil"
+	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/util/compression"
 )
 
@@ -417,6 +418,28 @@ func (w *WL) Repair(origErr error) error {
 	segs, err := listSegments(w.Dir())
 	if err != nil {
 		return fmt.Errorf("list segments: %w", err)
+	}
+	// A later concurrent-startup suffix can contain acknowledged writes that
+	// do not depend on replay completing successfully. Never delete it when
+	// repairing corruption in the historical prefix. Check before modifying
+	// any files so an operator can recover both sides of the boundary.
+	for _, s := range segs {
+		if s.index <= cerr.Segment {
+			continue
+		}
+		f, err := OpenReadSegment(SegmentName(w.Dir(), s.index))
+		if err != nil {
+			return fmt.Errorf("inspect repair suffix: %w", err)
+		}
+		sr := NewSegmentBufReader(f)
+		r := NewReader(sr)
+		boundary := r.Next() && len(r.Record()) == 1 && record.Type(r.Record()[0]) == record.ReplayBoundary
+		if err := errors.Join(r.Err(), sr.Close()); err != nil {
+			return fmt.Errorf("inspect repair suffix: %w", err)
+		}
+		if boundary {
+			return fmt.Errorf("refusing WAL repair across concurrent replay boundary in segment %d; preserve the WAL for manual recovery: %w", s.index, origErr)
+		}
 	}
 	w.logger.Warn("Deleting all segments newer than corrupted segment", "segment", cerr.Segment)
 
@@ -826,11 +849,23 @@ func (w *WL) fsync(f *Segment) error {
 	return err
 }
 
-// Sync forces a file sync on the current write log segment. This function is meant
-// to be used only on tests due to different behaviour on Operating Systems
-// like windows and linux.
+// Sync synchronizes the current segment and its directory. Log flushes each
+// batch before returning; Sync additionally makes those writes durable before
+// dependent operations, such as admitting concurrent replay ingestion.
 func (w *WL) Sync() error {
-	return w.fsync(w.segment)
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	if w.closed {
+		return errors.New("wlog is closed")
+	}
+	if err := w.fsync(w.segment); err != nil {
+		return err
+	}
+	dir, err := fileutil.OpenDir(w.Dir())
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
 }
 
 // Close flushes all writes and closes active segment.

@@ -22,7 +22,6 @@ import (
 	"sync"
 
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -30,11 +29,17 @@ import (
 )
 
 func (h *Head) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	if err := h.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.exemplars.ExemplarQuerier(ctx)
 }
 
 // Index returns an IndexReader against the block.
 func (h *Head) Index() (IndexReader, error) {
+	if err := h.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.indexRange(math.MinInt64, math.MaxInt64), nil
 }
 
@@ -270,9 +275,7 @@ func (h *Head) filterStaleSeriesAndSortPostings(p index.Postings) ([]storage.Ser
 			continue
 		}
 
-		if value.IsStaleNaN(s.lastValue) ||
-			(s.lastHistogramValue != nil && value.IsStaleNaN(s.lastHistogramValue.Sum)) ||
-			(s.lastFloatHistogramValue != nil && value.IsStaleNaN(s.lastFloatHistogramValue.Sum)) {
+		if s.staleCount() != 0 {
 			series = append(series, s)
 		}
 		s.Unlock()
@@ -401,6 +404,9 @@ func (h *headIndexReader) LabelNamesFor(ctx context.Context, series index.Postin
 
 // Chunks returns a ChunkReader against the block.
 func (h *Head) Chunks() (ChunkReader, error) {
+	if err := h.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.chunksRange(math.MinInt64, math.MaxInt64, h.iso.State(math.MinInt64, math.MaxInt64))
 }
 

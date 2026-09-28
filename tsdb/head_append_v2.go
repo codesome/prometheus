@@ -82,6 +82,7 @@ func (h *Head) AppenderV2(context.Context) storage.AppenderV2 {
 }
 
 func (h *Head) appenderV2() *headAppenderV2 {
+	replayRegistered := h.fastReplay && h.registerReplayAppender()
 	minValidTime := h.appendableMinValidTime()
 	appendID, cleanupAppendIDsBelow := h.iso.newAppendID(minValidTime) // Every appender gets an ID that is cleared upon commit/rollback.
 	return &headAppenderV2{
@@ -97,6 +98,7 @@ func (h *Head) appenderV2() *headAppenderV2 {
 			cleanupAppendIDsBelow: cleanupAppendIDsBelow,
 			storeST:               h.opts.EnableSTStorage.Load(),
 			useXOR2:               h.opts.EnableXOR2Encoding.Load(),
+			replayRegistered:      replayRegistered,
 		},
 	}
 }

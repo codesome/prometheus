@@ -480,7 +480,7 @@ func (db *DB) loadWAL(r *wlog.Reader, duplicateRefToValidRef map[chunks.HeadSeri
 		for r.Next() {
 			rec := r.Record()
 			switch dec.Type(rec) {
-			case record.Series:
+			case record.Series, record.ConcurrentSeries:
 				series := db.walReplaySeriesPool.Get()[:0]
 				series, err = dec.Series(rec, series)
 				if err != nil {

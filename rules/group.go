@@ -291,6 +291,9 @@ func (g *Group) run(ctx context.Context) {
 				evalTimestamp = evalTimestamp.Add((missed + 1) * g.interval)
 
 				g.evalIterationFunc(ctx, g, evalTimestamp)
+				if g.shouldRestore {
+					g.RestoreForState(time.Now())
+				}
 			}
 		}
 	}
@@ -741,7 +744,6 @@ func (g *Group) RestoreForState(ts time.Time) {
 		totalRestoreTimeSeconds := time.Since(ts).Seconds()
 		g.metrics.GroupLastRestoreDuration.WithLabelValues(GroupKey(g.file, g.name)).Set(totalRestoreTimeSeconds)
 		g.logger.Debug("'for' state restoration completed", "duration_seconds", totalRestoreTimeSeconds)
-		g.shouldRestore = false
 	}()
 	maxtMS := int64(model.TimeFromUnixNano(ts.UnixNano()))
 	// We allow restoration only if alerts were active before after certain time.
@@ -752,6 +754,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 		g.logger.Error("Failed to get Querier", "err", err)
 		return
 	}
+	g.shouldRestore = false
 	defer func() {
 		if err := q.Close(); err != nil {
 			g.logger.Error("Failed to close Querier", "err", err)

@@ -7945,9 +7945,10 @@ func TestHead_FastStartupStateFile(t *testing.T) {
 	opts := newTestHeadDefaultOptions(1000, false)
 	// Enable the fast startup feature.
 	opts.EnableFastStartup = true
+	opts.EnableExemplarStorage = false
 
 	head, w := newTestHeadWithOptions(t, compression.None, opts)
-	require.NoError(t, head.Init(0))
+	require.NoError(t, head.InitFastStartup(0))
 
 	// Add a single sample to the Head.
 	app := head.Appender(context.Background())
@@ -7955,8 +7956,11 @@ func TestHead_FastStartupStateFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
-	// Wait for the ticker to update the series state file.
-	time.Sleep(1500 * time.Millisecond)
+	// Wait for the ticker without assuming a fixed scheduling delay.
+	require.Eventually(t, func() bool {
+		state, err := head.readSeriesStateFile()
+		return err == nil && state.LastSeriesID == 1
+	}, 5*time.Second, 10*time.Millisecond)
 
 	stateFilePath := filepath.Join(w.Dir(), "series_state.json")
 
@@ -7969,7 +7973,8 @@ func TestHead_FastStartupStateFile(t *testing.T) {
 	// The ticker should write an unclean state.
 	require.False(t, state.CleanShutdown, "ticker should write CleanShutdown: false")
 	require.Equal(t, uint64(1), state.LastSeriesID, "LastSeriesID should be 1 after adding our sample")
-	require.Equal(t, 0, state.LastWALSegment, "LastWALSegment should be 0 on a fresh WAL")
+	// Fast startup cuts a fresh WAL segment for live writes, so the sample lands in segment 1.
+	require.Equal(t, 1, state.LastWALSegment, "LastWALSegment should be 1 after the fast-startup segment cut")
 
 	// Perform a clean shutdown.
 	require.NoError(t, head.Close())
@@ -7981,7 +7986,7 @@ func TestHead_FastStartupStateFile(t *testing.T) {
 	// Calling head.Close() should put us in the clean state.
 	require.True(t, state.CleanShutdown, "Close() should write CleanShutdown: true")
 	require.Equal(t, uint64(1), state.LastSeriesID, "LastSeriesID should remain 1")
-	require.Equal(t, 0, state.LastWALSegment, "LastWALSegment should remain 0")
+	require.Equal(t, 1, state.LastWALSegment, "LastWALSegment should remain 1")
 }
 
 func TestHead_ReadSeriesStateFile(t *testing.T) {
@@ -8065,4 +8070,170 @@ func TestHead_FindLastSeriesID(t *testing.T) {
 	id, err = head.findLastSeriesID(mockState, last)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), id, "Should find ID 2 even when state file's last segment is the newest segment")
+}
+
+func fastStartupAppend(t testing.TB, h *Head, lset labels.Labels, ts ...int64) {
+	app := h.Appender(context.Background())
+	for _, tt := range ts {
+		_, err := app.Append(0, lset, tt, float64(tt))
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+}
+
+// TestHeadFastStartupMerge exercises merging the background WAL replay (shadow map) into the live
+// series: a WAL-only series (A) is moved over, a series seen by both (B) has its history stitched
+// onto the live data, and a live-only series (C) is left as-is.
+func TestHeadFastStartupMerge(t *testing.T) {
+	opts := newTestHeadDefaultOptions(1000, false)
+	opts.EnableFastStartup = true
+	opts.EnableExemplarStorage = false
+
+	// First run: write historical data for A and B, then close (flushing the WAL and a clean
+	// series_state.json so the second run can seed lastSeriesID).
+	h1, _ := newTestHeadWithOptions(t, compression.None, opts)
+	require.NoError(t, h1.Init(0))
+	fastStartupAppend(t, h1, labels.FromStrings("__name__", "a"), 100, 200)
+	fastStartupAppend(t, h1, labels.FromStrings("__name__", "b"), 100, 200)
+	require.NoError(t, h1.Close())
+
+	// Second run with fast startup: replay runs in the background while we ingest live data for B
+	// (also in the WAL) and C (new).
+	wal, err := wlog.NewSize(nil, nil, filepath.Join(opts.ChunkDirRoot, "wal"), 32768, compression.None)
+	require.NoError(t, err)
+	h2, err := NewHead(nil, nil, wal, nil, opts, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = h2.Close() })
+	require.NoError(t, h2.InitFastStartup(0))
+
+	// Live timestamps are kept close together so they stay inside the head's appendable window.
+	fastStartupAppend(t, h2, labels.FromStrings("__name__", "b"), 1000, 1010)
+	fastStartupAppend(t, h2, labels.FromStrings("__name__", "c"), 1000, 1010)
+
+	<-h2.WaitForWALReplay() // Blocks until the replay + merge finish.
+
+	require.Equal(t, uint64(3), h2.NumSeries())
+
+	q, err := NewBlockQuerier(h2, 0, 3000)
+	require.NoError(t, err)
+	require.Equal(t, map[string][]chunks.Sample{
+		`{__name__="a"}`: {sample{0, 100, 100, nil, nil}, sample{0, 200, 200, nil, nil}},
+		`{__name__="b"}`: {sample{0, 100, 100, nil, nil}, sample{0, 200, 200, nil, nil}, sample{0, 1000, 1000, nil, nil}, sample{0, 1010, 1010, nil, nil}},
+		`{__name__="c"}`: {sample{0, 1000, 1000, nil, nil}, sample{0, 1010, 1010, nil, nil}},
+	}, query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "__name__", ".*")))
+}
+
+// TestHeadFastStartupMergeStitch deterministically exercises the Case B stitch path through
+// mergeWALSeries and a real query: the same series exists in both the shadow WAL map (older data,
+// as if replayed) and the live map (newer data, as if scraped), so its history must be prepended
+// onto the live series and stay queryable (postings + isolation).
+func TestHeadFastStartupMergeStitch(t *testing.T) {
+	opts := newTestHeadDefaultOptions(1000, false)
+	opts.EnableFastStartup = true
+	h, _ := newTestHeadWithOptions(t, compression.None, opts)
+	require.NoError(t, h.Init(0))
+
+	lset := labels.FromStrings("__name__", "m")
+
+	// Simulate WAL replay: create the series in the shadow map with older samples.
+	walS, _, err := h.getOrCreateInStripe(h.walSeries, 1, lset.Hash(), lset, false)
+	require.NoError(t, err)
+	cOpts := chunkOpts{chunkDiskMapper: h.chunkDiskMapper, chunkRange: h.chunkRange.Load(), samplesPerChunk: h.opts.SamplesPerChunk}
+	walS.Lock()
+	for _, ts := range []int64{100, 200} {
+		walS.append(0, ts, float64(ts), 0, cOpts)
+	}
+	walS.Unlock()
+	h.lastSeriesID.Store(1) // As InitFastStartup would seed it, so live series get higher refs.
+
+	// Live ingestion: same labels, newer samples, into the live map.
+	fastStartupAppend(t, h, lset, 1000, 1010)
+
+	// Real WAL replay calls updateMinMaxTime as it processes samples; mirror that so the head's min
+	// time covers the replayed history (queriers clamp their mint to h.MinTime()).
+	h.updateMinMaxTime(100, 200)
+
+	require.NoError(t, h.mergeWALSeries())
+	require.Equal(t, uint64(1), h.NumSeries())
+
+	q, err := NewBlockQuerier(h, 0, 3000)
+	require.NoError(t, err)
+	require.Equal(t, map[string][]chunks.Sample{
+		`{__name__="m"}`: {sample{0, 100, 100, nil, nil}, sample{0, 200, 200, nil, nil}, sample{0, 1000, 1000, nil, nil}, sample{0, 1010, 1010, nil, nil}},
+	}, query(t, q, labels.MustNewMatcher(labels.MatchEqual, "__name__", "m")))
+}
+
+// TestMemSeriesPrependHistory covers the chunk-stitching primitive directly: the no-mmap fast
+// path, the path where the live series already has mmapped chunks, and rejecting overlaps.
+func TestMemSeriesPrependHistory(t *testing.T) {
+	countSamples := func(s *memSeries) (n int) {
+		for _, mc := range s.mmappedChunks {
+			n += int(mc.numSamples)
+		}
+		for c := s.headChunks; c != nil; c = c.prev {
+			n += c.chunk.NumSamples()
+		}
+		return n
+	}
+	// build appends samples at [from, to) (stepping by 1) to a fresh series and mmaps its closed
+	// head chunks, so a wide range leaves mmapped chunks behind.
+	build := func(h *Head, name string, from, to int64) *memSeries {
+		lset := labels.FromStrings("__name__", name)
+		fastStartupAppend(t, h, lset, rangeSlice(from, to)...)
+		h.mmapHeadChunks()
+		return h.series.getByHash(lset.Hash(), lset)
+	}
+
+	t.Run("fast path without mmapped chunks", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist, live := build(h, "hist", 0, 5), build(h, "live", 100, 105)
+		require.Empty(t, live.mmappedChunks)
+
+		live.Lock()
+		require.False(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+
+		require.Equal(t, 10, countSamples(live))
+		require.Equal(t, int64(0), live.minTime())
+		require.Equal(t, int64(104), live.maxTime())
+	})
+
+	t.Run("live series already has mmapped chunks", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist, live := build(h, "hist", 0, 5), build(h, "live", 100, 500)
+		require.NotEmpty(t, live.mmappedChunks)
+
+		live.Lock()
+		require.False(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+
+		require.Equal(t, 405, countSamples(live))
+		require.Equal(t, int64(0), live.minTime())
+		require.Equal(t, int64(499), live.maxTime())
+	})
+
+	t.Run("boundary overlap preserves both inputs", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist, live := build(h, "hist", 100, 105), build(h, "live", 0, 5) // hist is newer than live.
+
+		live.Lock()
+		require.True(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+
+		require.Equal(t, 5, countSamples(live))
+		require.Equal(t, 5, countSamples(hist))
+		require.Equal(t, int64(0), live.minTime())
+		require.Equal(t, int64(4), live.maxTime())
+	})
+}
+
+func rangeSlice(from, to int64) []int64 {
+	s := make([]int64, 0, to-from)
+	for i := from; i < to; i++ {
+		s = append(s, i)
+	}
+	return s
 }

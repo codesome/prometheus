@@ -15,6 +15,7 @@
 package wlog
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -155,6 +156,10 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 	}()
 
 	r := NewReader(sgmReader)
+	type orderedMetadata struct {
+		metadata record.RefMetadata
+		order    int
+	}
 
 	var (
 		series                []record.RefSeries
@@ -170,7 +175,8 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 		buf                   []byte
 		recs                  [][]byte
 
-		latestMetadataMap = make(map[chunks.HeadSeriesRef]record.RefMetadata)
+		latestMetadataMap = make(map[chunks.HeadSeriesRef]orderedMetadata)
+		metadataOrder     int
 	)
 	for r.Next() {
 		series, samples, histogramSamples, floatHistogramSamples, tstones, exemplars, metadata = series[:0], samples[:0], histogramSamples[:0], floatHistogramSamples[:0], tstones[:0], exemplars[:0], metadata[:0]
@@ -182,7 +188,7 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 		rec := r.Record()
 
 		switch dec.Type(rec) {
-		case record.Series:
+		case record.Series, record.ConcurrentSeries:
 			series, err = dec.Series(rec, series)
 			if err != nil {
 				return nil, fmt.Errorf("decode series: %w", err)
@@ -195,7 +201,11 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 				}
 			}
 			if len(repl) > 0 {
-				buf = enc.Series(repl, buf)
+				if dec.Type(rec) == record.ConcurrentSeries {
+					buf = enc.ConcurrentSeries(repl, buf)
+				} else {
+					buf = enc.Series(repl, buf)
+				}
 			}
 			stats.TotalSeries += len(series)
 			stats.DroppedSeries += len(series) - len(repl)
@@ -336,7 +346,8 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 					if _, ok := latestMetadataMap[m.Ref]; !ok {
 						repl++
 					}
-					latestMetadataMap[m.Ref] = m
+					latestMetadataMap[m.Ref] = orderedMetadata{m, metadataOrder}
+					metadataOrder++
 				}
 			}
 			stats.TotalMetadata += len(metadata)
@@ -371,9 +382,19 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 
 	// Flush latest metadata records for each series.
 	if len(latestMetadataMap) > 0 {
+		// Concurrent references can describe the same labels. Preserve the
+		// last-update order across references so a checkpoint cannot make an
+		// older source's metadata override a newer update on replay.
+		refs := make([]chunks.HeadSeriesRef, 0, len(latestMetadataMap))
+		for ref := range latestMetadataMap {
+			refs = append(refs, ref)
+		}
+		slices.SortFunc(refs, func(a, b chunks.HeadSeriesRef) int {
+			return cmp.Compare(latestMetadataMap[a].order, latestMetadataMap[b].order)
+		})
 		latestMetadata := make([]record.RefMetadata, 0, len(latestMetadataMap))
-		for _, m := range latestMetadataMap {
-			latestMetadata = append(latestMetadata, m)
+		for _, ref := range refs {
+			latestMetadata = append(latestMetadata, latestMetadataMap[ref].metadata)
 		}
 		if err := cp.Log(enc.Metadata(latestMetadata, buf[:0])); err != nil {
 			return nil, fmt.Errorf("flush metadata records: %w", err)

@@ -17,6 +17,7 @@ package wlog
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,11 +31,30 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/prometheus/prometheus/tsdb/fileutil"
+	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/util/compression"
 )
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
+}
+
+func TestRepairPreservesConcurrentReplaySuffix(t *testing.T) {
+	w, err := NewSize(nil, nil, t.TempDir(), 32768, compression.None)
+	require.NoError(t, err)
+	defer w.Close()
+	require.NoError(t, w.Log([]byte("history")))
+	_, err = w.NextSegment()
+	require.NoError(t, err)
+	require.NoError(t, w.Log([]byte{byte(record.ReplayBoundary)}, []byte("acknowledged live writes")))
+	before, err := os.ReadFile(SegmentName(w.Dir(), 1))
+	require.NoError(t, err)
+	require.ErrorContains(t, w.Repair(&CorruptionErr{Segment: 0, Offset: 0, Err: errors.New("invalid historical record")}), "refusing WAL repair")
+	after, err := os.ReadFile(SegmentName(w.Dir(), 1))
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	_, err = os.Stat(SegmentName(w.Dir(), 0))
+	require.NoError(t, err, "repair must fail before modifying the historical prefix")
 }
 
 // TestWALRepair_ReadingError ensures that a repair is run for an error

@@ -172,6 +172,7 @@ func (h *Head) Appender(context.Context) storage.Appender {
 }
 
 func (h *Head) appender() *headAppender {
+	replayRegistered := h.fastReplay && h.registerReplayAppender()
 	minValidTime := h.appendableMinValidTime()
 	appendID, cleanupAppendIDsBelow := h.iso.newAppendID(minValidTime) // Every appender gets an ID that is cleared upon commit/rollback.
 	return &headAppender{
@@ -187,6 +188,7 @@ func (h *Head) appender() *headAppender {
 			cleanupAppendIDsBelow: cleanupAppendIDsBelow,
 			storeST:               h.opts.EnableSTStorage.Load(),
 			useXOR2:               h.opts.EnableXOR2Encoding.Load(),
+			replayRegistered:      replayRegistered,
 		},
 	}
 }
@@ -416,6 +418,7 @@ type headAppenderBase struct {
 	closed                          bool
 	storeST                         bool
 	useXOR2                         bool
+	replayRegistered                bool
 }
 type headAppender struct {
 	headAppenderBase
@@ -1065,13 +1068,27 @@ func (a *headAppenderBase) log() error {
 	var rec []byte
 	enc := record.Encoder{EnableSTStorage: a.storeST}
 
-	if len(a.seriesRefs) > 0 {
-		rec = enc.Series(a.seriesRefs, buf)
+	for start := 0; start < len(a.seriesRefs); {
+		end := len(a.seriesRefs)
+		concurrent := false
+		if a.head.fastReplay {
+			concurrent = a.series[start].concurrent
+			end = start + 1
+			for end < len(a.seriesRefs) && a.series[end].concurrent == concurrent {
+				end++
+			}
+		}
+		if concurrent {
+			rec = enc.ConcurrentSeries(a.seriesRefs[start:end], buf)
+		} else {
+			rec = enc.Series(a.seriesRefs[start:end], buf)
+		}
 		buf = rec[:0]
 
 		if err := a.head.wal.Log(rec); err != nil {
 			return fmt.Errorf("log series: %w", err)
 		}
+		start = end
 	}
 	for _, b := range a.batches {
 		if len(b.metadata) > 0 {
@@ -1433,8 +1450,9 @@ func (a *headAppenderBase) commitFloats(b *appendBatch, acc *appenderCommitConte
 				acc.floatsAppended--
 			}
 		default:
-			newlyStale := !value.IsStaleNaN(series.lastValue) && value.IsStaleNaN(s.V)
-			staleToNonStale := value.IsStaleNaN(series.lastValue) && !value.IsStaleNaN(s.V)
+			wasStale := series.staleCount() != 0
+			newlyStale := !wasStale && value.IsStaleNaN(s.V)
+			staleToNonStale := wasStale && !value.IsStaleNaN(s.V)
 			ok, chunkCreated = series.append(s.ST, s.T, s.V, a.appendID, acc.appendChunkOpts)
 			if ok {
 				if s.T < acc.inOrderMint {
@@ -1539,12 +1557,9 @@ func (a *headAppenderBase) commitHistograms(b *appendBatch, acc *appenderCommitC
 				acc.histogramsAppended--
 			}
 		default:
-			newlyStale := value.IsStaleNaN(s.H.Sum)
-			staleToNonStale := false
-			if series.lastHistogramValue != nil {
-				newlyStale = newlyStale && !value.IsStaleNaN(series.lastHistogramValue.Sum)
-				staleToNonStale = value.IsStaleNaN(series.lastHistogramValue.Sum) && !value.IsStaleNaN(s.H.Sum)
-			}
+			wasStale := series.staleCount() != 0
+			newlyStale := !wasStale && value.IsStaleNaN(s.H.Sum)
+			staleToNonStale := wasStale && !value.IsStaleNaN(s.H.Sum)
 			// TODO(krajorama,ywwg): pass ST when available in WAL.
 			ok, chunkCreated = series.appendHistogram(0, s.T, s.H, a.appendID, acc.appendChunkOpts)
 			if ok {
@@ -1650,12 +1665,9 @@ func (a *headAppenderBase) commitFloatHistograms(b *appendBatch, acc *appenderCo
 				acc.histogramsAppended--
 			}
 		default:
-			newlyStale := value.IsStaleNaN(s.FH.Sum)
-			staleToNonStale := false
-			if series.lastFloatHistogramValue != nil {
-				newlyStale = newlyStale && !value.IsStaleNaN(series.lastFloatHistogramValue.Sum)
-				staleToNonStale = value.IsStaleNaN(series.lastFloatHistogramValue.Sum) && !value.IsStaleNaN(s.FH.Sum)
-			}
+			wasStale := series.staleCount() != 0
+			newlyStale := !wasStale && value.IsStaleNaN(s.FH.Sum)
+			staleToNonStale := wasStale && !value.IsStaleNaN(s.FH.Sum)
 			// TODO(krajorama,ywwg): pass ST when available in WAL.
 			ok, chunkCreated = series.appendFloatHistogram(0, s.T, s.FH, a.appendID, acc.appendChunkOpts)
 			if ok {
@@ -1713,6 +1725,9 @@ func (a *headAppenderBase) unmarkCreatedSeriesAsPendingCommit() {
 // Commit writes to the WAL and adds the data to the Head.
 // TODO(codesome): Refactor this method to reduce indentation and make it more readable.
 func (a *headAppenderBase) Commit() (err error) {
+	if a.replayRegistered {
+		defer a.releaseReplayAppender()
+	}
 	if a.closed {
 		return ErrAppenderClosed
 	}
@@ -1894,6 +1909,7 @@ func (s *memSeries) appendHistogram(st, t int64, h *histogram.Histogram, appendI
 
 	s.lastHistogramValue = h
 	s.lastFloatHistogramValue = nil
+	s.lastValue = h.Sum
 
 	if appendID > 0 {
 		s.txs.add(appendID)
@@ -1951,6 +1967,7 @@ func (s *memSeries) appendFloatHistogram(st, t int64, fh *histogram.FloatHistogr
 
 	s.lastHistogramValue = nil
 	s.lastFloatHistogramValue = fh
+	s.lastValue = fh.Sum
 
 	if appendID > 0 {
 		s.txs.add(appendID)
@@ -2225,7 +2242,11 @@ func (s *memSeries) mmapChunks(chunkDiskMapper *chunks.ChunkDiskMapper) (count i
 	// then we need to write chunks t0 to t3, but skip s.headChunks.
 	for i := s.headChunks.len() - 1; i > 0; i-- {
 		chk := s.headChunks.atOffset(i)
-		chunkRef := chunkDiskMapper.WriteChunk(s.ref, chk.minTime, chk.maxTime, chk.chunk, false, handleChunkWriteError)
+		ref := chk.walRef
+		if ref == 0 && !s.uncached {
+			ref = s.ref
+		}
+		chunkRef := chunkDiskMapper.WriteChunk(ref, chk.minTime, chk.maxTime, chk.chunk, false, handleChunkWriteError)
 		s.mmappedChunks = append(s.mmappedChunks, &mmappedChunk{
 			ref:        chunkRef,
 			numSamples: uint16(chk.chunk.NumSamples()),
@@ -2252,6 +2273,9 @@ func handleChunkWriteError(err error) {
 
 // Rollback removes the samples and exemplars from headAppender and writes any series to WAL.
 func (a *headAppenderBase) Rollback() (err error) {
+	if a.replayRegistered {
+		defer a.releaseReplayAppender()
+	}
 	if a.closed {
 		return ErrAppenderClosed
 	}

@@ -33,7 +33,6 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
-	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -76,7 +75,12 @@ func counterAddNonZero(v *prometheus.CounterVec, value float64, lvs ...string) {
 	}
 }
 
-func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[chunks.HeadSeriesRef]chunks.HeadSeriesRef, mmappedChunks, oooMmappedChunks map[chunks.HeadSeriesRef][]*mmappedChunk, targetStripeMap *stripeSeries) (err error) {
+type replaySeriesRecord struct {
+	series     []record.RefSeries
+	concurrent bool
+}
+
+func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[chunks.HeadSeriesRef]chunks.HeadSeriesRef, mmappedChunks, oooMmappedChunks map[chunks.HeadSeriesRef][]*mmappedChunk, targetStripeMap *stripeSeries, generations *walReplayGenerations) (err error) {
 	// Track number of missing series records that were referenced by other records.
 	unknownSeriesRefs := &seriesRefSet{refs: make(map[chunks.HeadSeriesRef]struct{}), mtx: sync.Mutex{}}
 	// Track number of different records that referenced a series we don't know about
@@ -156,9 +160,9 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 		defer close(decoded)
 		var err error
 		dec := record.NewDecoder(syms, h.logger)
-		for r.Next() {
+		for h.walReplayCtx.Err() == nil && r.Next() {
 			switch dec.Type(r.Record()) {
-			case record.Series:
+			case record.Series, record.ConcurrentSeries:
 				series := h.wlReplaySeriesPool.Get()[:0]
 				series, err = dec.Series(r.Record(), series)
 				if err != nil {
@@ -169,7 +173,7 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 					}
 					return
 				}
-				decoded <- series
+				decoded <- replaySeriesRecord{series: series, concurrent: dec.Type(r.Record()) == record.ConcurrentSeries}
 			case record.Samples, record.SamplesV2:
 				samples := h.wlReplaySamplesPool.Get()[:0]
 				samples, err = dec.Samples(r.Record(), samples)
@@ -253,28 +257,48 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 Outer:
 	for d := range decoded {
 		switch v := d.(type) {
-		case []record.RefSeries:
-			for _, walSeries := range v {
+		case replaySeriesRecord:
+			if v.concurrent {
+				h.snapshotIncompatible.Store(true)
+			}
+			for _, walSeries := range v.series {
+				if v.concurrent {
+					if existing := targetStripeMap.getByID(walSeries.Ref); existing != nil {
+						if !labels.Equal(existing.labels(), walSeries.Labels) {
+							seriesCreationErr = fmt.Errorf("concurrent WAL reference %d redefined with different labels", walSeries.Ref)
+							break Outer
+						}
+						// A retried definition is not another generation.
+						continue
+					}
+				}
 				mSeries, created, err := h.getOrCreateInStripe(targetStripeMap, walSeries.Ref, walSeries.Labels.Hash(), walSeries.Labels, false)
 				if err != nil {
 					seriesCreationErr = err
 					break Outer
 				}
 
-				if chunks.HeadSeriesRef(h.lastSeriesID.Load()) < walSeries.Ref {
+				// During fast startup the live appenders own lastSeriesID (it was seeded above
+				// every WAL ref in InitFastStartup); the background replay must not touch it.
+				if targetStripeMap == h.series && chunks.HeadSeriesRef(h.lastSeriesID.Load()) < walSeries.Ref {
 					h.lastSeriesID.Store(uint64(walSeries.Ref))
 				}
 				if !created {
-					multiRef[walSeries.Ref] = mSeries.ref
+					if v.concurrent && walSeries.Ref != mSeries.ref {
+						mSeries = generations.add(h, targetStripeMap, mSeries, walSeries)
+					} else {
+						generations.supersede(mSeries, multiRef)
+						multiRef[walSeries.Ref] = mSeries.ref
+					}
 				}
 
 				idx := uint64(mSeries.ref) % uint64(concurrency)
 				processors[idx].input <- walSubsetProcessorInputItem{walSeriesRef: walSeries.Ref, existingSeries: mSeries}
 			}
-			for i := range v { // Zero out to avoid retaining label data.
-				v[i].Labels = labels.EmptyLabels()
+			for i := range v.series { // Zero out to avoid retaining label data.
+				v.series[i].Labels = labels.EmptyLabels()
 			}
-			h.wlReplaySeriesPool.Put(v[:0])
+			h.wlReplaySeriesPool.Put(v.series[:0])
 		case []record.RefSample:
 			samples := v
 			minValidTime := h.minValidTime.Load()
@@ -311,18 +335,36 @@ Outer:
 			}
 			h.wlReplaySamplesPool.Put(v)
 		case []tombstones.Stone:
-			// Tombstone records will be fairly rare, so not trying to optimise the allocations here.
-			deleteSeriesShards := make([][]chunks.HeadSeriesRef, concurrency)
 			for _, s := range v {
+				ref := chunks.HeadSeriesRef(s.Ref)
+				if r, ok := multiRef[ref]; ok {
+					ref = r
+				}
+				parent := targetStripeMap.getByID(ref)
+				if p := generations.parents[ref]; p != nil {
+					parent = p
+				}
+				if parent == nil {
+					unknownTombstoneRefs.Inc()
+					missingSeries[ref] = struct{}{}
+					continue
+				}
+				refs := []chunks.HeadSeriesRef{parent.ref}
+				for _, source := range generations.groups[parent] {
+					refs = append(refs, source.ref)
+				}
 				if len(s.Intervals) == 1 && s.Intervals[0].Mint == math.MinInt64 && s.Intervals[0].Maxt == math.MaxInt64 {
-					// This series was fully deleted at this point. This record is only done for stale series at the moment.
-					mod := uint64(s.Ref) % uint64(concurrency)
-					deleteSeriesShards[mod] = append(deleteSeriesShards[mod], chunks.HeadSeriesRef(s.Ref))
-
-					// If the series is with a different reference, try deleting that.
-					if r, ok := multiRef[chunks.HeadSeriesRef(s.Ref)]; ok {
-						mod := uint64(r) % uint64(concurrency)
-						deleteSeriesShards[mod] = append(deleteSeriesShards[mod], r)
+					// Drain earlier samples before deleting the identity. A later
+					// Series record must see the deletion, not the queued old object.
+					for i := range processors {
+						done := make(chan struct{})
+						processors[i].input <- walSubsetProcessorInputItem{barrier: done}
+						<-done
+					}
+					h.deleteSeriesByID(targetStripeMap, refs)
+					delete(generations.groups, parent)
+					for _, r := range refs {
+						delete(generations.parents, r)
 					}
 					continue
 				}
@@ -330,24 +372,12 @@ Outer:
 					if itv.Maxt < h.minValidTime.Load() {
 						continue
 					}
-					if r, ok := multiRef[chunks.HeadSeriesRef(s.Ref)]; ok {
-						// This is a tombstone for a duplicate series, so we need to keep the series record at least until this record's timestamp.
-						h.updateWALExpiry(chunks.HeadSeriesRef(s.Ref), itv.Maxt)
-						s.Ref = storage.SeriesRef(r)
+					h.updateWALExpiry(chunks.HeadSeriesRef(s.Ref), itv.Maxt)
+					// A delete applies to generations defined at this point, not
+					// to independent concurrent generations introduced later.
+					for _, r := range refs {
+						h.tombstones.AddInterval(storage.SeriesRef(r), itv)
 					}
-					if m := targetStripeMap.getByID(chunks.HeadSeriesRef(s.Ref)); m == nil {
-						unknownTombstoneRefs.Inc()
-						missingSeries[chunks.HeadSeriesRef(s.Ref)] = struct{}{}
-						continue
-					}
-					h.tombstones.AddInterval(s.Ref, itv)
-				}
-			}
-
-			for i := range concurrency {
-				if len(deleteSeriesShards[i]) > 0 {
-					processors[i].input <- walSubsetProcessorInputItem{deletedSeriesRefs: deleteSeriesShards[i]}
-					deleteSeriesShards[i] = nil
 				}
 			}
 
@@ -443,6 +473,7 @@ Outer:
 			h.wlReplayFloatHistogramsPool.Put(v[:0])
 		case []record.RefMetadata:
 			for _, m := range v {
+				originalRef := m.Ref
 				if r, ok := multiRef[m.Ref]; ok {
 					m.Ref = r
 				}
@@ -456,6 +487,19 @@ Outer:
 					Type: record.ToMetricType(m.Type),
 					Unit: m.Unit,
 					Help: m.Help,
+				}
+				if parent := generations.parents[m.Ref]; parent != nil {
+					parent.meta = s.meta
+					s = parent
+				}
+				s.needsMetadataWAL = originalRef != s.ref
+				if s.needsMetadataWAL {
+					if generations.metadataSeries == nil {
+						generations.metadataSeries = make(map[*memSeries]struct{})
+					}
+					generations.metadataSeries[s] = struct{}{}
+				} else {
+					delete(generations.metadataSeries, s)
 				}
 			}
 			clear(v) // Zero out to avoid retaining metadata strings.
@@ -482,6 +526,9 @@ Outer:
 	}
 	close(exemplarsInput)
 	wg.Wait()
+	if err := h.walReplayCtx.Err(); err != nil {
+		return err
+	}
 
 	if err := r.Err(); err != nil {
 		return fmt.Errorf("read records: %w", err)
@@ -537,9 +584,10 @@ func (h *Head) resetSeriesWithMMappedChunks(mSeries *memSeries, mmc, oooMmc []*m
 		}
 	}
 
+	oldChunks := mSeries.chunkCount()
 	h.metrics.chunksCreated.Add(float64(len(mmc) + len(oooMmc)))
-	h.metrics.chunksRemoved.Add(float64(len(mSeries.mmappedChunks)))
-	h.metrics.chunks.Add(float64(len(mmc) + len(oooMmc) - len(mSeries.mmappedChunks)))
+	h.metrics.chunksRemoved.Add(float64(oldChunks))
+	h.metrics.chunks.Add(float64(len(mmc) + len(oooMmc) - oldChunks))
 
 	if mSeries.ooo != nil {
 		h.metrics.chunksRemoved.Add(float64(len(mSeries.ooo.oooMmappedChunks)))
@@ -580,6 +628,16 @@ func (h *Head) resetSeriesWithMMappedChunks(mSeries *memSeries, mmc, oooMmc []*m
 	mSeries.nextAt = 0
 	mSeries.headChunks = nil
 	mSeries.app = nil
+	h.numStaleSeries.Sub(mSeries.staleCount())
+	mSeries.lastValue = 0
+	mSeries.lastHistogramValue = nil
+	mSeries.lastFloatHistogramValue = nil
+	if mSeries.ref != walSeriesRef {
+		// Continuation writes use the canonical ref, but the restored data
+		// belong to this replacement ref. Do not cache mixed-source chunks.
+		mSeries.uncached = true
+		h.snapshotIncompatible.Store(true)
+	}
 	return overlapped
 }
 
@@ -590,11 +648,11 @@ type walSubsetProcessor struct {
 }
 
 type walSubsetProcessorInputItem struct {
-	samples           []record.RefSample
-	histogramSamples  []histogramRecord
-	existingSeries    *memSeries
-	walSeriesRef      chunks.HeadSeriesRef
-	deletedSeriesRefs []chunks.HeadSeriesRef
+	samples          []record.RefSample
+	histogramSamples []histogramRecord
+	existingSeries   *memSeries
+	walSeriesRef     chunks.HeadSeriesRef
+	barrier          chan struct{}
 }
 
 func (wp *walSubsetProcessor) setup() {
@@ -651,6 +709,13 @@ func (wp *walSubsetProcessor) processWALSamples(h *Head, mmappedChunks, oooMmapp
 	}
 
 	for in := range wp.input {
+		if in.barrier != nil {
+			close(in.barrier)
+			continue
+		}
+		if h.walReplayCtx.Err() != nil {
+			continue
+		}
 		if in.existingSeries != nil {
 			mmc := mmappedChunks[in.walSeriesRef]
 			oooMmc := oooMmappedChunks[in.walSeriesRef]
@@ -671,14 +736,13 @@ func (wp *walSubsetProcessor) processWALSamples(h *Head, mmappedChunks, oooMmapp
 				continue
 			}
 
-			if !value.IsStaleNaN(ms.lastValue) && value.IsStaleNaN(s.V) {
-				h.numStaleSeries.Inc()
+			wasStale := ms.staleCount()
+			ok, chunkCreated := ms.append(s.ST, s.T, s.V, 0, appendChunkOpts)
+			if !ok {
+				continue
 			}
-			if value.IsStaleNaN(ms.lastValue) && !value.IsStaleNaN(s.V) {
-				h.numStaleSeries.Dec()
-			}
-
-			if _, chunkCreated := ms.append(s.ST, s.T, s.V, 0, appendChunkOpts); chunkCreated {
+			h.updateStaleCount(wasStale, ms.staleCount())
+			if chunkCreated {
 				h.metrics.chunksCreated.Inc()
 				h.metrics.chunks.Inc()
 				_ = ms.mmapChunks(h.chunkDiskMapper)
@@ -708,30 +772,19 @@ func (wp *walSubsetProcessor) processWALSamples(h *Head, mmappedChunks, oooMmapp
 			if s.t <= ms.mmMaxTime {
 				continue
 			}
-			var chunkCreated, newlyStale, staleToNonStale bool
+			var ok, chunkCreated bool
+			wasStale := ms.staleCount()
 			if s.h != nil {
-				newlyStale = value.IsStaleNaN(s.h.Sum)
-				if ms.lastHistogramValue != nil {
-					newlyStale = newlyStale && !value.IsStaleNaN(ms.lastHistogramValue.Sum)
-					staleToNonStale = value.IsStaleNaN(ms.lastHistogramValue.Sum) && !value.IsStaleNaN(s.h.Sum)
-				}
 				// TODO(krajorama,ywwg): Pass ST when available in WBL.
-				_, chunkCreated = ms.appendHistogram(0, s.t, s.h, 0, appendChunkOpts)
+				ok, chunkCreated = ms.appendHistogram(0, s.t, s.h, 0, appendChunkOpts)
 			} else {
-				newlyStale = value.IsStaleNaN(s.fh.Sum)
-				if ms.lastFloatHistogramValue != nil {
-					newlyStale = newlyStale && !value.IsStaleNaN(ms.lastFloatHistogramValue.Sum)
-					staleToNonStale = value.IsStaleNaN(ms.lastFloatHistogramValue.Sum) && !value.IsStaleNaN(s.fh.Sum)
-				}
 				// TODO(krajorama,ywwg): Pass ST when available in WBL.
-				_, chunkCreated = ms.appendFloatHistogram(0, s.t, s.fh, 0, appendChunkOpts)
+				ok, chunkCreated = ms.appendFloatHistogram(0, s.t, s.fh, 0, appendChunkOpts)
 			}
-			if newlyStale {
-				h.numStaleSeries.Inc()
+			if !ok {
+				continue
 			}
-			if staleToNonStale {
-				h.numStaleSeries.Dec()
-			}
+			h.updateStaleCount(wasStale, ms.staleCount())
 			if chunkCreated {
 				h.metrics.chunksCreated.Inc()
 				h.metrics.chunks.Inc()
@@ -748,10 +801,6 @@ func (wp *walSubsetProcessor) processWALSamples(h *Head, mmappedChunks, oooMmapp
 		select {
 		case wp.histogramsOutput <- in.histogramSamples:
 		default:
-		}
-
-		if len(in.deletedSeriesRefs) > 0 {
-			h.deleteSeriesByID(in.deletedSeriesRefs)
 		}
 	}
 	h.updateMinMaxTime(mint, maxt)
@@ -886,6 +935,7 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 				}
 				for _, sam := range samples[:m] {
 					if r, ok := multiRef[sam.Ref]; ok {
+						h.updateWALExpiry(sam.Ref, sam.T)
 						sam.Ref = r
 					}
 					mod := uint64(sam.Ref) % uint64(concurrency)
@@ -939,6 +989,7 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 				}
 				for _, sam := range samples[:m] {
 					if r, ok := multiRef[sam.Ref]; ok {
+						h.updateWALExpiry(sam.Ref, sam.T)
 						sam.Ref = r
 					}
 					mod := uint64(sam.Ref) % uint64(concurrency)
@@ -969,6 +1020,7 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 				}
 				for _, sam := range samples[:m] {
 					if r, ok := multiRef[sam.Ref]; ok {
+						h.updateWALExpiry(sam.Ref, sam.T)
 						sam.Ref = r
 					}
 					mod := uint64(sam.Ref) % uint64(concurrency)
@@ -1329,6 +1381,10 @@ const chunkSnapshotPrefix = "chunk_snapshot."
 // tombstones (a single record), and finally exemplars (>= 1 record). Exemplars are in the order they
 // were written to the circular buffer.
 func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
+	if h.snapshotIncompatible.Load() {
+		h.logger.Info("Skipping chunk snapshot with concurrent or aliased WAL series")
+		return &ChunkSnapshotStats{}, nil
+	}
 	if h.wal == nil {
 		// If we are not storing any WAL, does not make sense to take a snapshot too.
 		h.logger.Warn("skipping chunk snapshotting as WAL is disabled")
@@ -1648,7 +1704,8 @@ func (h *Head) loadChunkSnapshot(targetStripeMap *stripeSeries) (int, int, map[c
 				}
 
 				localRefSeries[csr.ref] = series
-				for {
+				// See loadWAL: during fast startup lastSeriesID is owned by live appenders.
+				for targetStripeMap == h.series {
 					seriesID := uint64(series.ref)
 					lastSeriesID := h.lastSeriesID.Load()
 					if lastSeriesID >= seriesID || h.lastSeriesID.CompareAndSwap(lastSeriesID, seriesID) {
@@ -1664,10 +1721,13 @@ func (h *Head) loadChunkSnapshot(targetStripeMap *stripeSeries) (int, int, map[c
 				series.lastValue = csr.lastValue
 				series.lastHistogramValue = csr.lastHistogramValue
 				series.lastFloatHistogramValue = csr.lastFloatHistogramValue
+				if series.lastHistogramValue != nil {
+					series.lastValue = series.lastHistogramValue.Sum
+				} else if series.lastFloatHistogramValue != nil {
+					series.lastValue = series.lastFloatHistogramValue.Sum
+				}
 
-				if value.IsStaleNaN(series.lastValue) ||
-					(series.lastHistogramValue != nil && value.IsStaleNaN(series.lastHistogramValue.Sum)) ||
-					(series.lastFloatHistogramValue != nil && value.IsStaleNaN(series.lastFloatHistogramValue.Sum)) {
+				if series.staleCount() != 0 {
 					h.numStaleSeries.Inc()
 				}
 
@@ -1811,7 +1871,9 @@ Outer:
 // Name of the file used to store the state.
 const seriesStateFilename = "series_state.json"
 
-// SeriesLifecycleState descibes the information we record in the series_state.json file.
+// SeriesLifecycleState describes an allocator high watermark and a WAL scan
+// starting point. CleanShutdown is informational; startup must still scan the
+// tail because another run may have written with fast startup disabled.
 type SeriesLifecycleState struct {
 	LastSeriesID   uint64 `json:"last_series_id"`
 	LastWALSegment int    `json:"last_wal_segment"`
@@ -1840,16 +1902,15 @@ func (h *Head) readSeriesStateFile() (SeriesLifecycleState, error) {
 }
 
 // Atomically writes the current series state to disk.
-func (h *Head) writeSeriesState(cleanShutdown bool) {
+func (h *Head) writeSeriesState(cleanShutdown bool) error {
 	if h.wal == nil {
-		return
+		return nil
 	}
 
 	// Find the last segment number by checking the wal/ directory.
 	last, _, err := h.wal.LastSegmentAndOffset()
 	if err != nil {
-		h.logger.Warn("Failed to get WAL segments for series state", "err", err)
-		last = -1
+		return fmt.Errorf("get WAL segment for series state: %w", err)
 	}
 
 	state := SeriesLifecycleState{
@@ -1863,21 +1924,21 @@ func (h *Head) writeSeriesState(cleanShutdown bool) {
 
 	f, err := os.Create(tmpPath)
 	if err != nil {
-		h.logger.Error("Failed to create temp series state file", "err", err)
-		return
+		return fmt.Errorf("create temporary series state file: %w", err)
 	}
 
 	if err := json.NewEncoder(f).Encode(state); err != nil {
-		h.logger.Error("Failed to encode series state", "err", err)
-		f.Close()
-		return
+		return errors.Join(fmt.Errorf("encode series state: %w", err), f.Close())
 	}
 
-	f.Close()
-
-	if err := os.Rename(tmpPath, path); err != nil {
-		h.logger.Error("Failed to rename the temporary series state file", "err", err)
+	if err := errors.Join(f.Sync(), f.Close()); err != nil {
+		return fmt.Errorf("sync series state file: %w", err)
 	}
+
+	if err := fileutil.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename temporary series state file: %w", err)
+	}
+	return nil
 }
 
 // runSeriesStateTicker writes the series state to disk every second.
@@ -1889,119 +1950,211 @@ func (h *Head) runSeriesStateTicker() {
 	for {
 		select {
 		case <-ticker.C:
-			h.writeSeriesState(false)
+			if err := h.writeSeriesState(false); err != nil {
+				h.logger.Error("Failed to write series state", "err", err)
+			}
 		case <-h.seriesStateQuit:
 			return
 		}
 	}
 }
 
-// findLastSeriesID performs a bounded reverse scan of WAL segments to find the highest series ID.
+// findLastSeriesID scans the checkpoint and WAL tail not covered by state.
+// Commit order is independent of allocation order, so every segment in the
+// range must be read, even after finding a series record.
 func (h *Head) findLastSeriesID(state SeriesLifecycleState, endSegment int) (uint64, error) {
-	startSegment := state.LastWALSegment
-	startSegment = max(0, startSegment)
-
-	syms := labels.NewSymbolTable()
-
-	// Iterate backwards from the newest segment to the oldest allowed segment.
-	for i := endSegment; i >= startSegment; i-- {
-		s, err := wlog.OpenReadSegment(wlog.SegmentName(h.wal.Dir(), i))
-		if os.IsNotExist(err) {
-			continue // Segment might have been deleted, we skip it.
-		}
-		if err != nil {
-			return 0, fmt.Errorf("open WAL segment %d: %w", i, err)
-		}
-
-		sr := wlog.NewSegmentBufReader(s)
-		r := wlog.NewReader(sr)
-		dec := record.NewDecoder(syms, h.logger)
-
-		var highestID chunks.HeadSeriesRef
-		var found bool
-
-		// Read the segment forwards.
+	startSegment := max(0, state.LastWALSegment)
+	highestID := state.LastSeriesID
+	dec := record.NewDecoder(labels.NewSymbolTable(), h.logger)
+	var series []record.RefSeries
+	scan := func(r *wlog.Reader) error {
 		for r.Next() {
 			rec := r.Record()
-			// We only care about Series records.
-			if dec.Type(rec) != record.Series {
+			if typ := dec.Type(rec); typ != record.Series && typ != record.ConcurrentSeries {
 				continue
 			}
-
-			series, err := dec.Series(rec, nil)
+			var err error
+			series, err = dec.Series(rec, series[:0])
 			if err != nil {
-				s.Close()
-				return 0, fmt.Errorf("decode series in segment %d: %w", i, err)
+				return fmt.Errorf("decode series: %w", err)
 			}
 			for _, ws := range series {
-				highestID = max(highestID, ws.Ref)
-				found = true
+				highestID = max(highestID, uint64(ws.Ref))
 			}
+			clear(series)
 		}
-
-		err = r.Err()
-		s.Close()
+		return r.Err()
+	}
+	checkpoint, checkpointIndex, err := wlog.LastCheckpoint(h.wal.Dir())
+	if err != nil && !errors.Is(err, record.ErrNotFound) {
+		return 0, err
+	}
+	if err == nil && checkpointIndex >= startSegment {
+		r, err := wlog.NewSegmentsReader(checkpoint)
 		if err != nil {
-			return 0, fmt.Errorf("read WAL segment %d: %w", i, err)
+			return 0, err
 		}
-
-		if found {
-			return uint64(highestID), nil
+		if err := errors.Join(scan(wlog.NewReader(r)), r.Close()); err != nil {
+			return 0, fmt.Errorf("scan checkpoint: %w", err)
+		}
+		startSegment = checkpointIndex + 1
+	}
+	firstSegment, _, err := wlog.Segments(h.wal.Dir())
+	if err != nil {
+		return 0, err
+	}
+	for i := max(startSegment, firstSegment); i <= endSegment; i++ {
+		s, err := wlog.OpenReadSegment(wlog.SegmentName(h.wal.Dir(), i))
+		if err != nil {
+			return 0, err
+		}
+		r := wlog.NewSegmentBufReader(s)
+		if err := errors.Join(scan(wlog.NewReader(r)), r.Close()); err != nil {
+			return 0, fmt.Errorf("scan WAL segment %d: %w", i, err)
 		}
 	}
-
-	// If we scanned the segments and found no series records,
-	// the ID from our state file has to be used.
-	return state.LastSeriesID, nil
+	return highestID, nil
 }
 
-// mergeWALSeries is called once the WAL replay is done, and merges the data in the WAL map, into the live scraper map.
-func (h *Head) mergeWALSeries() {
-	h.logger.Info("Starting to merge WAL series into live series")
+// mergeWALSeries folds the series replayed into the shadow walSeries map (fast startup) into the
+// live h.series map. Replay and appender transactions must have finished, and new transactions
+// and queries must remain gated. Background mmapping may still run under the series locks.
+// A historical-only series is moved over; a series seen by both is reconciled into the live
+// object. After a successful merge, subsequent calls are no-ops.
+func (h *Head) mergeWALSeries() error {
+	if h.walSeries == nil {
+		return nil
+	}
 	start := time.Now()
+	var moved, stitched int
+	var metadataSeries []*memSeries
 
-	for i := 0; i < h.walSeries.size; i++ {
-		addedSeries := make([]labels.Labels, 0)
-
-		h.series.locks[i].Lock()
-
-		// Helper function to process a single series. 
-		processWALSeries := func(hash uint64, walS *memSeries) {
-			liveS, exists := h.series.series[i][walS.ref]
-
-			if !exists {
-				// First case: The scraper hasn't seen this series yet.
-				// Move it over to the live maps.
-				h.series.series[i][walS.ref] = walS
-				h.series.hashes[i].set(hash, walS) 				
-				addedSeries = append(addedSeries, walS.lset)
-				return
+	process := func(hash uint64, walS *memSeries) error {
+		if err := h.walReplayCtx.Err(); err != nil {
+			return err
+		}
+		// setUnlessAlreadySet locks the live stripe correctly and, on a conflict, hands back the
+		// existing live series without inserting walS - exactly the move/stitch split we need.
+		liveS, created := h.series.setUnlessAlreadySet(hash, walS.lset, walS)
+		if created {
+			// Case A: live ingestion never saw this series; walS is now the live object. Its ref
+			// is safe to keep because lastSeriesID was seeded above every WAL ref.
+			h.metrics.seriesCreated.Inc()
+			h.numSeries.Inc()
+			h.postings.Add(storage.SeriesRef(walS.ref), walS.lset)
+			h.series.postCreation(walS.lset)
+			if walS.needsMetadataWAL {
+				metadataSeries = append(metadataSeries, walS)
 			}
-
-			// Other case: overlap
-			// liveS.Lock()
-			// walS.Lock()
-			
-			// TODO: Implement this: h.mergeOverlappingSeries(walS, liveS)
-			
-			// walS.Unlock()
-			// liveS.Unlock()
+			moved++
+			return nil
 		}
-
-		// Iterate conflicts first
-		for hash, all := range h.walSeries.hashes[i].conflicts {
-			for _, walS := range all {
-				processWALSeries(hash, walS)
+		// Case B: prepend walS's older history onto the live series.
+		liveS.Lock()
+		defer liveS.Unlock()
+		if err := h.mergeSeries(liveS, walS); err != nil {
+			return err
+		}
+		if liveS.meta == nil {
+			liveS.meta = walS.meta
+			if liveS.meta != nil {
+				liveS.needsMetadataWAL = true
+				metadataSeries = append(metadataSeries, liveS)
 			}
 		}
-
-		// Iterate uniques 
-		for hash, walS := range h.walSeries.hashes[i].unique {
-			processWALSeries(hash, walS)
-		}
-
-		h.series.locks[i].Unlock()
+		// The old identity still labels historical records in the WAL. Keep
+		// it in checkpoints until those records have been compacted away.
+		h.updateWALExpiry(walS.ref, walS.maxTime())
+		stitched++
+		return nil
 	}
 
-	h.logger.Info("WAL series merge completed", "duration", time.Since(start).String())
+	// walSeries is no longer written after replay, so iterating it without a lock is safe.
+	for i := 0; i < h.walSeries.size; i++ {
+		for hash, all := range h.walSeries.hashes[i].conflicts {
+			for _, walS := range all {
+				if err := process(hash, walS); err != nil {
+					return err
+				}
+			}
+		}
+		for hash, walS := range h.walSeries.hashes[i].unique {
+			if err := process(hash, walS); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := h.logReplayMetadata(metadataSeries); err != nil {
+		return err
+	}
+	h.postings.EnsureOrder(h.opts.WALReplayConcurrency)
+	h.walSeries = nil
+	h.logger.Info("WAL series merge completed", "moved", moved, "stitched", stitched, "duration", time.Since(start).String())
+	return nil
+}
+
+// prependHistory folds hist (older data, from the WAL shadow map) onto the front of s, in place.
+// The caller must hold s.Lock(); hist must no longer be referenced by anyone.
+// It returns true without changing either series when their ranges overlap.
+// Disabling OOO ingestion does not prevent two independent streams overlapping.
+func (s *memSeries) prependHistory(hist *memSeries, cdm *chunks.ChunkDiskMapper) (overlap bool) {
+	if hist.headChunks == nil && len(hist.mmappedChunks) == 0 {
+		return false // Nothing to prepend.
+	}
+	if sMin := s.minTime(); sMin != math.MinInt64 && hist.maxTime() >= sMin {
+		return true
+	}
+	if s.headChunks == nil && len(s.mmappedChunks) == 0 {
+		s.adoptChunks(hist)
+		s.uncached = true
+		return false
+	}
+	// An unowned chunk in a previously reconciled history must remain
+	// uncached when moved through another concurrent startup.
+	s.uncached = s.uncached || hist.uncached
+
+	if len(s.mmappedChunks) == 0 && s.headChunks != nil {
+		// Fast path (common: replay is far shorter than a chunk's time span, so s has only its
+		// active head chunk): link the head-chunk lists and adopt hist's mmapped chunks. No I/O.
+		for c := hist.headChunks; c != nil; c = c.prev {
+			if c.walRef == 0 && !hist.uncached {
+				c.walRef = hist.ref
+			}
+		}
+		s.headChunks.oldest().prev = hist.headChunks // hist.headChunks may be nil.
+		s.mmappedChunks = hist.mmappedChunks
+	} else {
+		// s already has mmapped chunks (or no active head chunk): hist's head chunks can't be
+		// linked without interleaving the mmapped/head tiers, so persist them and prepend hist as
+		// a pure mmapped run.
+		hist.mmapAllHeadChunks(cdm)
+		s.mmappedChunks = append(hist.mmappedChunks, s.mmappedChunks...)
+	}
+	s.firstChunkID = hist.firstChunkID
+	return false
+}
+
+// mmapAllHeadChunks persists every in-memory head chunk (including the most recent one, which the
+// regular mmapChunks keeps back for appending) and clears the head-chunk list. Only valid for a
+// series that is no longer being appended to.
+func (s *memSeries) mmapAllHeadChunks(cdm *chunks.ChunkDiskMapper) {
+	if s.headChunks == nil {
+		return
+	}
+	for i := s.headChunks.len() - 1; i >= 0; i-- {
+		chk := s.headChunks.atOffset(i)
+		chunkSeriesRef := chk.walRef
+		if chunkSeriesRef == 0 && !s.uncached {
+			chunkSeriesRef = s.ref
+		}
+		chunkRef := cdm.WriteChunk(chunkSeriesRef, chk.minTime, chk.maxTime, chk.chunk, false, handleChunkWriteError)
+		s.mmappedChunks = append(s.mmappedChunks, &mmappedChunk{
+			ref:        chunkRef,
+			numSamples: uint16(chk.chunk.NumSamples()),
+			minTime:    chk.minTime,
+			maxTime:    chk.maxTime,
+		})
+	}
+	s.headChunks = nil
 }

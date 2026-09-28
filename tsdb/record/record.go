@@ -60,12 +60,22 @@ const (
 	CustomBucketsFloatHistogramSamples Type = 10
 	// SamplesV2 is an enhanced sample record with an encoding scheme that allows storing float samples with timestamp and an optional ST per sample.
 	SamplesV2 Type = 11
+	// ConcurrentSeries defines series created while historical WAL replay was in
+	// progress. Unlike Series, duplicate labels do not supersede earlier data.
+	ConcurrentSeries Type = 12
+	// ReplayBoundary starts an independently written WAL suffix. It is written
+	// as the first record of a new segment before concurrent ingestion starts.
+	ReplayBoundary Type = 13
 )
 
 func (rt Type) String() string {
 	switch rt {
 	case Series:
 		return "series"
+	case ConcurrentSeries:
+		return "concurrent_series"
+	case ReplayBoundary:
+		return "replay_boundary"
 	case Samples:
 		return "samples"
 	case SamplesV2:
@@ -226,17 +236,17 @@ func (*Decoder) Type(rec []byte) Type {
 		return Unknown
 	}
 	switch t := Type(rec[0]); t {
-	case Series, Samples, SamplesV2, Tombstones, Exemplars, MmapMarkers, Metadata, HistogramSamples, FloatHistogramSamples, CustomBucketsHistogramSamples, CustomBucketsFloatHistogramSamples:
+	case Series, ConcurrentSeries, ReplayBoundary, Samples, SamplesV2, Tombstones, Exemplars, MmapMarkers, Metadata, HistogramSamples, FloatHistogramSamples, CustomBucketsHistogramSamples, CustomBucketsFloatHistogramSamples:
 		return t
 	}
 	return Unknown
 }
 
-// Series appends series in rec to the given slice.
+// Series appends series in a Series or ConcurrentSeries record to the given slice.
 func (d *Decoder) Series(rec []byte, series []RefSeries) ([]RefSeries, error) {
 	dec := encoding.Decbuf{B: rec}
 
-	if Type(dec.Byte()) != Series {
+	if typ := Type(dec.Byte()); typ != Series && typ != ConcurrentSeries {
 		return nil, errors.New("invalid record type")
 	}
 	for len(dec.B) > 0 && dec.Err() == nil {
@@ -740,6 +750,16 @@ func (*Encoder) Series(series []RefSeries, b []byte) []byte {
 		EncodeLabels(&buf, s.Labels)
 	}
 	return buf.Get()
+}
+
+// ConcurrentSeries appends series definitions that preserve earlier generations
+// with the same labels. The distinction belongs to the series, not to the time
+// its definition is committed: a commit may finish after replay has completed.
+func (e *Encoder) ConcurrentSeries(series []RefSeries, b []byte) []byte {
+	start := len(b)
+	b = e.Series(series, b)
+	b[start] = byte(ConcurrentSeries)
+	return b
 }
 
 // Metadata appends the encoded metadata to b and returns the resulting slice.
