@@ -24,6 +24,9 @@ Exemplar storage is implemented as a fixed size circular buffer that stores exem
 This takes a snapshot of the chunks that are in memory along with the series information when shutting down and stores it on disk. This will reduce the startup time since the memory state can now be restored with this snapshot
 and m-mapped chunks, while a WAL replay from disk is only needed for the parts of the WAL that are not part of the snapshot.
 
+Snapshots are skipped after replaying concurrent WAL generations or series aliases that the
+snapshot format cannot represent. Those runs recover from the WAL on the next startup.
+
 ## Extra scrape metrics
 
 `--enable-feature=extra-scrape-metrics`
@@ -395,3 +398,41 @@ Example query:
 ```
 
 See [the fill modifiers documentation](querying/operators.md#filling-in-missing-matches) for more details and examples.
+
+## Fast startup
+
+`--enable-feature=fast-startup`
+
+This feature uses experimental WAL records. Older Prometheus versions do not understand these
+records and can silently lose data when replaying them. Disabling the flag does not restore
+downgrade compatibility. Before downgrading, use a supported TSDB block snapshot or export to
+migrate the data into a separate directory without the experimental WAL.
+
+When enabled, Prometheus prepares on-disk chunks and establishes the series-ID allocation bound
+before accepting ingestion. It then replays historical WAL segments in the background while new
+samples are ingested. Missing state requires scanning the checkpoint and WAL to establish that
+bound; startup is not necessarily immediate.
+
+Queries, rule evaluation, readiness, and compaction remain gated until replay and merge succeed.
+After replay, existing ingestion transactions finish and new transactions wait while the two
+sets of series are stitched together. Distinct timestamps from overlapping streams are retained;
+at the same timestamp the newer startup generation wins, including across sample types.
+Replay errors prevent readiness. Shutdown can cancel replay or waiting for transactions.
+
+Fast startup trades earlier ingestion for extra replay work and memory, and does not necessarily
+reduce the time until queries become ready. Closed live chunks are still memory-mapped during
+replay. The final ingestion pause depends on cardinality, overlapping data and transaction length.
+
+Existing out-of-order data (a WBL), memory snapshots, exemplar storage, or a disabled WAL select
+ordinary synchronous initialization. Enabling out-of-order ingestion during background replay
+is rejected.
+
+In-memory chunk snapshots cannot represent mixed WAL generations or aliased series and are
+skipped after those records are replayed, even with fast startup disabled. TSDB block snapshots remain available.
+If corruption in the historical WAL precedes a concurrent-startup boundary, automatic WAL repair
+refuses to delete the later segments, which may contain acknowledged writes. Preserve the data
+directory for manual recovery in that case.
+
+This feature is mutually exclusive with a configured out-of-order time window
+(`--storage.tsdb.out-of-order-time-window` / `out_of_order_time_window`); enabling both fails at
+startup.
