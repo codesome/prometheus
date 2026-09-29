@@ -1069,7 +1069,9 @@ func (h *Head) Init(minValidTime int64) error {
 
 // InitFastStartup prepares disk chunks synchronously, then replays the WAL while
 // accepting writes. Callers must wait for WaitForWALReplay and check WALReplayError
-// before serving reads. Unsupported recovery modes use synchronous initialization.
+// before serving reads. After a failed replay, the Head keeps accepting writes but
+// never becomes readable or truncatable, so callers should stop ingestion and close
+// it. Unsupported recovery modes use synchronous initialization.
 func (h *Head) InitFastStartup(minValidTime int64) error {
 	if !h.opts.EnableFastStartup || h.wal == nil || h.wbl != nil || h.opts.EnableMemorySnapshotOnShutdown || h.opts.EnableExemplarStorage {
 		h.logger.Info("Using synchronous WAL replay", "reason", "fast startup disabled, WAL disabled, existing WBL, memory snapshots, or exemplar storage enabled")

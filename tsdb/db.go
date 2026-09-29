@@ -291,6 +291,9 @@ type Options struct {
 	FsSizeFunc FsSizeFunc
 
 	// EnableFastStartup enables scraping in parallel with WAL replay but with queries still disabled.
+	// If the background replay fails, the DB keeps accepting appends but stays unreadable, and it
+	// never compacts, applies retention or truncates the WAL. Callers must check
+	// Head().WALReplayError after Head().WaitForWALReplay and close the DB on failure.
 	EnableFastStartup bool
 }
 
