@@ -184,7 +184,6 @@ func (h *Head) Appender(context.Context) storage.Appender {
 }
 
 func (h *Head) appender() *headAppender {
-	replayRegistered := h.fastReplay && h.registerReplayAppender()
 	minValidTime := h.appendableMinValidTime()
 	appendID, cleanupAppendIDsBelow := h.iso.newAppendID(minValidTime) // Every appender gets an ID that is cleared upon commit/rollback.
 	return &headAppender{
@@ -201,7 +200,6 @@ func (h *Head) appender() *headAppender {
 			storeST:               h.opts.EnableSTStorage.Load(),
 			useXOR2:               h.opts.UseXOR2FloatEncoding(),
 			useHistogramST:        h.opts.EnableHistogramSTEncoding.Load(),
-			replayRegistered:      replayRegistered,
 		},
 	}
 }
@@ -432,7 +430,6 @@ type headAppenderBase struct {
 	storeST                         bool // Whether start-timestamp storage is enabled for this append.
 	useXOR2                         bool // Whether XOR2 encoding is used for float chunks in this append.
 	useHistogramST                  bool // Whether ST-capable histogram chunk encoding is used in this append.
-	replayRegistered                bool // Whether this appender was admitted during concurrent WAL replay.
 }
 type headAppender struct {
 	headAppenderBase
@@ -1790,9 +1787,6 @@ func (a *headAppenderBase) releasePendingCommit(s *memSeries) {
 
 // Commit writes to the WAL and adds the data to the Head.
 func (a *headAppenderBase) Commit() (err error) {
-	if a.replayRegistered {
-		defer a.releaseReplayAppender()
-	}
 	if a.closed {
 		return ErrAppenderClosed
 	}
@@ -2334,9 +2328,6 @@ func handleChunkWriteError(err error) {
 
 // Rollback removes the samples and exemplars from headAppender and writes any series to WAL.
 func (a *headAppenderBase) Rollback() (err error) {
-	if a.replayRegistered {
-		defer a.releaseReplayAppender()
-	}
 	if a.closed {
 		return ErrAppenderClosed
 	}

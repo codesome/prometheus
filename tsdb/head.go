@@ -173,13 +173,6 @@ type Head struct {
 	// chunk snapshot format. Published before ingestion, or during replay.
 	snapshotIncompatible atomic.Bool
 
-	// Appenders admitted during replay must finish before the one-time stitch.
-	// New admissions wait for walReplayDone once draining starts.
-	replayAppendersMtx     sync.Mutex
-	replayAppenders        int
-	replayAppendersDrained chan struct{}
-	replayMerging          bool
-
 	stats *HeadStats
 	reg   prometheus.Registerer
 
@@ -1135,10 +1128,6 @@ func (h *Head) InitFastStartup(minValidTime int64) error {
 		if err := h.replayDiskChunksAndWAL(); err != nil {
 			h.walReplayErr = err
 			h.logger.Error("Fast startup: Background WAL replay failed", "err", err)
-			return
-		}
-		if err := h.drainReplayAppenders(); err != nil {
-			h.walReplayErr = err
 			return
 		}
 		h.walReplayErr = h.mergeWALSeries()

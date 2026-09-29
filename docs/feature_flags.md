@@ -394,14 +394,15 @@ samples are ingested. Missing state requires scanning the checkpoint and WAL to 
 bound; startup is not necessarily immediate.
 
 Queries, rule evaluation, readiness, and compaction remain gated until replay and merge succeed.
-After replay, existing ingestion transactions finish and new transactions wait while the two
-sets of series are stitched together. Distinct timestamps from overlapping streams are retained;
+After replay, the two sets of series are stitched together one series at a time while ingestion
+continues. A series with an open ingestion transaction is stitched after that transaction ends.
+Distinct timestamps from overlapping streams are retained;
 at the same timestamp the newer startup generation wins, including across sample types.
-Replay errors prevent readiness. Shutdown can cancel replay or waiting for transactions.
+Replay errors prevent readiness. Shutdown can cancel replay or stitching.
 
 Fast startup trades earlier ingestion for extra replay work and memory, and does not necessarily
 reduce the time until queries become ready. Closed live chunks are still memory-mapped during
-replay. The final ingestion pause depends on cardinality, overlapping data and transaction length.
+replay.
 
 Existing out-of-order data (a WBL), memory snapshots, exemplar storage, or a disabled WAL select
 ordinary synchronous initialization. Enabling out-of-order ingestion during background replay

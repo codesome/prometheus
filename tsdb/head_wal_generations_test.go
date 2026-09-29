@@ -258,23 +258,24 @@ func TestHeadWALRecreatedSeriesSnapshot(t *testing.T) {
 	}
 }
 
-func TestHeadFastStartupCancelWhileDraining(t *testing.T) {
+func TestHeadFastStartupCancelWhileStitching(t *testing.T) {
 	dir := t.TempDir()
+	old, moved := labels.FromStrings("__name__", "old"), labels.FromStrings("__name__", "moved")
 	h1 := newFastStartupTestHead(t, dir, false, nil)
 	require.NoError(t, h1.Init(0))
-	fastStartupAppend(t, h1, labels.FromStrings("__name__", "old"), 100)
+	fastStartupAppend(t, h1, old, 100)
+	fastStartupAppend(t, h1, moved, 100)
 	require.NoError(t, h1.Close())
 	h2, resume := restartFastStartupPaused(t, dir)
 	a := h2.Appender(context.Background())
-	_, err := a.Append(0, labels.FromStrings("__name__", "live"), 200, 2)
+	_, err := a.Append(0, old, 200, 2)
 	require.NoError(t, err)
 	done := make(chan struct{})
 	go func() { resume(); close(done) }()
+	// The stitch has moved the other series and now waits for the transaction on old.
 	require.Eventually(t, func() bool {
-		h2.replayAppendersMtx.Lock()
-		defer h2.replayAppendersMtx.Unlock()
-		return h2.replayMerging
-	}, time.Second, time.Millisecond)
+		return h2.series.getByHash(moved.Hash(), moved) != nil
+	}, 5*time.Second, time.Millisecond)
 	// Cancel without closing the WAL so the outstanding appender can roll back.
 	h2.walReplayCancel()
 	<-done

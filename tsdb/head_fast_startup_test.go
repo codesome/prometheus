@@ -599,12 +599,14 @@ func TestHeadFastStartupGenerationRecovery(t *testing.T) {
 	}
 }
 
-func TestHeadFastStartupDrainsTransactions(t *testing.T) {
+func TestHeadFastStartupStitchWaitsForTransactions(t *testing.T) {
 	dir := t.TempDir()
 	lset := labels.FromStrings("__name__", "m")
+	other := labels.FromStrings("__name__", "other")
 	h1 := newFastStartupTestHead(t, dir, false, nil)
 	require.NoError(t, h1.Init(0))
 	fastStartupAppend(t, h1, lset, 100, 200)
+	fastStartupAppend(t, h1, other, 100)
 	require.NoError(t, h1.Close())
 	h2, resume := restartFastStartupPaused(t, dir)
 	a := h2.Appender(context.Background())
@@ -615,20 +617,22 @@ func TestHeadFastStartupDrainsTransactions(t *testing.T) {
 		resume()
 		close(done)
 	}()
+	// Series without an open transaction are stitched while it remains open.
 	require.Eventually(t, func() bool {
-		h2.replayAppendersMtx.Lock()
-		defer h2.replayAppendersMtx.Unlock()
-		return h2.replayMerging
-	}, time.Second, time.Millisecond)
-	require.ErrorIs(t, h2.WALReplayError(), ErrNotReady)
+		return h2.series.getByHash(other.Hash(), other) != nil
+	}, 5*time.Second, time.Millisecond)
+	fastStartupAppend(t, h2, other, 1000)
+	require.ErrorIs(t, h2.WALReplayError(), ErrNotReady, "m cannot be stitched before its transaction ends")
 	require.NoError(t, a.Commit())
 	<-done
 	require.NoError(t, h2.WALReplayError())
 	require.Len(t, fastStartupSamples(t, h2, "m"), 3)
+	require.Len(t, fastStartupSamples(t, h2, "other"), 2)
 	require.NoError(t, h2.Close())
 	h3 := newFastStartupTestHead(t, dir, false, nil)
 	require.NoError(t, h3.Init(0))
 	require.Len(t, fastStartupSamples(t, h3, "m"), 3)
+	require.Len(t, fastStartupSamples(t, h3, "other"), 2)
 }
 
 func BenchmarkHeadFastStartupMerge(b *testing.B) {
@@ -748,12 +752,14 @@ func BenchmarkHeadReplayAfterFastStartup(b *testing.B) {
 // BenchmarkHeadStartup includes ID scanning, WAL decoding, chunk building, a
 // first scrape of every series, and the final merge. The input has no chunk
 // cache or allocator hint, as after a crash or first enabling the feature.
+// With fast startup, it also reports the longest append of a live-only series
+// while replay and merge run.
 func BenchmarkHeadStartup(b *testing.B) {
 	const samplesPerSeries = 240
 	for _, seriesCount := range []int{10000, 100000, 1000000} {
 		for _, fast := range []bool{false, true} {
 			b.Run(fmt.Sprintf("series=%d/fast=%v", seriesCount, fast), func(b *testing.B) {
-				var firstScrape, ready time.Duration
+				var firstScrape, ready, stall time.Duration
 				for range b.N {
 					b.StopTimer()
 					dir := b.TempDir()
@@ -794,14 +800,45 @@ func BenchmarkHeadStartup(b *testing.B) {
 					}
 					require.NoError(b, a.Commit())
 					firstScrape += time.Since(start)
+					stop, worst := make(chan struct{}), make(chan time.Duration)
+					if fast {
+						go func() {
+							var longest time.Duration
+							lset := labels.FromStrings("__name__", "live_only")
+							for ts := int64(samplesPerSeries * 15000); ; ts++ {
+								select {
+								case <-stop:
+									worst <- longest
+									return
+								case <-time.After(time.Millisecond):
+								}
+								appendStart := time.Now()
+								a := h.Appender(context.Background())
+								if _, err := a.Append(0, lset, ts, 1); err != nil {
+									panic(err)
+								}
+								if err := a.Commit(); err != nil {
+									panic(err)
+								}
+								longest = max(longest, time.Since(appendStart))
+							}
+						}()
+					}
 					<-h.WaitForWALReplay()
 					require.NoError(b, h.WALReplayError())
 					ready += time.Since(start)
 					b.StopTimer()
+					if fast {
+						close(stop)
+						stall += <-worst
+					}
 					require.NoError(b, h.Close())
 				}
 				b.ReportMetric(float64(firstScrape.Nanoseconds())/float64(b.N), "first-scrape-ns/op")
 				b.ReportMetric(float64(ready.Nanoseconds())/float64(b.N), "ready-ns/op")
+				if fast {
+					b.ReportMetric(float64(stall.Nanoseconds())/float64(b.N), "max-append-ns/op")
+				}
 			})
 		}
 	}

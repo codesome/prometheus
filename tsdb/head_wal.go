@@ -2200,8 +2200,9 @@ func (h *Head) findLastSeriesID(state SeriesLifecycleState, endSegment int) (uin
 }
 
 // mergeWALSeries folds the series replayed into the shadow walSeries map (fast startup) into the
-// live h.series map. Replay and appender transactions must have finished, and new transactions
-// and queries must remain gated. Background mmapping may still run under the series locks.
+// live h.series map. Replay must have finished and queries must remain gated. Ingestion and
+// background mmapping may continue: each live series is reconciled under its lock once no
+// appender has queued samples or metadata for it.
 // A historical-only series is moved over; a series seen by both is reconciled into the live
 // object. After a successful merge, subsequent calls are no-ops.
 func (h *Head) mergeWALSeries() error {
@@ -2209,8 +2210,14 @@ func (h *Head) mergeWALSeries() error {
 		return nil
 	}
 	start := time.Now()
+	type walMergeItem struct {
+		hash uint64
+		walS *memSeries
+	}
 	var moved, stitched int
 	var metadataSeries []*memSeries
+	// Series with an open transaction, retried after the first pass.
+	var pending []walMergeItem
 
 	process := func(hash uint64, walS *memSeries) error {
 		if err := h.walReplayCtx.Err(); err != nil {
@@ -2221,6 +2228,8 @@ func (h *Head) mergeWALSeries() error {
 			// accepting writes. Drop them here instead of publishing them.
 			return nil
 		}
+		// Read before appenders can see walS.
+		needsMetadataWAL := walS.needsMetadataWAL
 		// Count walS as mmap-ready before background mmapping can see it.
 		mmapReady := walS.headChunkCount.Load() >= 2
 		if mmapReady {
@@ -2234,12 +2243,13 @@ func (h *Head) mergeWALSeries() error {
 		}
 		if created {
 			// Case A: live ingestion never saw this series; walS is now the live object. Its ref
-			// is safe to keep because lastSeriesID was seeded above every WAL ref.
+			// is safe to keep because lastSeriesID was seeded above every WAL ref. Appenders
+			// that find it from now on validate their samples against the full history.
 			h.metrics.seriesCreated.Inc()
 			h.numSeries.Inc()
 			h.postings.Add(storage.SeriesRef(walS.ref), walS.lset)
 			h.series.postCreation(walS.lset)
-			if walS.needsMetadataWAL {
+			if needsMetadataWAL {
 				metadataSeries = append(metadataSeries, walS)
 			}
 			moved++
@@ -2248,6 +2258,12 @@ func (h *Head) mergeWALSeries() error {
 		// Case B: prepend walS's older history onto the live series.
 		liveS.Lock()
 		defer liveS.Unlock()
+		if liveS.hasPendingCommit() {
+			// An appender validated queued samples or metadata against the live
+			// data alone. Its Commit must not apply them to the merged history.
+			pending = append(pending, walMergeItem{hash, walS})
+			return nil
+		}
 		wasMmapReady := liveS.headChunkCount.Load() >= 2
 		err := h.mergeSeries(liveS, walS)
 		if isMmapReady := liveS.headChunkCount.Load() >= 2; isMmapReady != wasMmapReady {
@@ -2289,6 +2305,18 @@ func (h *Head) mergeWALSeries() error {
 			}
 		}
 	}
+	for len(pending) > 0 {
+		if err := h.waitReplayRetry(); err != nil {
+			return err
+		}
+		retry := pending
+		pending = nil
+		for _, p := range retry {
+			if err := process(p.hash, p.walS); err != nil {
+				return err
+			}
+		}
+	}
 
 	if err := h.logReplayMetadata(metadataSeries); err != nil {
 		return err
@@ -2297,6 +2325,19 @@ func (h *Head) mergeWALSeries() error {
 	h.walSeries = nil
 	h.logger.Info("WAL series merge completed", "moved", moved, "stitched", stitched, "duration", time.Since(start).String())
 	return nil
+}
+
+// waitReplayRetry waits briefly for open transactions before retrying the
+// series they block, unless replay is canceled.
+func (h *Head) waitReplayRetry() error {
+	t := time.NewTimer(10 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-h.walReplayCtx.Done():
+		return h.walReplayCtx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // prependHistory folds hist (older data, from the WAL shadow map) onto the front of s, in place.

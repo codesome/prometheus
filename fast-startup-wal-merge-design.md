@@ -26,10 +26,11 @@ remaining acceptance work is listed below.
   remains incompatible with fast startup.
 - Replay the historical prefix into a shadow map; ingestion writes to a fresh
   segment. Shadow creation does not publish postings or live-series counts.
-- After replay, drain existing appender transactions before stitching. New
-  transactions wait until readiness or failure is published. Shutdown can cancel
-  the drain. This prevents buffered samples from being silently dropped by a
-  Commit against newly merged history. Feature-off appenders do not take this lock.
+- After replay, stitch one series at a time under its lock while ingestion
+  continues. Queued samples and metadata reserve their series until Commit or
+  Rollback; a series with a reservation is retried after its transaction ends, so
+  a Commit never applies samples validated against live data alone to the merged
+  history. Shutdown can cancel the retries.
 - Keep the live object/ref during stitching. Cached references remain valid.
   Build postings unordered and sort once, avoiding quadratic insertion costs.
 - Reads, readiness, rules, compaction, retention and WAL truncation require
@@ -110,8 +111,8 @@ Only series whose sources overlap are re-encoded. Their new chunks remain uncach
 for that in-memory series's lifetime, and a subsequent replay can restore normal
 caching once obsolete source aliases have expired.
 
-The drain and stitch pause admission globally. Its tail-latency cost depends on
-cardinality, overlap and transaction length; this must be measured before rollout.
+The stitch does not pause ingestion. Appends to a series briefly wait for its
+lock while that series is stitched, which takes longer when its sources overlap.
 
 ## Corruption and interrupted startup
 

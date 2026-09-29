@@ -30,53 +30,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 )
 
-func (h *Head) registerReplayAppender() bool {
-	select {
-	case <-h.walReplayDone:
-		return false
-	default:
-	}
-	h.replayAppendersMtx.Lock()
-	if h.replayMerging {
-		h.replayAppendersMtx.Unlock()
-		<-h.walReplayDone
-		return false
-	}
-	h.replayAppenders++
-	h.replayAppendersMtx.Unlock()
-	return true
-}
-
-func (a *headAppenderBase) releaseReplayAppender() {
-	if !a.replayRegistered {
-		return
-	}
-	a.replayRegistered = false
-	h := a.head
-	h.replayAppendersMtx.Lock()
-	h.replayAppenders--
-	if h.replayMerging && h.replayAppenders == 0 {
-		close(h.replayAppendersDrained)
-	}
-	h.replayAppendersMtx.Unlock()
-}
-
-func (h *Head) drainReplayAppenders() error {
-	h.replayAppendersMtx.Lock()
-	h.replayMerging = true
-	h.replayAppendersDrained = make(chan struct{})
-	if h.replayAppenders == 0 {
-		close(h.replayAppendersDrained)
-	}
-	h.replayAppendersMtx.Unlock()
-	select {
-	case <-h.replayAppendersDrained:
-		return nil
-	case <-h.walReplayCtx.Done():
-		return h.walReplayCtx.Err()
-	}
-}
-
 // walReplayGenerations belongs to the replay controller and survives segment
 // boundaries. Workers see source series through the ID index, never this map.
 // Separate sources are essential: their samples can interleave in WAL order.
@@ -229,32 +182,64 @@ func (g *walReplayGenerations) finish(h *Head, target *stripeSeries, multiRef ma
 }
 
 // logReplayMetadata makes metadata independent of expiring source aliases.
-// Ingestion must be stopped. A repaired WAL prefix must call this after repair,
-// otherwise repair could discard the newly written records.
+// It may run concurrently with ingestion. Each record is logged while its series
+// are locked, so that a later metadata update is logged after it, and a series
+// with an open transaction is retried once that finishes. A repaired WAL prefix
+// must call this after repair, otherwise repair could discard the new records.
 func (h *Head) logReplayMetadata(series []*memSeries) error {
 	if len(series) == 0 || h.wal == nil {
 		return nil
 	}
+	// Locking a series twice below would deadlock.
+	slices.SortFunc(series, func(a, b *memSeries) int { return cmp.Compare(a.ref, b.ref) })
+	series = slices.Compact(series)
 	buf := h.getBytesBuffer()
 	defer func() { h.putBytesBuffer(buf) }()
 	enc := record.Encoder{}
 	refs := make([]record.RefMetadata, 0, min(len(series), 5000))
+	logged := make([]*memSeries, 0, cap(refs))
+	var busy []*memSeries
 	for len(series) > 0 {
-		n := min(len(series), 5000)
-		refs = refs[:0]
-		for _, s := range series[:n] {
-			refs = append(refs, record.RefMetadata{
-				Ref: s.ref, Type: record.GetMetricType(s.meta.Type), Unit: s.meta.Unit, Help: s.meta.Help,
-			})
+		batch := series[:min(len(series), 5000)]
+		series = series[len(batch):]
+		refs, logged = refs[:0], logged[:0]
+		for _, s := range batch {
+			s.Lock()
+			switch {
+			case !s.needsMetadataWAL:
+				// An appender has committed newer metadata since.
+			case s.hasPendingCommit():
+				// An appender may have logged newer metadata without applying it yet.
+				busy = append(busy, s)
+			default:
+				refs = append(refs, record.RefMetadata{
+					Ref: s.ref, Type: record.GetMetricType(s.meta.Type), Unit: s.meta.Unit, Help: s.meta.Help,
+				})
+				logged = append(logged, s)
+			}
 		}
-		buf = enc.Metadata(refs, buf[:0])
-		if err := h.wal.Log(buf); err != nil {
+		var err error
+		if len(refs) > 0 {
+			buf = enc.Metadata(refs, buf[:0])
+			err = h.wal.Log(buf)
+		}
+		if err == nil {
+			for _, s := range logged {
+				s.needsMetadataWAL = false
+			}
+		}
+		for _, s := range batch {
+			s.Unlock()
+		}
+		if err != nil {
 			return fmt.Errorf("persist reconciled metadata: %w", err)
 		}
-		for _, s := range series[:n] {
-			s.needsMetadataWAL = false
+		if len(series) == 0 && len(busy) > 0 {
+			if err := h.waitReplayRetry(); err != nil {
+				return err
+			}
+			series, busy = busy, nil
 		}
-		series = series[n:]
 	}
 	return nil
 }
