@@ -527,6 +527,62 @@ func (w *WL) Repair(origErr error) error {
 	return w.setSegment(s)
 }
 
+// RepairHistory repairs a corruption in segments up to and including last,
+// while the WL keeps writing to a later segment. Like Repair, it discards all
+// records from the corruption up to the end of segment last. Later segments are
+// kept. Segments are truncated rather than deleted, so indices stay sequential.
+func (w *WL) RepairHistory(origErr error, last int) error {
+	var cerr *CorruptionErr
+	if !errors.As(origErr, &cerr) {
+		return fmt.Errorf("cannot handle error: %w", origErr)
+	}
+	if cerr.Segment < 0 || cerr.Segment > last {
+		return fmt.Errorf("corruption is not in segments up to %d: %w", last, origErr)
+	}
+	w.mtx.RLock()
+	active := w.segment.Index()
+	w.mtx.RUnlock()
+	if active <= last {
+		return fmt.Errorf("cannot repair active segment %d", active)
+	}
+	w.logger.Warn("Starting corruption repair of segments before the active one",
+		"segment", cerr.Segment, "offset", cerr.Offset, "last", last)
+
+	// Find the end of the last complete record before the corruption.
+	f, err := OpenReadSegment(SegmentName(w.Dir(), cerr.Segment))
+	if err != nil {
+		return err
+	}
+	r := NewReader(bufio.NewReader(f))
+	var end int64
+	for r.Next() && r.Offset() < cerr.Offset {
+		end = r.Offset()
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// Empty later segments first. If this is interrupted, the corruption
+	// remains and the next repair starts over.
+	for i := last; i >= cerr.Segment; i-- {
+		size := int64(0)
+		if i == cerr.Segment {
+			size = end
+		}
+		if err := truncateSegment(SegmentName(w.Dir(), i), size); err != nil {
+			return fmt.Errorf("truncate segment %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func truncateSegment(name string, size int64) error {
+	f, err := os.OpenFile(name, os.O_WRONLY, 0o666)
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Truncate(size), f.Sync(), f.Close())
+}
+
 // SegmentName builds a segment name for the directory.
 func SegmentName(dir string, i int) string {
 	return filepath.Join(dir, fmt.Sprintf("%08d", i))
