@@ -119,7 +119,7 @@ type Head struct {
 	// All series addressable by their ID or hash.
 	series *stripeSeries
 
-	// A temporary map used exclusively during WAL replay.
+	// A temporary map used exclusively during background WAL replay, nil otherwise.
 	// It is merged into 'series' at the end of the replay.
 	walSeries *stripeSeries
 
@@ -426,7 +426,7 @@ func (h *Head) resetInMemoryState() error {
 
 	h.series = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
 
-	if h.opts.EnableFastStartup {
+	if h.fastReplay {
 		h.walSeries = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
 	}
 
@@ -1120,6 +1120,7 @@ func (h *Head) InitFastStartup(minValidTime int64) error {
 		}
 	}
 	h.fastReplay = true
+	h.walSeries = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
 	h.snapshotIncompatible.Store(true)
 	h.walReplayPrepared = make(chan struct{})
 

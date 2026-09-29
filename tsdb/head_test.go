@@ -11213,6 +11213,7 @@ func TestHeadFastStartupMergeStitch(t *testing.T) {
 	lset := labels.FromStrings("__name__", "m")
 
 	// Simulate WAL replay: create the series in the shadow map with older samples.
+	h.walSeries = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
 	walS, _, err := h.getOrCreateInStripe(h.walSeries, 1, lset.Hash(), lset, false)
 	require.NoError(t, err)
 	cOpts := chunkOpts{chunkDiskMapper: h.chunkDiskMapper, chunkRange: h.chunkRange.Load(), samplesPerChunk: h.opts.SamplesPerChunk}

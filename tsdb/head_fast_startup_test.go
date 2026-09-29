@@ -236,6 +236,7 @@ func TestHeadFastStartupFallbacks(t *testing.T) {
 			h1, w := newTestHeadWithOptions(t, compression.None, opts)
 			require.NoError(t, h1.InitFastStartup(0))
 			require.False(t, h1.fastReplay)
+			require.Nil(t, h1.walSeries, "synchronous replay does not need the shadow map")
 			lset := labels.FromStrings("__name__", "m")
 			appendSample := func(h *Head, ts int64) {
 				a := h.Appender(context.Background())
@@ -629,6 +630,7 @@ func BenchmarkHeadFastStartupMerge(b *testing.B) {
 				opts.WALReplayConcurrency = 1
 				h, err := NewHead(nil, nil, nil, nil, opts, nil)
 				require.NoError(b, err)
+				h.walSeries = newStripeSeries(opts.StripeSize, opts.SeriesCallback)
 				cOpts := chunkOpts{chunkDiskMapper: h.chunkDiskMapper, chunkRange: h.chunkRange.Load(), samplesPerChunk: h.opts.SamplesPerChunk}
 				// Replay leaves postings unordered until the merge completes.
 				for i := 1; i <= count; i++ {
