@@ -339,6 +339,8 @@ Outer:
 			}
 			h.wlReplaySamplesPool.Put(v)
 		case []tombstones.Stone:
+			var deletedRefs []chunks.HeadSeriesRef
+			var deletedParents []*memSeries
 			for _, s := range v {
 				// A tombstone means this ref was previously allocated, even if its series record is no
 				// longer in the WAL. Advance lastSeriesID so the ref is not reissued. During fast
@@ -359,24 +361,19 @@ Outer:
 					missingSeries[ref] = struct{}{}
 					continue
 				}
+				if len(s.Intervals) == 1 && s.Intervals[0].Mint == math.MinInt64 && s.Intervals[0].Maxt == math.MaxInt64 {
+					// Stale series eviction logs one such stone per series in a single
+					// record. Delete them together after the loop.
+					deletedRefs = append(deletedRefs, parent.ref)
+					for _, source := range generations.groups[parent] {
+						deletedRefs = append(deletedRefs, source.ref)
+					}
+					deletedParents = append(deletedParents, parent)
+					continue
+				}
 				refs := []chunks.HeadSeriesRef{parent.ref}
 				for _, source := range generations.groups[parent] {
 					refs = append(refs, source.ref)
-				}
-				if len(s.Intervals) == 1 && s.Intervals[0].Mint == math.MinInt64 && s.Intervals[0].Maxt == math.MaxInt64 {
-					// Drain earlier samples before deleting the identity. A later
-					// Series record must see the deletion, not the queued old object.
-					for i := range processors {
-						done := make(chan struct{})
-						processors[i].input <- walSubsetProcessorInputItem{barrier: done}
-						<-done
-					}
-					h.deleteSeriesByID(targetStripeMap, refs)
-					delete(generations.groups, parent)
-					for _, r := range refs {
-						delete(generations.parents, r)
-					}
-					continue
 				}
 				for _, itv := range s.Intervals {
 					if itv.Maxt < h.minValidTime.Load() {
@@ -388,6 +385,25 @@ Outer:
 					for _, r := range refs {
 						h.tombstones.AddInterval(storage.SeriesRef(r), itv)
 					}
+				}
+			}
+			if len(deletedRefs) > 0 {
+				// Drain earlier samples before deleting the identities. A later
+				// Series record must see the deletion, not the queued old object.
+				barriers := make([]chan struct{}, len(processors))
+				for i := range processors {
+					barriers[i] = make(chan struct{})
+					processors[i].input <- walSubsetProcessorInputItem{barrier: barriers[i]}
+				}
+				for _, done := range barriers {
+					<-done
+				}
+				h.deleteSeriesByID(targetStripeMap, deletedRefs)
+				for _, parent := range deletedParents {
+					delete(generations.groups, parent)
+				}
+				for _, r := range deletedRefs {
+					delete(generations.parents, r)
 				}
 			}
 

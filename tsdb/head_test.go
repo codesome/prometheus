@@ -220,6 +220,9 @@ func BenchmarkLoadWLs(b *testing.B) {
 		// per native histogram sample. Each bucket adds one span entry
 		// and one bucket delta to the encoded histogram.
 		bucketsPerHistogram int
+		// The first staleSeriesPct*seriesPerBatch series in a batch are fully deleted
+		// by a single tombstone record after their samples, as stale series compaction does.
+		staleSeriesPct float64
 	}{
 		{ // Less series and more samples. 2 hour WAL with 1 second scrape interval.
 			batches:          10,
@@ -288,6 +291,12 @@ func BenchmarkLoadWLs(b *testing.B) {
 			histogramSeriesPct:  0.5,
 			bucketsPerHistogram: 8,
 		},
+		{ // Half of the series were evicted by stale series compaction.
+			batches:          10,
+			seriesPerBatch:   1000,
+			samplesPerSeries: 480,
+			staleSeriesPct:   0.5,
+		},
 	}
 
 	labelsPerSeries := 5
@@ -309,6 +318,9 @@ func BenchmarkLoadWLs(b *testing.B) {
 					name := fmt.Sprintf("batches=%d,seriesPerBatch=%d,samplesPerSeries=%d,exemplarsPerSeries=%d,mmappedChunkT=%d,oooSeriesPct=%.3f,oooSamplesPct=%.3f,oooCapMax=%d,missingSeriesPct=%.3f,stStorage=%v", c.batches, c.seriesPerBatch, c.samplesPerSeries, exemplarsPerSeries, c.mmappedChunkT, c.oooSeriesPct, c.oooSamplesPct, c.oooCapMax, missingSeriesPct, enableSTStorage)
 					if c.histogramSeriesPct > 0 {
 						name += fmt.Sprintf(",histogramSeriesPct=%.3f,bucketsPerHistogram=%d", c.histogramSeriesPct, c.bucketsPerHistogram)
+					}
+					if c.staleSeriesPct > 0 {
+						name += fmt.Sprintf(",staleSeriesPct=%.3f", c.staleSeriesPct)
 					}
 					b.Run(name,
 						func(b *testing.B) {
@@ -424,6 +436,21 @@ func BenchmarkLoadWLs(b *testing.B) {
 										buf = populateTestWL(b, wal, []any{refHistSamples}, buf, enableSTStorage)
 									}
 								}
+							}
+
+							// Write full deletions of stale series.
+							staleSeriesPerBatch := int(float64(c.seriesPerBatch) * c.staleSeriesPct)
+							var stones []tombstones.Stone
+							for j := 0; j < c.batches; j++ {
+								for k := j * c.seriesPerBatch; k < j*c.seriesPerBatch+staleSeriesPerBatch; k++ {
+									stones = append(stones, tombstones.Stone{
+										Ref:       storage.SeriesRef(k) * 101,
+										Intervals: tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}},
+									})
+								}
+							}
+							if len(stones) > 0 {
+								buf = populateTestWL(b, wal, []any{stones}, buf, enableSTStorage)
 							}
 
 							// Write mmapped chunks.

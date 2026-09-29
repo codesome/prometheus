@@ -89,6 +89,17 @@ func TestHeadConcurrentWALGenerations(t *testing.T) {
 			records: [][]byte{series(1, false), samples(1, 100), series(2, true), samples(2, 200), deleted(2, math.MinInt64, math.MaxInt64), series(3, false), samples(3, 300)},
 			want:    []int64{300},
 		},
+		"full deletions of every source in one record": {
+			records: [][]byte{
+				series(1, false), samples(1, 100), series(2, true), samples(2, 200),
+				enc.Tombstones([]tombstones.Stone{
+					{Ref: 1, Intervals: tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}}},
+					{Ref: 2, Intervals: tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}}},
+				}, nil),
+				series(3, false), samples(3, 300),
+			},
+			want: []int64{300},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
