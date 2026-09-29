@@ -2311,8 +2311,13 @@ func (s *memSeries) prependHistory(hist *memSeries, cdm *chunks.ChunkDiskMapper)
 		return true
 	}
 	if s.headChunks == nil && len(s.mmappedChunks) == 0 {
+		if !hist.uncached {
+			// Write hist's head chunks under its own ref, so that s's next
+			// sample starts a chunk s owns instead of extending hist's.
+			hist.mmapAllHeadChunks(cdm)
+		}
 		s.adoptChunks(hist)
-		s.uncached = true
+		s.uncached = s.uncached || hist.uncached
 		return false
 	}
 	// An unowned chunk in a previously reconciled history must remain

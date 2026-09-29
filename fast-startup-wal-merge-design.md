@@ -100,10 +100,15 @@ protects later feature-off runs and ordinary series recreation after compaction:
 the snapshot format does not capture source aliases. TSDB block snapshots are
 unaffected.
 
-New chunks of a reconciled series remain uncached for that in-memory series's
-lifetime. A subsequent replay can restore normal caching once obsolete source
-aliases have expired. Repeated restarts before compaction therefore do more
-decoding, including with the feature disabled; this needs workload-level testing.
+When sources do not overlap, every chunk keeps a single source. Replay folds
+older sources onto the newest one, which survives: it owns its head chunks and
+the latest data, so later appends extend chunks it owns and the next replay folds
+older sources onto it again without re-encoding. A live series with no data that
+adopts history first writes history's head chunks under their own ref.
+
+Only series whose sources overlap are re-encoded. Their new chunks remain uncached
+for that in-memory series's lifetime, and a subsequent replay can restore normal
+caching once obsolete source aliases have expired.
 
 The drain and stitch pause admission globally. Its tail-latency cost depends on
 cardinality, overlap and transaction length; this must be measured before rollout.

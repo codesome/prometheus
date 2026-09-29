@@ -504,16 +504,17 @@ func TestHeadConcurrentWALMetadataAliasExpiry(t *testing.T) {
 				enc := record.Encoder{}
 				w, err := wlog.NewSize(nil, nil, filepath.Join(dir, "wal"), 32768, compression.None)
 				require.NoError(t, err)
-				require.NoError(t, w.Log(
-					enc.Series([]record.RefSeries{{Ref: 1, Labels: lset}}, nil),
-					enc.Samples([]record.RefSample{{Ref: 1, T: 200, V: 2}}, nil),
-					enc.Metadata([]record.RefMetadata{{Ref: 1, Help: "old metadata"}}, nil),
-					enc.ConcurrentSeries([]record.RefSeries{{Ref: 2, Labels: lset}}, nil),
-					enc.Metadata([]record.RefMetadata{{Ref: 2, Help: "latest metadata", Unit: "seconds", Type: uint8(record.Gauge)}}, nil),
-				))
+				// The newer source survives. The older one carries the latest metadata update.
+				require.NoError(t, w.Log(enc.Series([]record.RefSeries{{Ref: 1, Labels: lset}}, nil)))
 				if !metadataOnly {
-					require.NoError(t, w.Log(enc.Samples([]record.RefSample{{Ref: 2, T: 100, V: 1}}, nil)))
+					require.NoError(t, w.Log(enc.Samples([]record.RefSample{{Ref: 1, T: 100, V: 1}}, nil)))
 				}
+				require.NoError(t, w.Log(
+					enc.ConcurrentSeries([]record.RefSeries{{Ref: 2, Labels: lset}}, nil),
+					enc.Samples([]record.RefSample{{Ref: 2, T: 200, V: 2}}, nil),
+					enc.Metadata([]record.RefMetadata{{Ref: 2, Help: "old metadata"}}, nil),
+					enc.Metadata([]record.RefMetadata{{Ref: 1, Help: "latest metadata", Unit: "seconds", Type: uint8(record.Gauge)}}, nil),
+				))
 				if mode == "repair" {
 					require.NoError(t, w.Log([]byte{byte(record.Samples), 1}))
 				}
@@ -553,7 +554,7 @@ func TestHeadConcurrentWALMetadataAliasExpiry(t *testing.T) {
 				// Expire the metadata's original source while retaining the series.
 				// Neither its definition nor its metadata will survive checkpointing.
 				keep := h.keepSeriesInWALCheckpointFn(150)
-				require.False(t, keep(2))
+				require.False(t, keep(1))
 				next, err := h.wal.NextSegment()
 				require.NoError(t, err)
 				_, err = wlog.Checkpoint(h.logger, h.wal, 0, next-1, keep, 150, false, true)

@@ -22,6 +22,7 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -114,6 +115,8 @@ func (g *walReplayGenerations) supersede(parent *memSeries, multiRef map[chunks.
 }
 
 func (g *walReplayGenerations) finish(h *Head, target *stripeSeries, multiRef map[chunks.HeadSeriesRef]chunks.HeadSeriesRef, persistMetadata bool) error {
+	// Parents replaced by a newer source, and the survivor replacing each.
+	replaced := make(map[chunks.HeadSeriesRef]*memSeries)
 	for parent, sources := range g.groups {
 		if target.getByID(parent.ref) != parent {
 			continue
@@ -123,7 +126,7 @@ func (g *walReplayGenerations) finish(h *Head, target *stripeSeries, multiRef ma
 		all = append(all, sources...)
 		slices.SortFunc(all, func(a, b *memSeries) int { return cmp.Compare(a.ref, b.ref) })
 		for _, s := range all {
-			// Only parent survives the fold below; it is recounted afterwards.
+			// Only one series survives the fold below; it is recounted afterwards.
 			if s.headChunkCount.Load() >= 2 {
 				target.decMmapReady(s.ref)
 			}
@@ -149,22 +152,64 @@ func (g *walReplayGenerations) finish(h *Head, target *stripeSeries, multiRef ma
 			}
 		}
 		if merged != parent {
-			parent.adoptChunks(merged)
-			// Subsequent appends use parent's WAL ref, whereas the adopted tail
-			// can contain another source. It cannot serve as a replay cache.
-			parent.uncached = true
+			// The newest source survives rather than the parent. It owns its head
+			// chunks and the latest data, so subsequent appends extend chunks it
+			// owns, and the next replay folds older sources onto it without overlap.
+			merged.replayOnly = false
+			merged.meta = parent.meta
+			if merged.meta != nil {
+				// The metadata may have been recorded under a ref that will expire.
+				merged.needsMetadataWAL = true
+				if g.metadataSeries == nil {
+					g.metadataSeries = make(map[*memSeries]struct{})
+				}
+				g.metadataSeries[merged] = struct{}{}
+			}
+			delete(g.metadataSeries, parent)
+			hash := parent.lset.Hash()
+			i := hash & uint64(target.size-1)
+			target.locks[i].Lock()
+			target.hashes[i].set(hash, merged)
+			target.locks[i].Unlock()
+			removeReplaySource(target, parent.ref)
+			replaced[parent.ref] = merged
 		}
-		if parent.headChunkCount.Load() >= 2 {
-			target.incMmapReady(parent.ref)
+		if merged.headChunkCount.Load() >= 2 {
+			target.incMmapReady(merged.ref)
 		}
 		if len(oooChunks) > 0 {
 			// OOO chunk IDs follow mapper order, not sample timestamp order.
 			slices.SortFunc(oooChunks, func(a, b *mmappedChunk) int { return cmp.Compare(a.ref, b.ref) })
-			parent.ooo = &memSeriesOOOFields{oooMmappedChunks: oooChunks}
+			merged.ooo = &memSeriesOOOFields{oooMmappedChunks: oooChunks}
 		}
-		for _, s := range sources {
-			multiRef[s.ref] = parent.ref
-			removeReplaySource(target, s.ref)
+		for _, s := range all {
+			if s != merged && s != parent {
+				multiRef[s.ref] = merged.ref
+				removeReplaySource(target, s.ref)
+			}
+		}
+	}
+	if len(replaced) > 0 {
+		// Aliases of a replaced parent, including its own ref, now resolve to the survivor.
+		for ref, to := range multiRef {
+			if s := replaced[to]; s != nil {
+				multiRef[ref] = s.ref
+			}
+		}
+		for ref, s := range replaced {
+			multiRef[ref] = s.ref
+		}
+		if target == h.series {
+			deleted := make(map[storage.SeriesRef]struct{}, len(replaced))
+			affected := make(map[labels.Label]struct{})
+			for ref, s := range replaced {
+				deleted[storage.SeriesRef(ref)] = struct{}{}
+				s.lset.Range(func(l labels.Label) { affected[l] = struct{}{} })
+			}
+			h.postings.Delete(deleted, affected)
+			for _, s := range replaced {
+				h.postings.Add(storage.SeriesRef(s.ref), s.lset)
+			}
 		}
 	}
 	for _, s := range g.discarded {

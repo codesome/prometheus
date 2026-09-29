@@ -11292,6 +11292,25 @@ func TestMemSeriesPrependHistory(t *testing.T) {
 		require.Equal(t, int64(499), live.maxTime())
 	})
 
+	t.Run("empty live series keeps chunk ownership", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist := build(h, "hist", 0, 5)
+		lset := labels.FromStrings("__name__", "live")
+		live, _, err := h.getOrCreate(lset.Hash(), lset, false)
+		require.NoError(t, err)
+
+		live.Lock()
+		require.False(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+		fastStartupAppend(t, h, lset, 100)
+
+		require.False(t, live.uncached)
+		require.Len(t, live.mmappedChunks, 1, "hist's chunk is written under its own ref")
+		require.Equal(t, 1, live.headChunks.len(), "the live sample starts a chunk the live series owns")
+		require.Equal(t, 6, countSamples(live))
+	})
+
 	t.Run("boundary overlap preserves both inputs", func(t *testing.T) {
 		h, _ := newTestHead(t, 1000, compression.None, false)
 		require.NoError(t, h.Init(0))

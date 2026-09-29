@@ -37,7 +37,9 @@ import (
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 	"github.com/prometheus/prometheus/tsdb/wlog"
@@ -580,6 +582,18 @@ func TestHeadFastStartupGenerationRecovery(t *testing.T) {
 				_, err = wlog.Checkpoint(h.logger, h.wal, first, next-1, h.keepSeriesInWALCheckpointFn(0), 0, false, true)
 				require.NoError(t, err)
 				require.NoError(t, h.Close())
+				if overlap {
+					continue
+				}
+				// Without overlap every chunk has a single source, so none may be written
+				// without an owner. Such chunks are skipped by the next replay's chunk cache.
+				cdm, err := chunks.NewChunkDiskMapper(nil, mmappedChunksDir(dir), chunkenc.NewPool(), chunks.DefaultWriteBufferSize, chunks.DefaultWriteQueueSize)
+				require.NoError(t, err)
+				require.NoError(t, cdm.IterateAllChunks(func(seriesRef chunks.HeadSeriesRef, _ chunks.ChunkDiskMapperRef, mint, maxt int64, _ uint16, _ chunkenc.Encoding, _ bool) error {
+					require.NotZero(t, seriesRef, "chunk [%d, %d] after restart %d has no owner", mint, maxt, restart)
+					return nil
+				}))
+				require.NoError(t, cdm.Close())
 			}
 		})
 	}
@@ -653,6 +667,79 @@ func BenchmarkHeadFastStartupMerge(b *testing.B) {
 				}
 				require.NoError(b, p.Err())
 				require.NoError(b, h.Close())
+			}
+		})
+	}
+}
+
+// BenchmarkHeadReplayAfterFastStartup replays a WAL with two generations of every
+// series, after a restart that folded them and ingested two more hours of samples.
+func BenchmarkHeadReplayAfterFastStartup(b *testing.B) {
+	const step = 15000
+	for _, seriesCount := range []int{1000, 10000} {
+		b.Run(fmt.Sprintf("series=%d", seriesCount), func(b *testing.B) {
+			srcDir := b.TempDir()
+			newHead := func(dir string, fast bool, cb SeriesLifecycleCallback) *Head {
+				opts := DefaultHeadOptions()
+				opts.ChunkDirRoot = dir
+				opts.EnableFastStartup = fast
+				opts.SeriesCallback = cb
+				w, err := wlog.New(nil, nil, filepath.Join(dir, "wal"), compression.Snappy)
+				require.NoError(b, err)
+				h, err := NewHead(nil, nil, w, nil, opts, nil)
+				require.NoError(b, err)
+				return h
+			}
+			lsets := make([]labels.Labels, seriesCount)
+			for i := range lsets {
+				lsets[i] = labels.FromStrings("__name__", "m", "instance", strconv.Itoa(i))
+			}
+			appendRange := func(h *Head, from, to int64) {
+				for ts := from; ts < to; ts += step {
+					a := h.Appender(context.Background())
+					for _, lset := range lsets {
+						_, err := a.Append(0, lset, ts, float64(ts))
+						require.NoError(b, err)
+					}
+					require.NoError(b, a.Commit())
+				}
+				h.mmapHeadChunks()
+			}
+			h := newHead(srcDir, false, nil)
+			require.NoError(b, h.Init(0))
+			appendRange(h, 0, 240*step)
+			require.NoError(b, h.Close())
+			// Live ingestion during a fast startup creates a second generation.
+			gate := &fastStartupReplayGate{entered: make(chan struct{}), release: make(chan struct{})}
+			h = newHead(srcDir, true, gate)
+			require.NoError(b, h.InitFastStartup(0))
+			<-gate.entered
+			appendRange(h, 240*step, 260*step)
+			close(gate.release)
+			<-h.WaitForWALReplay()
+			require.NoError(b, h.WALReplayError())
+			require.NoError(b, h.Close())
+			// An ordinary restart folds the generations and ingests two more hours.
+			h = newHead(srcDir, false, nil)
+			require.NoError(b, h.Init(0))
+			appendRange(h, 260*step, 740*step)
+			require.NoError(b, h.Close())
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				// Replay writes chunks, so every iteration starts from the same copy.
+				b.StopTimer()
+				dir := b.TempDir()
+				require.NoError(b, fileutil.CopyDirs(srcDir, dir))
+				h := newHead(dir, false, nil)
+				b.StartTimer()
+				require.NoError(b, h.Init(0))
+				b.StopTimer()
+				require.Equal(b, uint64(seriesCount), h.NumSeries())
+				require.NoError(b, h.Close())
+				require.NoError(b, os.RemoveAll(dir))
+				b.StartTimer()
 			}
 		})
 	}
