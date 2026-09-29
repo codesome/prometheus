@@ -361,39 +361,60 @@ func TestHeadConcurrentWALOutOfOrderRecovery(t *testing.T) {
 }
 
 func TestHeadConcurrentWALInterruptedReplay(t *testing.T) {
-	for _, corruptHistory := range []bool{false, true} {
-		t.Run(map[bool]string{false: "cancel", true: "historical corruption"}[corruptHistory], func(t *testing.T) {
+	for _, mode := range []string{"cancel", "undecodable record", "checksum mismatch"} {
+		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			lset := labels.FromStrings("__name__", "m")
 			h1 := newFastStartupTestHead(t, dir, false, nil)
 			require.NoError(t, h1.Init(0))
 			fastStartupAppend(t, h1, lset, 100, 200)
-			if corruptHistory {
+			switch mode {
+			case "undecodable record":
 				require.NoError(t, h1.wal.Log([]byte{byte(record.Samples), 1}))
+			case "checksum mismatch":
+				// Corrupt an older segment that the series ID scan skips.
+				fastStartupAppend(t, h1, lset, 250)
+				_, err := h1.wal.NextSegment()
+				require.NoError(t, err)
+				require.NoError(t, h1.writeSeriesState(false))
 			}
 			require.NoError(t, h1.Close())
+			if mode == "checksum mismatch" {
+				path := wlog.SegmentName(filepath.Join(dir, "wal"), 0)
+				f, err := wlog.OpenReadSegment(path)
+				require.NoError(t, err)
+				r := wlog.NewReader(wlog.NewSegmentBufReader(f))
+				require.True(t, r.Next())
+				require.True(t, r.Next())
+				start := r.Offset() // The record with the sample at 250.
+				require.NoError(t, f.Close())
+				b, err := os.ReadFile(path)
+				require.NoError(t, err)
+				b[start+8] ^= 0xff
+				require.NoError(t, os.WriteFile(path, b, 0o600))
+			}
 			h2, resume := restartFastStartupPaused(t, dir)
 			fastStartupAppend(t, h2, lset, 150, 300)
 			liveSegment, _, err := h2.wal.LastSegmentAndOffset()
 			require.NoError(t, err)
-			if !corruptHistory {
+			livePath := wlog.SegmentName(filepath.Join(dir, "wal"), liveSegment)
+			live, err := os.ReadFile(livePath)
+			require.NoError(t, err)
+			if mode == "cancel" {
 				h2.walReplayCancel()
 			}
 			resume()
-			require.Error(t, h2.WALReplayError())
-			require.NoError(t, h2.Close())
-			if corruptHistory {
-				path := wlog.SegmentName(filepath.Join(dir, "wal"), liveSegment)
-				before, err := os.ReadFile(path)
-				require.NoError(t, err)
-				db, err := Open(dir, nil, nil, DefaultOptions(), nil)
-				require.ErrorContains(t, err, "refusing WAL repair")
-				require.Nil(t, db)
-				after, err := os.ReadFile(path)
-				require.NoError(t, err)
-				require.Equal(t, before, after)
-				return
+			if mode == "cancel" {
+				require.Error(t, h2.WALReplayError())
+			} else {
+				// History from the corruption on is discarded, as synchronous repair does.
+				require.NoError(t, h2.WALReplayError())
+				require.Len(t, fastStartupSamples(t, h2, "m"), 4)
 			}
+			require.NoError(t, h2.Close())
+			after, err := os.ReadFile(livePath)
+			require.NoError(t, err)
+			require.True(t, bytes.HasPrefix(after, live), "acknowledged live writes must be kept")
 			h3 := newFastStartupTestHead(t, dir, false, nil)
 			require.NoError(t, h3.Init(0))
 			require.Len(t, fastStartupSamples(t, h3, "m"), 4)

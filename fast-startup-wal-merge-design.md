@@ -117,10 +117,15 @@ lock while that series is stitched, which takes longer when its sources overlap.
 ## Corruption and interrupted startup
 
 ReplayBoundary (type 13, no payload) is synced as the first record of the live
-segment before ingestion starts. Repair refuses to discard a suffix beyond a
-later boundary; files remain available for manual recovery. Tests cover malformed
-sample payloads with valid checksums, which pass the ID scan but fail during
-background decoding. Ordinary repair of a corrupt final tail remains supported:
+segment before ingestion starts. When background replay finds corruption in the
+history it is replaying, it discards that history from the corruption up to its
+boundary, as ordinary repair discards everything after a corruption, and serves
+the valid prefix together with the live suffix. Segments are truncated rather
+than deleted to keep indices sequential. Ordinary startup still refuses to
+discard a suffix beyond a later boundary; files remain available for manual
+recovery. Tests cover malformed sample payloads with valid checksums, which pass
+the ID scan but fail during background decoding, and checksum mismatches in
+segments the ID scan skips. Ordinary repair of a corrupt final tail remains supported:
 its valid prefix is reconciled before serving it. Interrupted replay can recover
 the historical prefix and acknowledged live suffix on the next startup. A
 subprocess test kills the writer during replay and after reconciliation, without

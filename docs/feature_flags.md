@@ -410,9 +410,11 @@ is rejected.
 
 In-memory chunk snapshots cannot represent mixed WAL generations or aliased series and are
 skipped after those records are replayed, even with fast startup disabled. TSDB block snapshots remain available.
-If corruption in the historical WAL precedes a concurrent-startup boundary, automatic WAL repair
-refuses to delete the later segments, which may contain acknowledged writes. Preserve the data
-directory for manual recovery in that case.
+If background replay finds corruption in the WAL written before startup, it discards the rest of
+that history, as ordinary WAL repair does, and keeps the segments written since startup. Startup
+without background replay still refuses to repair corruption that precedes a concurrent-startup
+boundary, since the later segments may contain acknowledged writes. Preserve the data directory
+for manual recovery in that case.
 
 This feature is mutually exclusive with a configured out-of-order time window
 (`--storage.tsdb.out-of-order-time-window` / `out_of_order_time_window`); enabling both fails at

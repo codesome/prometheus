@@ -992,6 +992,17 @@ func (h *Head) replayDiskChunksAndWAL() (replayErr error) {
 		if err := sr.Close(); err != nil {
 			h.logger.Warn("Error while closing the wal segments reader", "err", err)
 		}
+		if _, ok := errors.AsType[*wlog.CorruptionErr](err); ok && h.fastReplay {
+			// Ingestion has written acknowledged records to later segments since
+			// replay started. Discard the replayed history from the corruption on,
+			// as synchronous repair does, and continue with its valid prefix.
+			h.logger.Warn("Background WAL replay found corruption, repairing replayed segments", "err", err)
+			h.metrics.walCorruptionsTotal.Inc()
+			if err := h.wal.RepairHistory(err, h.walReplayMaxSegment); err != nil {
+				return fmt.Errorf("repair replayed WAL segments: %w", err)
+			}
+			break
+		}
 		if err != nil {
 			return err
 		}

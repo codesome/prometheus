@@ -109,6 +109,9 @@ ordinary replay continues through the boundary and processes the whole WAL.
 
 Repair must not truncate across a later replay boundary: the later segments may
 contain acknowledged writes independent of the failed historical replay. A
+background replay that finds corruption before the boundary it wrote discards
+the segments from the corruption up to that boundary, truncating rather than
+deleting them, and keeps the boundary and later segments. A
 checkpoint created from successfully decoded segments may discard boundaries.
 Corrupt checkpoints already require manual recovery.
 
