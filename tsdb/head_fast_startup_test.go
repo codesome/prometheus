@@ -629,11 +629,14 @@ func BenchmarkHeadFastStartupMerge(b *testing.B) {
 				opts.WALReplayConcurrency = 1
 				h, err := NewHead(nil, nil, nil, nil, opts, nil)
 				require.NoError(b, err)
+				cOpts := chunkOpts{chunkDiskMapper: h.chunkDiskMapper, chunkRange: h.chunkRange.Load(), samplesPerChunk: h.opts.SamplesPerChunk}
 				// Replay leaves postings unordered until the merge completes.
 				for i := 1; i <= count; i++ {
 					lset := labels.FromStrings("__name__", "m", "instance", strconv.Itoa(i))
-					_, _, err := h.getOrCreateInStripe(h.walSeries, chunks.HeadSeriesRef(i), lset.Hash(), lset, false)
+					s, _, err := h.getOrCreateInStripe(h.walSeries, chunks.HeadSeriesRef(i), lset.Hash(), lset, false)
 					require.NoError(b, err)
+					// Replay drops series without samples.
+					s.append(0, 100, 1, 0, cOpts)
 				}
 				b.StartTimer()
 				err = h.mergeWALSeries()

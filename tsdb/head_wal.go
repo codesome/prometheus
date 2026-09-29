@@ -2216,6 +2216,11 @@ func (h *Head) mergeWALSeries() error {
 		if err := h.walReplayCtx.Err(); err != nil {
 			return err
 		}
+		if walS.headChunks == nil && len(walS.mmappedChunks) == 0 && walS.ooo == nil {
+			// Synchronous replay garbage collects series without samples before
+			// accepting writes. Drop them here instead of publishing them.
+			return nil
+		}
 		// Count walS as mmap-ready before background mmapping can see it.
 		mmapReady := walS.headChunkCount.Load() >= 2
 		if mmapReady {

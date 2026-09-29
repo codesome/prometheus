@@ -11167,6 +11167,11 @@ func TestHeadFastStartupMerge(t *testing.T) {
 	require.NoError(t, h1.Init(0))
 	fastStartupAppend(t, h1, labels.FromStrings("__name__", "a"), 100, 200)
 	fastStartupAppend(t, h1, labels.FromStrings("__name__", "b"), 100, 200)
+	// A rolled back series is logged without samples. Replay must drop it, as ordinary startup does.
+	app := h1.Appender(context.Background())
+	_, err := app.Append(0, labels.FromStrings("__name__", "empty"), 100, 100)
+	require.NoError(t, err)
+	require.NoError(t, app.Rollback())
 	require.NoError(t, h1.Close())
 
 	// Second run with fast startup: replay runs in the background while we ingest live data for B
