@@ -81,6 +81,44 @@ Series records encode the labels that identifies a series and its unique ID.
 └────────────────────────────────────────────┘
 ```
 
+#### Concurrent series records (experimental)
+
+Type `15` has the same payload as a Series record (type `1`). It defines IDs
+allocated while historical WAL replay was running concurrently with ingestion.
+A definition with an existing label set adds an independent source; unlike a
+normal Series definition, it does not indicate that earlier data were compacted.
+Repeated definitions of the same concurrent ID are idempotent. Readers must keep
+samples routed by their source ID until replay finishes, since source records can
+interleave. Distinct timestamps survive reconciliation; the highest concurrent
+source ID wins conflicts at equal timestamps. Normal Series records retain their
+replacement semantics, including superseding preceding concurrent sources.
+
+Checkpoints preserve this type and retain source definitions until their samples
+expire. Metadata updates retain their relative last-update order across IDs.
+When reconciling aliases, readers must persist metadata under the surviving ID
+before allowing the metadata's original source definition to expire.
+Deletion records apply to the sources defined at that point, not future sources.
+WAL watchers may treat this record as an ordinary series definition.
+
+#### Replay boundary records (experimental)
+
+Type `16` is a single byte with no payload. It is the first record of a new WAL
+segment and is synchronized before concurrent ingestion is admitted. Replay of
+the preceding historical WAL stops before this segment. On a later restart,
+ordinary replay continues through the boundary and processes the whole WAL.
+
+Repair must not truncate across a later replay boundary: the later segments may
+contain acknowledged writes independent of the failed historical replay. A
+background replay that finds corruption before the boundary it wrote discards
+the segments from the corruption up to that boundary, truncating rather than
+deleting them, and keeps the boundary and later segments. A
+checkpoint created from successfully decoded segments may discard boundaries.
+Corrupt checkpoints already require manual recovery.
+
+Both records are experimental and are written only by fast startup. Reading them
+does not depend on enabling fast startup. Older versions may ignore these records
+and lose data; opening this WAL with an older version is unsupported.
+
 #### Sample records
 
 Sample records encode samples as a list of triples `(series_id, timestamp, value)`.

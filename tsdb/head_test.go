@@ -37,6 +37,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
@@ -46,6 +47,7 @@ import (
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
@@ -220,6 +222,9 @@ func BenchmarkLoadWLs(b *testing.B) {
 		// per native histogram sample. Each bucket adds one span entry
 		// and one bucket delta to the encoded histogram.
 		bucketsPerHistogram int
+		// The first staleSeriesPct*seriesPerBatch series in a batch are fully deleted
+		// by a single tombstone record after their samples, as stale series compaction does.
+		staleSeriesPct float64
 	}{
 		{ // Less series and more samples. 2 hour WAL with 1 second scrape interval.
 			batches:          10,
@@ -288,6 +293,12 @@ func BenchmarkLoadWLs(b *testing.B) {
 			histogramSeriesPct:  0.5,
 			bucketsPerHistogram: 8,
 		},
+		{ // Half of the series were evicted by stale series compaction.
+			batches:          10,
+			seriesPerBatch:   1000,
+			samplesPerSeries: 480,
+			staleSeriesPct:   0.5,
+		},
 	}
 
 	labelsPerSeries := 5
@@ -309,6 +320,9 @@ func BenchmarkLoadWLs(b *testing.B) {
 					name := fmt.Sprintf("batches=%d,seriesPerBatch=%d,samplesPerSeries=%d,exemplarsPerSeries=%d,mmappedChunkT=%d,oooSeriesPct=%.3f,oooSamplesPct=%.3f,oooCapMax=%d,missingSeriesPct=%.3f,stStorage=%v", c.batches, c.seriesPerBatch, c.samplesPerSeries, exemplarsPerSeries, c.mmappedChunkT, c.oooSeriesPct, c.oooSamplesPct, c.oooCapMax, missingSeriesPct, enableSTStorage)
 					if c.histogramSeriesPct > 0 {
 						name += fmt.Sprintf(",histogramSeriesPct=%.3f,bucketsPerHistogram=%d", c.histogramSeriesPct, c.bucketsPerHistogram)
+					}
+					if c.staleSeriesPct > 0 {
+						name += fmt.Sprintf(",staleSeriesPct=%.3f", c.staleSeriesPct)
 					}
 					b.Run(name,
 						func(b *testing.B) {
@@ -424,6 +438,21 @@ func BenchmarkLoadWLs(b *testing.B) {
 										buf = populateTestWL(b, wal, []any{refHistSamples}, buf, enableSTStorage)
 									}
 								}
+							}
+
+							// Write full deletions of stale series.
+							staleSeriesPerBatch := int(float64(c.seriesPerBatch) * c.staleSeriesPct)
+							var stones []tombstones.Stone
+							for j := 0; j < c.batches; j++ {
+								for k := j * c.seriesPerBatch; k < j*c.seriesPerBatch+staleSeriesPerBatch; k++ {
+									stones = append(stones, tombstones.Stone{
+										Ref:       storage.SeriesRef(k) * 101,
+										Intervals: tombstones.Intervals{{Mint: math.MinInt64, Maxt: math.MaxInt64}},
+									})
+								}
+							}
+							if len(stones) > 0 {
+								buf = populateTestWL(b, wal, []any{stones}, buf, enableSTStorage)
 							}
 
 							// Write mmapped chunks.
@@ -8001,6 +8030,61 @@ func TestHeadAppender_AppendSTZeroSample(t *testing.T) {
 	})
 }
 
+// TestHeadAppender_MetadataPendingCommit verifies that a queued metadata update
+// reserves its series until the appender commits or rolls back.
+func TestHeadAppender_MetadataPendingCommit(t *testing.T) {
+	lset := labels.FromStrings("__name__", "m")
+	meta := metadata.Metadata{Type: model.MetricTypeCounter, Unit: "seconds", Help: "Duration"}
+	for _, tc := range []struct {
+		name   string
+		update func(h *Head, ref storage.SeriesRef) (commit, rollback func() error)
+	}{
+		{name: "v1", update: func(h *Head, ref storage.SeriesRef) (func() error, func() error) {
+			app := h.Appender(t.Context())
+			_, err := app.UpdateMetadata(ref, lset, meta)
+			require.NoError(t, err)
+			return app.Commit, app.Rollback
+		}},
+		{name: "v2", update: func(h *Head, ref storage.SeriesRef) (func() error, func() error) {
+			app := h.AppenderV2(t.Context())
+			_, err := app.Append(ref, lset, 0, 200, 2, nil, nil, storage.AOptions{Metadata: meta})
+			require.NoError(t, err)
+			return app.Commit, app.Rollback
+		}},
+	} {
+		for _, commit := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/commit=%t", tc.name, commit), func(t *testing.T) {
+				opts := newTestHeadDefaultOptions(DefaultBlockDuration, false)
+				opts.EnableMetadataWALRecords = true
+				h, _ := newTestHeadWithOptions(t, compression.None, opts)
+				app := h.Appender(t.Context())
+				ref, err := app.Append(0, lset, 100, 1)
+				require.NoError(t, err)
+				require.NoError(t, app.Commit())
+				series := h.series.getByID(chunks.HeadSeriesRef(ref))
+				series.Lock()
+				series.needsMetadataWAL = true
+				series.Unlock()
+
+				commitFn, rollbackFn := tc.update(h, ref)
+				series.Lock()
+				require.NotZero(t, series.pendingCommitCount(), "a queued metadata update must reserve the series")
+				series.Unlock()
+				if commit {
+					require.NoError(t, commitFn())
+				} else {
+					require.NoError(t, rollbackFn())
+				}
+				series.Lock()
+				defer series.Unlock()
+				require.Zero(t, series.pendingCommitCount())
+				require.Zero(t, prom_testutil.ToFloat64(h.metrics.pendingCommitUnderflow))
+				require.Equal(t, !commit, series.needsMetadataWAL, "committed metadata supersedes replayed metadata")
+			})
+		}
+	}
+}
+
 // TestHeadAppender_PendingCommitUnderflowIsReportedNotFatal verifies that releasing
 // a pending-sample reservation that is not held is reported and survivable. The
 // commit must still finish: panicking here would leave the series lock held, and
@@ -10115,9 +10199,10 @@ func TestHead_FastStartupStateFile(t *testing.T) {
 	opts := newTestHeadDefaultOptions(1000, false)
 	// Enable the fast startup feature.
 	opts.EnableFastStartup = true
+	opts.EnableExemplarStorage = false
 
 	head, w := newTestHeadWithOptions(t, compression.None, opts)
-	require.NoError(t, head.Init(0))
+	require.NoError(t, head.InitFastStartup(0))
 
 	// Add a single sample to the Head.
 	app := head.Appender(context.Background())
@@ -10144,7 +10229,8 @@ func TestHead_FastStartupStateFile(t *testing.T) {
 	// The ticker should write an unclean state.
 	require.False(t, state.CleanShutdown, "ticker should write CleanShutdown: false")
 	require.Equal(t, uint64(1), state.LastSeriesID, "LastSeriesID should be 1 after adding our sample")
-	require.Equal(t, 0, state.LastWALSegment, "LastWALSegment should be 0 on a fresh WAL")
+	// Fast startup cuts a fresh WAL segment for live writes, so the sample lands in segment 1.
+	require.Equal(t, 1, state.LastWALSegment, "LastWALSegment should be 1 after the fast-startup segment cut")
 
 	// Perform a clean shutdown.
 	require.NoError(t, head.Close())
@@ -10156,7 +10242,7 @@ func TestHead_FastStartupStateFile(t *testing.T) {
 	// Calling head.Close() should put us in the clean state.
 	require.True(t, state.CleanShutdown, "Close() should write CleanShutdown: true")
 	require.Equal(t, uint64(1), state.LastSeriesID, "LastSeriesID should remain 1")
-	require.Equal(t, 0, state.LastWALSegment, "LastWALSegment should remain 0")
+	require.Equal(t, 1, state.LastWALSegment, "LastWALSegment should remain 1")
 }
 
 func TestHead_ReadSeriesStateFile(t *testing.T) {
@@ -11113,4 +11199,195 @@ func testOOORestartResetsFirstOOOChunkID(t *testing.T, scenario sampleTypeScenar
 	}
 
 	require.NoError(t, h.Close())
+}
+
+func fastStartupAppend(t testing.TB, h *Head, lset labels.Labels, ts ...int64) {
+	app := h.Appender(context.Background())
+	for _, tt := range ts {
+		_, err := app.Append(0, lset, tt, float64(tt))
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+}
+
+// TestHeadFastStartupMerge exercises merging the background WAL replay (shadow map) into the live
+// series: a WAL-only series (A) is moved over, a series seen by both (B) has its history stitched
+// onto the live data, and a live-only series (C) is left as-is.
+func TestHeadFastStartupMerge(t *testing.T) {
+	opts := newTestHeadDefaultOptions(1000, false)
+	opts.EnableFastStartup = true
+	opts.EnableExemplarStorage = false
+
+	// First run: write historical data for A and B, then close (flushing the WAL and a clean
+	// series_state.json so the second run can seed lastSeriesID).
+	h1, _ := newTestHeadWithOptions(t, compression.None, opts)
+	require.NoError(t, h1.Init(0))
+	fastStartupAppend(t, h1, labels.FromStrings("__name__", "a"), 100, 200)
+	fastStartupAppend(t, h1, labels.FromStrings("__name__", "b"), 100, 200)
+	// A rolled back series is logged without samples. Replay must drop it, as ordinary startup does.
+	app := h1.Appender(context.Background())
+	_, err := app.Append(0, labels.FromStrings("__name__", "empty"), 100, 100)
+	require.NoError(t, err)
+	require.NoError(t, app.Rollback())
+	require.NoError(t, h1.Close())
+
+	// Second run with fast startup: replay runs in the background while we ingest live data for B
+	// (also in the WAL) and C (new).
+	wal, err := wlog.NewSize(nil, nil, filepath.Join(opts.ChunkDirRoot, "wal"), 32768, compression.None)
+	require.NoError(t, err)
+	h2, err := NewHead(nil, nil, wal, nil, opts, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = h2.Close() })
+	require.NoError(t, h2.InitFastStartup(0))
+
+	// Live timestamps are kept close together so they stay inside the head's appendable window.
+	fastStartupAppend(t, h2, labels.FromStrings("__name__", "b"), 1000, 1010)
+	fastStartupAppend(t, h2, labels.FromStrings("__name__", "c"), 1000, 1010)
+
+	<-h2.WaitForWALReplay() // Blocks until the replay + merge finish.
+
+	require.Equal(t, uint64(3), h2.NumSeries())
+
+	q, err := NewBlockQuerier(h2, 0, 3000)
+	require.NoError(t, err)
+	require.Equal(t, map[string][]chunks.Sample{
+		`{__name__="a"}`: {sample{0, 100, 100, nil, nil}, sample{0, 200, 200, nil, nil}},
+		`{__name__="b"}`: {sample{0, 100, 100, nil, nil}, sample{0, 200, 200, nil, nil}, sample{0, 1000, 1000, nil, nil}, sample{0, 1010, 1010, nil, nil}},
+		`{__name__="c"}`: {sample{0, 1000, 1000, nil, nil}, sample{0, 1010, 1010, nil, nil}},
+	}, query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "__name__", ".*")))
+}
+
+// TestHeadFastStartupMergeStitch deterministically exercises the Case B stitch path through
+// mergeWALSeries and a real query: the same series exists in both the shadow WAL map (older data,
+// as if replayed) and the live map (newer data, as if scraped), so its history must be prepended
+// onto the live series and stay queryable (postings + isolation).
+func TestHeadFastStartupMergeStitch(t *testing.T) {
+	opts := newTestHeadDefaultOptions(1000, false)
+	opts.EnableFastStartup = true
+	h, _ := newTestHeadWithOptions(t, compression.None, opts)
+	require.NoError(t, h.Init(0))
+
+	lset := labels.FromStrings("__name__", "m")
+
+	// Simulate WAL replay: create the series in the shadow map with older samples.
+	h.walSeries = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
+	walS, _, err := h.getOrCreateInStripe(h.walSeries, 1, lset.Hash(), lset, false)
+	require.NoError(t, err)
+	cOpts := chunkOpts{chunkDiskMapper: h.chunkDiskMapper, chunkRange: h.chunkRange.Load(), samplesPerChunk: h.opts.SamplesPerChunk}
+	walS.Lock()
+	for _, ts := range []int64{100, 200} {
+		walS.append(0, ts, float64(ts), 0, cOpts)
+	}
+	walS.Unlock()
+	h.lastSeriesID.Store(1) // As InitFastStartup would seed it, so live series get higher refs.
+
+	// Live ingestion: same labels, newer samples, into the live map.
+	fastStartupAppend(t, h, lset, 1000, 1010)
+
+	// Real WAL replay calls updateMinMaxTime as it processes samples; mirror that so the head's min
+	// time covers the replayed history (queriers clamp their mint to h.MinTime()).
+	h.updateMinMaxTime(100, 200)
+
+	require.NoError(t, h.mergeWALSeries())
+	require.Equal(t, uint64(1), h.NumSeries())
+
+	q, err := NewBlockQuerier(h, 0, 3000)
+	require.NoError(t, err)
+	require.Equal(t, map[string][]chunks.Sample{
+		`{__name__="m"}`: {sample{0, 100, 100, nil, nil}, sample{0, 200, 200, nil, nil}, sample{0, 1000, 1000, nil, nil}, sample{0, 1010, 1010, nil, nil}},
+	}, query(t, q, labels.MustNewMatcher(labels.MatchEqual, "__name__", "m")))
+}
+
+// TestMemSeriesPrependHistory covers the chunk-stitching primitive directly: the no-mmap fast
+// path, the path where the live series already has mmapped chunks, and rejecting overlaps.
+func TestMemSeriesPrependHistory(t *testing.T) {
+	countSamples := func(s *memSeries) (n int) {
+		for _, mc := range s.mmappedChunks {
+			n += int(mc.numSamples)
+		}
+		for c := s.headChunks; c != nil; c = c.prev {
+			n += c.chunk.NumSamples()
+		}
+		return n
+	}
+	// build appends samples at [from, to) (stepping by 1) to a fresh series and mmaps its closed
+	// head chunks, so a wide range leaves mmapped chunks behind.
+	build := func(h *Head, name string, from, to int64) *memSeries {
+		lset := labels.FromStrings("__name__", name)
+		fastStartupAppend(t, h, lset, rangeSlice(from, to)...)
+		h.mmapHeadChunks()
+		return h.series.getByHash(lset.Hash(), lset)
+	}
+
+	t.Run("fast path without mmapped chunks", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist, live := build(h, "hist", 0, 5), build(h, "live", 100, 105)
+		require.Empty(t, live.mmappedChunks)
+
+		live.Lock()
+		require.False(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+
+		require.Equal(t, 10, countSamples(live))
+		require.Equal(t, int64(0), live.minTime())
+		require.Equal(t, int64(104), live.maxTime())
+	})
+
+	t.Run("live series already has mmapped chunks", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist, live := build(h, "hist", 0, 5), build(h, "live", 100, 500)
+		require.NotEmpty(t, live.mmappedChunks)
+
+		live.Lock()
+		require.False(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+
+		require.Equal(t, 405, countSamples(live))
+		require.Equal(t, int64(0), live.minTime())
+		require.Equal(t, int64(499), live.maxTime())
+	})
+
+	t.Run("empty live series keeps chunk ownership", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist := build(h, "hist", 0, 5)
+		lset := labels.FromStrings("__name__", "live")
+		live, _, err := h.getOrCreate(lset.Hash(), lset, false)
+		require.NoError(t, err)
+
+		live.Lock()
+		require.False(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+		fastStartupAppend(t, h, lset, 100)
+
+		require.False(t, live.uncached)
+		require.Len(t, live.mmappedChunks, 1, "hist's chunk is written under its own ref")
+		require.Equal(t, 1, live.headChunks.len(), "the live sample starts a chunk the live series owns")
+		require.Equal(t, 6, countSamples(live))
+	})
+
+	t.Run("boundary overlap preserves both inputs", func(t *testing.T) {
+		h, _ := newTestHead(t, 1000, compression.None, false)
+		require.NoError(t, h.Init(0))
+		hist, live := build(h, "hist", 100, 105), build(h, "live", 0, 5) // hist is newer than live.
+
+		live.Lock()
+		require.True(t, live.prependHistory(hist, h.chunkDiskMapper))
+		live.Unlock()
+
+		require.Equal(t, 5, countSamples(live))
+		require.Equal(t, 5, countSamples(hist))
+		require.Equal(t, int64(0), live.minTime())
+		require.Equal(t, int64(4), live.maxTime())
+	})
+}
+
+func rangeSlice(from, to int64) []int64 {
+	s := make([]int64, 0, to-from)
+	for i := from; i < to; i++ {
+		s = append(s, i)
+	}
+	return s
 }

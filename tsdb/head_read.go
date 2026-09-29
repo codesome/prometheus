@@ -35,11 +35,17 @@ import (
 const headChunksBufMaxCap = 256
 
 func (h *Head) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	if err := h.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.exemplars.ExemplarQuerier(ctx)
 }
 
 // Index returns an IndexReader against the block.
 func (h *Head) Index() (IndexReader, error) {
+	if err := h.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.indexRange(math.MinInt64, math.MaxInt64), nil
 }
 
@@ -479,6 +485,9 @@ func (h *headIndexReader) LabelNamesFor(ctx context.Context, series index.Postin
 
 // Chunks returns a ChunkReader against the block.
 func (h *Head) Chunks() (ChunkReader, error) {
+	if err := h.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.chunksRange(math.MinInt64, math.MaxInt64, h.iso.State(math.MinInt64, math.MaxInt64))
 }
 

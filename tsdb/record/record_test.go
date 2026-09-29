@@ -52,6 +52,12 @@ func TestRecord_EncodeDecode(t *testing.T) {
 	decSeries, err := dec.Series(enc.Series(series, nil), nil)
 	require.NoError(t, err)
 	testutil.RequireEqual(t, series, decSeries)
+	concurrent := enc.ConcurrentSeries(series, []byte{42})
+	require.Equal(t, byte(42), concurrent[0], "encoding must preserve the prefix")
+	require.Equal(t, ConcurrentSeries, dec.Type(concurrent[1:]))
+	decSeries, err = dec.Series(concurrent[1:], nil)
+	require.NoError(t, err)
+	testutil.RequireEqual(t, series, decSeries)
 
 	metadata := []RefMetadata{
 		{

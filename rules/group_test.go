@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/common/promslog"
@@ -26,7 +27,38 @@ import (
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb"
 )
+
+func TestGroup_RetryStateRestoration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		expr, err := testParser.ParseExpr("up == 0")
+		require.NoError(t, err)
+		rule := NewAlertingRule("Down", expr, time.Minute, 0, labels.EmptyLabels(), labels.EmptyLabels(), labels.EmptyLabels(), "", false, nil)
+		attempts := 0
+		querier := &storage.MockQuerier{SelectMockFunction: func(bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
+			return storage.EmptySeriesSet()
+		}}
+		group := NewGroup(GroupOptions{
+			Name: "restore", Interval: time.Second, Rules: []Rule{rule}, ShouldRestore: true,
+			EvalIterationFunc: func(context.Context, *Group, time.Time) {},
+			Opts: &ManagerOptions{Context: context.Background(), Queryable: storage.QueryableFunc(func(int64, int64) (storage.Querier, error) {
+				attempts++
+				if attempts == 1 {
+					return nil, tsdb.ErrNotReady
+				}
+				return querier, nil
+			})},
+		})
+		go group.run(context.Background())
+		time.Sleep(5 * time.Second)
+		group.stop()
+		require.Equal(t, 2, attempts)
+		require.True(t, rule.Restored())
+		require.False(t, group.shouldRestore)
+	})
+}
 
 func TestGroupEvalJSONLoggerRule(t *testing.T) {
 	expr, err := testParser.ParseExpr("up")

@@ -534,7 +534,7 @@ func (w *Watcher) readSegment(r *LiveReader, segmentNum int, onlySeries bool) er
 		w.recordsReadMetric.WithLabelValues(dec.Type(rec).String()).Inc()
 
 		switch dec.Type(rec) {
-		case record.Series:
+		case record.Series, record.ConcurrentSeries:
 			series, err = dec.Series(rec, series[:0])
 			if err != nil {
 				w.recordDecodeFailsMetric.Inc()
@@ -683,7 +683,7 @@ func (w *Watcher) readSegmentForGC(r *LiveReader, segmentNum int, _ bool) error 
 		w.recordsReadMetric.WithLabelValues(dec.Type(rec).String()).Inc()
 
 		switch dec.Type(rec) {
-		case record.Series:
+		case record.Series, record.ConcurrentSeries:
 			series, err := dec.Series(rec, series[:0])
 			if err != nil {
 				w.recordDecodeFailsMetric.Inc()

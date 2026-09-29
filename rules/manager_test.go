@@ -58,6 +58,17 @@ func TestMain(m *testing.M) {
 	prom_testutil.TolerantVerifyLeak(m)
 }
 
+func TestManagerStopBeforeRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		manager := NewManager(&ManagerOptions{Context: context.Background(), Logger: promslog.NewNopLogger()})
+		require.NoError(t, manager.Update(time.Second, []string{"fixtures/rules_multiple.yaml"}, labels.EmptyLabels(), "", nil))
+		require.NotEmpty(t, manager.RuleGroups())
+		// Fast startup may finish configuration loading, then fail or be
+		// canceled before storage is ready and Manager.Run is called.
+		manager.Stop()
+	})
+}
+
 func TestAlertingRule(t *testing.T) {
 	storage := promqltest.LoadedStorage(t, `
 		load 5m

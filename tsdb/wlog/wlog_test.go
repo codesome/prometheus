@@ -17,6 +17,7 @@ package wlog
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,11 +31,70 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/prometheus/prometheus/tsdb/fileutil"
+	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/util/compression"
 )
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
+}
+
+func TestRepairPreservesConcurrentReplaySuffix(t *testing.T) {
+	w, err := NewSize(nil, nil, t.TempDir(), 32768, compression.None)
+	require.NoError(t, err)
+	defer w.Close()
+	require.NoError(t, w.Log([]byte("history")))
+	_, err = w.NextSegment()
+	require.NoError(t, err)
+	require.NoError(t, w.Log([]byte{byte(record.ReplayBoundary)}, []byte("acknowledged live writes")))
+	before, err := os.ReadFile(SegmentName(w.Dir(), 1))
+	require.NoError(t, err)
+	require.ErrorContains(t, w.Repair(&CorruptionErr{Segment: 0, Offset: 0, Err: errors.New("invalid historical record")}), "refusing WAL repair")
+	after, err := os.ReadFile(SegmentName(w.Dir(), 1))
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	_, err = os.Stat(SegmentName(w.Dir(), 0))
+	require.NoError(t, err, "repair must fail before modifying the historical prefix")
+}
+
+func TestRepairHistory(t *testing.T) {
+	w, err := NewSize(nil, nil, t.TempDir(), 32768, compression.None)
+	require.NoError(t, err)
+	defer w.Close()
+	// Replayed history: segment 0 holds a, b and c, segments 1 and 2 hold d and e.
+	require.NoError(t, w.Log([]byte("a"), []byte("b"), []byte("c")))
+	for _, rec := range []string{"d", "e", "live"} {
+		_, err = w.NextSegment()
+		require.NoError(t, err)
+		require.NoError(t, w.Log([]byte(rec)))
+	}
+	// Report b as corrupt, as replay does for a record it cannot decode.
+	f, err := OpenReadSegment(SegmentName(w.Dir(), 0))
+	require.NoError(t, err)
+	r := NewReader(NewSegmentBufReader(f))
+	require.True(t, r.Next())
+	require.True(t, r.Next())
+	cerr := &CorruptionErr{Segment: 0, Offset: r.Offset(), Err: errors.New("invalid record")}
+	require.NoError(t, f.Close())
+
+	require.ErrorContains(t, w.RepairHistory(cerr, 3), "active segment")
+	require.Error(t, w.RepairHistory(&CorruptionErr{Segment: 3, Offset: 0, Err: cerr.Err}, 2))
+	require.NoError(t, w.RepairHistory(cerr, 2))
+	require.NoError(t, w.Log([]byte("after repair")))
+
+	sr, err := NewSegmentsReader(w.Dir())
+	require.NoError(t, err)
+	defer sr.Close()
+	r = NewReader(sr)
+	var got []string
+	for r.Next() {
+		got = append(got, string(r.Record()))
+	}
+	require.NoError(t, r.Err())
+	require.Equal(t, []string{"a", "live", "after repair"}, got, "only history from the corruption on is discarded")
+	first, last, err := Segments(w.Dir())
+	require.NoError(t, err)
+	require.Equal(t, []int{0, 3}, []int{first, last}, "segment indices stay sequential")
 }
 
 // TestWALRepair_ReadingError ensures that a repair is run for an error

@@ -20,7 +20,6 @@ import (
 	"io"
 	"log/slog"
 	"math"
-	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -120,6 +119,10 @@ type Head struct {
 	// All series addressable by their ID or hash.
 	series *stripeSeries
 
+	// A temporary map used exclusively during background WAL replay, nil otherwise.
+	// It is merged into 'series' at the end of the replay.
+	walSeries *stripeSeries
+
 	walExpiriesMtx sync.Mutex
 	walExpiries    map[chunks.HeadSeriesRef]int64 // Series no longer in the head, and what time they must be kept until.
 
@@ -148,6 +151,27 @@ type Head struct {
 	// For running the background goroutine which updates series_state.json.
 	seriesStateQuit chan struct{}
 	seriesStateWg   sync.WaitGroup
+
+	// For running the background WAL replay.
+	walReplayWg sync.WaitGroup
+
+	// For signalling when the background WAL replay finishes.
+	walReplayDone chan struct{}
+
+	// Last WAL segment the background replay may read during fast startup, captured before live
+	// ingestion begins so the replay never reads records written by live appends. -1 means no cap.
+	walReplayMaxSegment int
+
+	// Set before ingestion starts and immutable thereafter. Completion and the
+	// replay error are published by closing walReplayDone.
+	fastReplay        bool
+	walReplayErr      error
+	walReplayCtx      context.Context
+	walReplayCancel   context.CancelFunc
+	walReplayPrepared chan struct{}
+	// Concurrent generations and aliased series cannot be represented by the
+	// chunk snapshot format. Published before ingestion, or during replay.
+	snapshotIncompatible atomic.Bool
 
 	stats *HeadStats
 	reg   prometheus.Registerer
@@ -301,6 +325,12 @@ func NewHead(r prometheus.Registerer, l *slog.Logger, wal, wbl *wlog.WL, opts *H
 		return nil, fmt.Errorf("OOOCapMax of %d is invalid. must be > 0 and <= 255", capMax)
 	}
 
+	if opts.EnableFastStartup {
+		if opts.OutOfOrderTimeWindow.Load() > 0 {
+			return nil, errors.New("fast startup is disabled because OOO time window is enabled")
+		}
+	}
+
 	if opts.ChunkRange < 1 {
 		return nil, fmt.Errorf("invalid chunk range %d", opts.ChunkRange)
 	}
@@ -326,10 +356,13 @@ func NewHead(r prometheus.Registerer, l *slog.Logger, wal, wbl *wlog.WL, opts *H
 				return &memChunk{}
 			},
 		},
-		stats:           stats,
-		reg:             r,
-		seriesStateQuit: make(chan struct{}),
+		stats:               stats,
+		reg:                 r,
+		seriesStateQuit:     make(chan struct{}),
+		walReplayDone:       make(chan struct{}),
+		walReplayMaxSegment: -1,
 	}
+	h.walReplayCtx, h.walReplayCancel = context.WithCancel(context.Background())
 	if err := h.resetInMemoryState(); err != nil {
 		return nil, err
 	}
@@ -385,9 +418,15 @@ func (h *Head) resetInMemoryState() error {
 	}
 
 	h.series = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
+
+	if h.fastReplay {
+		h.walSeries = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
+	}
+
 	h.iso = newIsolation(h.opts.IsolationDisabled)
 	h.oooIso = newOOOIsolation()
 	h.numSeries.Store(0)
+	h.numStaleSeries.Store(0)
 	h.numNativeHistogramSeries.Store(0)
 	h.numNativeHistogramBuckets.Store(0)
 	h.exemplarMetrics = em
@@ -732,16 +771,14 @@ func (s *WALReplayStatus) GetWALReplayStatus() WALReplayStatus {
 
 const cardinalityCacheExpirationTime = time.Duration(30) * time.Second
 
-// Init loads data from the write ahead log and prepares the head for writes.
-// It should be called before using an appender so that it
-// limits the ingested samples to the head min valid time.
-func (h *Head) Init(minValidTime int64) error {
-	h.minValidTime.Store(minValidTime)
+func (h *Head) replayDiskChunksAndWAL() (replayErr error) {
 	defer h.resetWLReplayResources()
 	defer func() {
-		h.postings.EnsureOrder(h.opts.WALReplayConcurrency)
+		if !h.fastReplay {
+			h.postings.EnsureOrder(h.opts.WALReplayConcurrency)
+			h.gc() // Remove obsolete data after replay, before accepting writes.
+		}
 	}()
-	defer h.gc() // After loading the wal remove the obsolete data from the head.
 	defer func() {
 		// Loading of m-mapped chunks and snapshot can make the mint of the Head
 		// to go below minValidTime.
@@ -752,6 +789,11 @@ func (h *Head) Init(minValidTime int64) error {
 
 	h.logger.Info("Replaying on-disk memory mappable chunks if any")
 	start := time.Now()
+
+	targetStripeMap := h.series
+	if h.fastReplay {
+		targetStripeMap = h.walSeries
+	}
 
 	snapIdx, snapOffset := -1, 0
 	refSeries := make(map[chunks.HeadSeriesRef]*memSeries)
@@ -785,7 +827,7 @@ func (h *Head) Init(minValidTime int64) error {
 		}
 		if loadSnapshot {
 			var err error
-			snapIdx, snapOffset, refSeries, err = h.loadChunkSnapshot()
+			snapIdx, snapOffset, refSeries, err = h.loadChunkSnapshot(targetStripeMap)
 			if err == nil {
 				snapshotLoaded = true
 				chunkSnapshotLoadDuration = time.Since(start)
@@ -838,6 +880,19 @@ func (h *Head) Init(minValidTime int64) error {
 		h.logger.Info("On-disk memory mappable chunks replay completed", "duration", mmapChunkReplayDuration.String())
 	}
 
+	// Snapshot-load failure and m-map corruption both call resetInMemoryState, which replaces
+	// h.series/h.walSeries. Re-derive the target map here so the WAL replay below writes into the
+	// current map rather than a discarded one.
+	targetStripeMap = h.series
+	if h.fastReplay {
+		targetStripeMap = h.walSeries
+	}
+	// Snapshot and mmap recovery may reset the Head or remove chunk files.
+	// Finish all such work before allowing any live appender to run.
+	if h.walReplayPrepared != nil {
+		close(h.walReplayPrepared)
+	}
+
 	if h.wal == nil {
 		h.logger.Info("WAL not found")
 		return nil
@@ -858,32 +913,31 @@ func (h *Head) Init(minValidTime int64) error {
 		return fmt.Errorf("finding WAL segments: %w", e)
 	}
 
-	if h.opts.EnableFastStartup {
-		state, err := h.readSeriesStateFile()
-		if err != nil && !os.IsNotExist(err) {
-			h.logger.Warn("Failed to read series state file, skipping the fast startup", "err", err)
-		}
-		if err == nil {
-			if state.CleanShutdown {
-				h.lastSeriesID.Store(state.LastSeriesID)
-				h.logger.Info("Fast startup: clean shutdown detected, restored last series ID", "last_series_id", state.LastSeriesID)
-			} else {
-				h.logger.Info("Fast startup: unclean shutdown detected, performing WAL scan", "from_segment", state.LastWALSegment, "to_segment", endAt)
-				id, scanErr := h.findLastSeriesID(state, endAt)
-				if scanErr != nil {
-					h.logger.Error("Fast startup: WAL scan failed, skipping fast startup", "err", scanErr)
-				} else {
-					h.lastSeriesID.Store(id)
-					h.logger.Info("Fast startup: WAL scan completed", "last_series_id", id)
-				}
-			}
-		}
+	// During fast startup, don't read past the segment captured before live ingestion started;
+	// later segments hold records written by live appends and must not be replayed here.
+	if h.walReplayMaxSegment >= 0 && endAt > h.walReplayMaxSegment {
+		endAt = h.walReplayMaxSegment
 	}
 
 	h.startWALReplayStatus(startFrom, endAt)
 
 	syms := labels.NewSymbolTable() // One table for the whole WAL.
 	multiRef := map[chunks.HeadSeriesRef]chunks.HeadSeriesRef{}
+	generations := &walReplayGenerations{}
+	generationsFinished := false
+	defer func() {
+		// Synchronous startup may repair a corrupt tail and serve its valid
+		// prefix without replaying again. Reconcile that prefix before GC and
+		// index publication. Async startup never serves a partial replay.
+		if !generationsFinished && !h.fastReplay {
+			if err := generations.finish(h, targetStripeMap, multiRef, false); err != nil {
+				h.logger.Error("Cannot reconcile valid prefix of failed WAL replay", "replay_err", replayErr, "merge_err", err)
+				// Do not wrap the original corruption: repairing the WAL cannot
+				// make a partially reconciled in-memory Head safe to expose.
+				replayErr = fmt.Errorf("reconcile valid WAL prefix: %w", err)
+			}
+		}
+	}()
 	if err == nil && startFrom >= snapIdx {
 		sr, err := wlog.NewSegmentsReader(dir)
 		if err != nil {
@@ -897,7 +951,7 @@ func (h *Head) Init(minValidTime int64) error {
 
 		// A corrupted checkpoint is a hard error for now and requires user
 		// intervention. There's likely little data that can be recovered anyway.
-		if err := h.loadWAL(wlog.NewReader(sr), syms, multiRef, mmappedChunks, oooMmappedChunks, lastMmapRef); err != nil {
+		if err := h.loadWAL(wlog.NewReader(sr), syms, multiRef, mmappedChunks, oooMmappedChunks, lastMmapRef, targetStripeMap, generations); err != nil {
 			return fmt.Errorf("backfill checkpoint: %w", err)
 		}
 		h.updateWALReplayStatusRead(startFrom)
@@ -913,6 +967,9 @@ func (h *Head) Init(minValidTime int64) error {
 	}
 	// Backfill segments from the most recent checkpoint onwards.
 	for i := startFrom; i <= endAt; i++ {
+		if err := h.walReplayCtx.Err(); err != nil {
+			return err
+		}
 		walSegmentStart := time.Now()
 		s, err := wlog.OpenReadSegment(wlog.SegmentName(h.wal.Dir(), i))
 		if err != nil {
@@ -931,9 +988,20 @@ func (h *Head) Init(minValidTime int64) error {
 		if err != nil {
 			return fmt.Errorf("segment reader (offset=%d): %w", offset, err)
 		}
-		err = h.loadWAL(wlog.NewReader(sr), syms, multiRef, mmappedChunks, oooMmappedChunks, lastMmapRef)
+		err = h.loadWAL(wlog.NewReader(sr), syms, multiRef, mmappedChunks, oooMmappedChunks, lastMmapRef, targetStripeMap, generations)
 		if err := sr.Close(); err != nil {
 			h.logger.Warn("Error while closing the wal segments reader", "err", err)
+		}
+		if _, ok := errors.AsType[*wlog.CorruptionErr](err); ok && h.fastReplay {
+			// Ingestion has written acknowledged records to later segments since
+			// replay started. Discard the replayed history from the corruption on,
+			// as synchronous repair does, and continue with its valid prefix.
+			h.logger.Warn("Background WAL replay found corruption, repairing replayed segments", "err", err)
+			h.metrics.walCorruptionsTotal.Inc()
+			if err := h.wal.RepairHistory(err, h.walReplayMaxSegment); err != nil {
+				return fmt.Errorf("repair replayed WAL segments: %w", err)
+			}
+			break
 		}
 		if err != nil {
 			return err
@@ -942,6 +1010,11 @@ func (h *Head) Init(minValidTime int64) error {
 		h.updateWALReplayStatusRead(i)
 	}
 	walReplayDuration := time.Since(walReplayStart)
+	if err := generations.finish(h, targetStripeMap, multiRef, true); err != nil {
+		generationsFinished = true
+		return err
+	}
+	generationsFinished = true
 
 	wblReplayStart := time.Now()
 	if h.wbl != nil {
@@ -985,14 +1058,121 @@ func (h *Head) Init(minValidTime int64) error {
 		"total_replay_duration", totalReplayDuration.String(),
 	)
 
-	// TODO(RushabhMehta2005): Remove this 'if' block and always run the series state ticker when the feature is fully implemented.
-	if h.opts.EnableFastStartup {
-		// Start the background goroutine that writes to series_state.json.
-		h.seriesStateWg.Add(1)
-		go h.runSeriesStateTicker()
-	}
-
 	return nil
+}
+
+// Init loads data from the write ahead log and prepares the head for writes.
+// It should be called before using an appender so that it
+// limits the ingested samples to the head min valid time.
+func (h *Head) Init(minValidTime int64) error {
+	h.minValidTime.Store(minValidTime)
+	err := h.replayDiskChunksAndWAL()
+	close(h.walReplayDone)
+	return err
+}
+
+// InitFastStartup prepares disk chunks synchronously, then replays the WAL while
+// accepting writes. Callers must wait for WaitForWALReplay and check WALReplayError
+// before serving reads. After a failed replay, the Head keeps accepting writes but
+// never becomes readable or truncatable, so callers should stop ingestion and close
+// it. Unsupported recovery modes use synchronous initialization.
+func (h *Head) InitFastStartup(minValidTime int64) error {
+	if !h.opts.EnableFastStartup || h.wal == nil || h.wbl != nil || h.opts.EnableMemorySnapshotOnShutdown || h.opts.EnableExemplarStorage {
+		h.logger.Info("Using synchronous WAL replay", "reason", "fast startup disabled, WAL disabled, existing WBL, memory snapshots, or exemplar storage enabled")
+		return h.Init(minValidTime)
+	}
+	h.minValidTime.Store(minValidTime)
+
+	if h.wal != nil {
+		// Find the last WAL segment.
+		_, endAt, e := wlog.Segments(h.wal.Dir())
+		if e != nil {
+			return fmt.Errorf("finding WAL segments: %w", e)
+		}
+
+		state, err := h.readSeriesStateFile()
+		if err != nil || state.LastWALSegment < 0 || state.LastWALSegment > endAt {
+			// The file is an optimization hint, not an allocator authority. In
+			// particular, enabling the feature on an existing database is safe.
+			state = SeriesLifecycleState{}
+		}
+		// Even a clean marker can be stale after running with the feature off.
+		// Always scan the tail and include the saved high watermark: series IDs
+		// are allocated before commit, so WAL order is not allocation order.
+		id, err := h.findLastSeriesID(state, endAt)
+		if err != nil {
+			h.logger.Warn("Cannot establish series ID bound, using synchronous WAL replay", "err", err)
+			return h.Init(minValidTime)
+		}
+		h.lastSeriesID.Store(id)
+
+		// Cap the background replay at the current last segment and cut a fresh one, so that
+		// records written by live ingestion (which starts once this returns) land in a later
+		// segment and are never re-read by the replay.
+		h.walReplayMaxSegment = endAt
+		if _, err := h.wal.NextSegment(); err != nil {
+			return fmt.Errorf("cutting WAL segment for fast startup: %w", err)
+		}
+		// Old snapshots cannot describe the identities introduced below. Remove
+		// them before accepting any writes, including when snapshotting is off.
+		if err := DeleteChunkSnapshots(h.opts.ChunkDirRoot, math.MaxInt, math.MaxInt); err != nil {
+			return fmt.Errorf("remove snapshots before concurrent replay: %w", err)
+		}
+		if err := h.wal.Log([]byte{byte(record.ReplayBoundary)}); err != nil {
+			return fmt.Errorf("log replay boundary: %w", err)
+		}
+		if err := h.wal.Sync(); err != nil {
+			return fmt.Errorf("sync replay boundary: %w", err)
+		}
+	}
+	h.fastReplay = true
+	h.walSeries = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
+	h.snapshotIncompatible.Store(true)
+	h.walReplayPrepared = make(chan struct{})
+
+	// Start the background goroutine that writes to series_state.json.
+	h.seriesStateWg.Add(1)
+	go h.runSeriesStateTicker()
+
+	h.walReplayWg.Go(func() {
+		defer close(h.walReplayDone)
+		if err := h.replayDiskChunksAndWAL(); err != nil {
+			h.walReplayErr = err
+			h.logger.Error("Fast startup: Background WAL replay failed", "err", err)
+			return
+		}
+		h.walReplayErr = h.mergeWALSeries()
+		if h.walReplayErr != nil {
+			h.logger.Error("Fast startup: WAL merge failed", "err", h.walReplayErr)
+		}
+	})
+
+	select {
+	case <-h.walReplayPrepared:
+		return nil
+	case <-h.walReplayDone:
+		return h.walReplayErr
+	}
+}
+
+// WaitForWALReplay returns a channel that is closed when the WAL replay has finished.
+func (h *Head) WaitForWALReplay() <-chan struct{} {
+	return h.walReplayDone
+}
+
+// WALReplayError returns ErrNotReady while background replay is running, its
+// error if it failed, or nil after successful initialization. Receiving from
+// WaitForWALReplay alone does not imply that replay succeeded.
+func (h *Head) WALReplayError() error {
+	if !h.fastReplay {
+		return nil
+	}
+	select {
+	case <-h.walReplayDone:
+		return h.walReplayErr
+	default:
+		return ErrNotReady
+	}
 }
 
 func (h *Head) loadMmappedChunks(refSeries map[chunks.HeadSeriesRef]*memSeries) (map[chunks.HeadSeriesRef][]*mmappedChunk, map[chunks.HeadSeriesRef][]*mmappedChunk, chunks.ChunkDiskMapperRef, error) {
@@ -1002,6 +1182,11 @@ func (h *Head) loadMmappedChunks(refSeries map[chunks.HeadSeriesRef]*memSeries) 
 	if err := h.chunkDiskMapper.IterateAllChunks(func(seriesRef chunks.HeadSeriesRef, chunkRef chunks.ChunkDiskMapperRef, mint, maxt int64, numSamples uint16, encoding chunkenc.Encoding, isOOO bool) error {
 		secondLastRef = lastRef
 		lastRef = chunkRef
+		// Ref zero is reserved for reconciled chunks. Their samples belong to
+		// multiple WAL identities and must be reconstructed from those records.
+		if seriesRef == 0 {
+			return nil
+		}
 		if !isOOO && maxt < h.minValidTime.Load() {
 			return nil
 		}
@@ -1130,7 +1315,9 @@ func (h *Head) removeCorruptedMmappedChunks(err error) (map[chunks.HeadSeriesRef
 	return mmappedChunks, oooMmappedChunks, lastRef, nil
 }
 
-func (h *Head) ApplyConfig(cfg *config.Config, wbl *wlog.WL) {
+// ApplyConfig applies runtime storage settings. Enabling out-of-order ingestion
+// before background WAL replay succeeds is rejected without changing the Head.
+func (h *Head) ApplyConfig(cfg *config.Config, wbl *wlog.WL) error {
 	oooTimeWindow := int64(0)
 	if cfg.StorageConfig.TSDBConfig != nil {
 		oooTimeWindow = cfg.StorageConfig.TSDBConfig.OutOfOrderTimeWindow
@@ -1139,10 +1326,12 @@ func (h *Head) ApplyConfig(cfg *config.Config, wbl *wlog.WL) {
 		oooTimeWindow = 0
 	}
 
-	h.SetOutOfOrderTimeWindow(oooTimeWindow, wbl)
+	if err := h.SetOutOfOrderTimeWindow(oooTimeWindow, wbl); err != nil {
+		return err
+	}
 
 	if !h.opts.EnableExemplarStorage {
-		return
+		return nil
 	}
 
 	h.exemplars.(*CircularExemplarStorage).SetOutOfOrderTimeWindow(oooTimeWindow)
@@ -1155,21 +1344,27 @@ func (h *Head) ApplyConfig(cfg *config.Config, wbl *wlog.WL) {
 	newSize := h.opts.MaxExemplars.Load()
 
 	if prevSize == newSize {
-		return
+		return nil
 	}
 
 	migrated := h.exemplars.(*CircularExemplarStorage).Resize(newSize)
 	h.logger.Info("Exemplar storage resized", "from", prevSize, "to", newSize, "migrated", migrated)
+	return nil
 }
 
 // SetOutOfOrderTimeWindow updates the out of order related parameters.
 // If the Head already has a WBL set, then the wbl will be ignored.
-func (h *Head) SetOutOfOrderTimeWindow(oooTimeWindow int64, wbl *wlog.WL) {
+// Enabling out-of-order ingestion requires successful completion of WAL replay.
+func (h *Head) SetOutOfOrderTimeWindow(oooTimeWindow int64, wbl *wlog.WL) error {
+	if oooTimeWindow > 0 && h.WALReplayError() != nil {
+		return errors.New("cannot enable out-of-order ingestion before WAL replay completes successfully")
+	}
 	if oooTimeWindow > 0 && h.wbl == nil {
 		h.wbl = wbl
 	}
 
 	h.opts.OutOfOrderTimeWindow.Store(oooTimeWindow)
+	return nil
 }
 
 // PostingsCardinalityStats returns highest cardinality stats by label and value names.
@@ -1248,6 +1443,9 @@ func (h *Head) SetMinValidTime(minValidTime int64) {
 
 // Truncate removes old data before mint from the head and WAL.
 func (h *Head) Truncate(mint int64) (err error) {
+	if err := h.WALReplayError(); err != nil {
+		return err
+	}
 	initialized := h.initialized()
 	if err := h.truncateMemory(mint); err != nil {
 		return err
@@ -1821,10 +2019,16 @@ func NewRangeHeadWithIsolationDisabled(head *Head, mint, maxt int64) *RangeHead 
 }
 
 func (h *RangeHead) Index() (IndexReader, error) {
+	if err := h.head.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.head.indexRange(h.mint, h.maxt), nil
 }
 
 func (h *RangeHead) Chunks() (ChunkReader, error) {
+	if err := h.head.WALReplayError(); err != nil {
+		return nil, err
+	}
 	var isoState *isolationState
 	if !h.isolationOff {
 		isoState = h.head.iso.State(h.mint, h.maxt)
@@ -1833,7 +2037,7 @@ func (h *RangeHead) Chunks() (ChunkReader, error) {
 }
 
 func (h *RangeHead) Tombstones() (tombstones.Reader, error) {
-	return h.head.tombstones, nil
+	return h.head.Tombstones()
 }
 
 func (h *RangeHead) MinTime() int64 {
@@ -1898,6 +2102,9 @@ func NewSelectedSeriesHead(head *Head, mint, maxt int64, selectedSeriesRefs seri
 }
 
 func (h *SelectedSeriesHead) Index() (_ IndexReader, err error) {
+	if err := h.head.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.head.selectedSeriesIndex(h.mint, h.maxt, h.selectedSeriesRefs)
 }
 
@@ -1928,6 +2135,9 @@ func (h *SelectedSeriesHead) String() string {
 // Delete all samples in the range of [mint, maxt] for series that satisfy the given
 // label matchers.
 func (h *Head) Delete(ctx context.Context, mint, maxt int64, ms ...*labels.Matcher) error {
+	if err := h.WALReplayError(); err != nil {
+		return err
+	}
 	// Do not delete anything beyond the currently valid range.
 	mint, maxt = clampInterval(mint, maxt, h.MinTime(), h.MaxTime())
 
@@ -2029,6 +2239,9 @@ func (h *Head) gc() (actualInOrderMint, minOOOTime int64, minMmapFile int) {
 
 // Tombstones returns a new reader over the head's tombstones.
 func (h *Head) Tombstones() (tombstones.Reader, error) {
+	if err := h.WALReplayError(); err != nil {
+		return nil, err
+	}
 	return h.tombstones, nil
 }
 
@@ -2145,23 +2358,33 @@ func (h *Head) compactable() bool {
 		return false
 	}
 
+	// Don't compact/truncate while a background WAL replay is still merging into the live
+	// series (fast startup); doing so could truncate data the merge is about to add.
+	if h.WALReplayError() != nil {
+		return false
+	}
+
 	return h.MaxTime()-h.MinTime() > h.chunkRange.Load()/2*3
 }
 
 // Close flushes the WAL and closes the head.
 // It also takes a snapshot of in-memory chunks if enabled.
 func (h *Head) Close() error {
+	// Stop replay before closing the shared WAL and chunk mapper. Pending
+	// history remains in the WAL and will be recovered on the next startup.
+	h.walReplayCancel()
+	h.walReplayWg.Wait()
+
 	h.closedMtx.Lock()
 	defer h.closedMtx.Unlock()
 	h.closed = true
 
 	// Stop the background series_state.json writer.
-	if h.opts.EnableFastStartup && h.seriesStateQuit != nil {
+	writeState := h.opts.EnableFastStartup && h.seriesStateQuit != nil
+	if writeState {
 		close(h.seriesStateQuit)
 		h.seriesStateWg.Wait()
 		h.seriesStateQuit = nil
-		// Flush the final clean state.
-		h.writeSeriesState(true)
 	}
 
 	// mmap all but last chunk in case we're performing snapshot since that only
@@ -2177,6 +2400,10 @@ func (h *Head) Close() error {
 	}
 	if errs == nil && h.opts.EnableMemorySnapshotOnShutdown {
 		errs = errors.Join(errs, h.performChunkSnapshot())
+	}
+	if writeState {
+		// A clean marker must not precede flushing the WAL or completing replay.
+		errs = errors.Join(errs, h.writeSeriesState(errs == nil && h.walReplayErr == nil))
 	}
 	return errs
 }
@@ -2198,8 +2425,14 @@ func (h *Head) getOrCreate(hash uint64, lset labels.Labels, pendingCommit bool) 
 }
 
 // If id is zero, one will be allocated.
+// It always writes to the live h.series map.
 func (h *Head) getOrCreateWithOptionalID(id chunks.HeadSeriesRef, hash uint64, lset labels.Labels, pendingCommit bool) (*memSeries, bool, error) {
-	if preCreationErr := h.series.seriesLifecycleCallback.PreCreation(lset); preCreationErr != nil {
+	return h.getOrCreateInStripe(h.series, id, hash, lset, pendingCommit)
+}
+
+// getOrCreateInStripe allows injecting a specific stripe map like walSeries for background replay.
+func (h *Head) getOrCreateInStripe(stripeMap *stripeSeries, id chunks.HeadSeriesRef, hash uint64, lset labels.Labels, pendingCommit bool) (*memSeries, bool, error) {
+	if preCreationErr := stripeMap.seriesLifecycleCallback.PreCreation(lset); preCreationErr != nil {
 		return nil, false, preCreationErr
 	}
 	if id == 0 {
@@ -2212,10 +2445,27 @@ func (h *Head) getOrCreateWithOptionalID(id chunks.HeadSeriesRef, hash uint64, l
 		shardHash = labels.StableHash(lset)
 	}
 	optimisticallyCreatedSeries := newMemSeries(lset, id, shardHash, h.opts.IsolationDisabled, pendingCommit)
+	if stripeMap == h.series && h.fastReplay {
+		select {
+		case <-h.walReplayDone:
+			// Ingestion can finish while the server handles a replay failure.
+			// Until a successful merge, old data still need their identity.
+			optimisticallyCreatedSeries.concurrent = h.walReplayErr != nil
+		default:
+			optimisticallyCreatedSeries.concurrent = true
+		}
+	}
 
-	s, created := h.series.setUnlessAlreadySet(hash, lset, optimisticallyCreatedSeries)
+	s, created := stripeMap.setUnlessAlreadySet(hash, lset, optimisticallyCreatedSeries)
 	if !created {
 		return s, false, nil
+	}
+
+	if stripeMap != h.series {
+		// Series replayed into the shadow map during fast startup must not touch the head's
+		// shared index state (postings, series counters). mergeWALSeries applies these once,
+		// per surviving series, avoiding double-counting and races with live ingestion.
+		return s, true, nil
 	}
 
 	h.metrics.seriesCreated.Inc()
@@ -2225,7 +2475,7 @@ func (h *Head) getOrCreateWithOptionalID(id chunks.HeadSeriesRef, hash uint64, l
 
 	// Adding the series in the postings marks the creation of series
 	// as any further calls to this and the read methods would return that series.
-	h.series.postCreation(lset)
+	stripeMap.postCreation(lset)
 
 	return s, true, nil
 }
@@ -2586,8 +2836,8 @@ func (h *Head) gcSeries(seriesRefs []storage.SeriesRef, maxt int64, shouldEvict 
 }
 
 // deleteSeriesByID deletes the series with the given reference.
-// Only used for WAL replay.
-func (h *Head) deleteSeriesByID(refs []chunks.HeadSeriesRef) {
+// Only used for WAL replay, after draining workers that can access the series.
+func (h *Head) deleteSeriesByID(target *stripeSeries, refs []chunks.HeadSeriesRef) {
 	var (
 		deleted                 = map[storage.SeriesRef]struct{}{}
 		deletedForCallback      = map[chunks.HeadSeriesRef]labels.Labels{}
@@ -2596,27 +2846,32 @@ func (h *Head) deleteSeriesByID(refs []chunks.HeadSeriesRef) {
 		histogramSeriesDeleted  = 0
 		histogramBucketsDeleted = 0
 		chunksRemoved           = 0
+		publishedRemoved        = 0
 	)
 
 	for _, ref := range refs {
 		// Delete the reference from the series map.
 		// Copying getByID here to avoid locking and unlocking twice.
-		stripe := h.series.refStripe(ref)
-		h.series.locks[stripe].Lock()
-		series := h.series.series[stripe][ref]
+		stripe := target.refStripe(ref)
+		target.locks[stripe].Lock()
+		series := target.series[stripe][ref]
 		if series == nil {
-			h.series.locks[stripe].Unlock()
+			target.locks[stripe].Unlock()
 			continue
 		}
-		delete(h.series.series[stripe], series.ref)
-		h.series.locks[stripe].Unlock()
+		delete(target.series[stripe], series.ref)
+		target.locks[stripe].Unlock()
+		if !series.replayOnly {
+			publishedRemoved++
+			deletedForCallback[series.ref] = series.lset
+		}
 
 		// Delete the reference from the hash.
 		hash := series.lset.Hash()
-		hashStripe := int(hash) & (h.series.size - 1)
-		h.series.locks[hashStripe].Lock()
-		h.series.hashes[hashStripe].del(hash, series.ref)
-		h.series.locks[hashStripe].Unlock()
+		hashStripe := int(hash) & (target.size - 1)
+		target.locks[hashStripe].Lock()
+		target.hashes[hashStripe].del(hash, series.ref)
+		target.locks[hashStripe].Unlock()
 
 		// Keep the series record in checkpoints until its last sample time; while the
 		// WAL may still hold samples for this ref, they can't outlive maxt.
@@ -2639,35 +2894,34 @@ func (h *Head) deleteSeriesByID(refs []chunks.HeadSeriesRef) {
 		chunksRemoved += len(series.mmappedChunks)
 		chunksRemoved += int(headChunkCount)
 		if headChunkCount >= 2 {
-			h.series.decMmapReady(series.ref)
+			target.decMmapReady(series.ref)
 		}
-		// Clear to prevent a double-subtraction from the chunksRemoved gauge if
-		// resetSeriesWithMMappedChunks is queued on the same WAL-replay processor
-		// after this deletion (it would otherwise subtract len(mmappedChunks) again).
-		series.mmappedChunks = nil
-
+		if series.ooo != nil {
+			chunksRemoved += len(series.ooo.oooMmappedChunks)
+		}
 		deleted[storage.SeriesRef(series.ref)] = struct{}{}
-		deletedForCallback[series.ref] = series.lset
 		series.lset.Range(func(l labels.Label) { affected[l] = struct{}{} })
 	}
 
-	h.metrics.seriesRemoved.Add(float64(len(deleted)))
 	h.metrics.chunksRemoved.Add(float64(chunksRemoved))
 	h.metrics.chunks.Sub(float64(chunksRemoved))
-	h.numSeries.Sub(uint64(len(deleted)))
 	h.numStaleSeries.Sub(uint64(staleSeriesDeleted))
 	h.numNativeHistogramSeries.Sub(uint64(histogramSeriesDeleted))
 	h.numNativeHistogramBuckets.Sub(uint64(histogramBucketsDeleted))
 
-	// Remove deleted series IDs from the postings lists.
-	h.postings.Delete(deleted, affected)
+	// Series in the replay shadow map are not published in the index or to
+	// the lifecycle callback until they are merged.
+	if target == h.series {
+		h.metrics.seriesRemoved.Add(float64(publishedRemoved))
+		h.numSeries.Sub(uint64(publishedRemoved))
+		h.postings.Delete(deleted, affected)
+		if len(deletedForCallback) > 0 {
+			h.series.seriesLifecycleCallback.PostDeletion(deletedForCallback)
+		}
+	}
 
 	// Remove tombstones referring to the deleted series.
 	h.tombstones.DeleteTombstones(deleted)
-
-	if len(deletedForCallback) > 0 {
-		h.series.seriesLifecycleCallback.PostDeletion(deletedForCallback)
-	}
 }
 
 // gcSeries walks all series and removes those whose ref is in seriesRefs, whose maxTime is
@@ -2931,6 +3185,11 @@ type memSeries struct {
 	// occupy one 8-byte word before lastValue.
 	headChunkCount stdatomic.Uint32
 
+	concurrent       bool // Immutable: created during concurrent WAL replay.
+	uncached         bool // Newly written chunks require reconstruction from multiple WAL identities.
+	replayOnly       bool // A source generation not published in the label index.
+	needsMetadataWAL bool // Replayed metadata must be persisted under the surviving reference.
+
 	// We keep the last value here (in addition to appending it to the chunk) so we can check for duplicates.
 	lastValue float64
 
@@ -3160,7 +3419,10 @@ func (s *memSeries) cleanupAppendIDsBelow(bound uint64) {
 type memChunk struct {
 	chunk            chunkenc.Chunk
 	minTime, maxTime int64
-	prev             *memChunk // Link to the previous element on the list.
+	// A transferred chunk retains its original WAL series identity when it
+	// is mmapped. Zero means it still belongs to its containing memSeries.
+	walRef chunks.HeadSeriesRef
+	prev   *memChunk // Link to the previous element on the list.
 }
 
 // len returns the length of memChunk list, including the element it was called on.

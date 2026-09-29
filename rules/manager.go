@@ -314,7 +314,12 @@ func (m *Manager) Update(interval time.Duration, files []string, externalLabels 
 			// Wait with starting evaluation until the rule manager
 			// is told to run. This is necessary to avoid running
 			// queries against a bootstrapping storage.
-			<-m.block
+			select {
+			case <-m.block:
+			case <-newg.done:
+				close(newg.terminated)
+				return
+			}
 			newg.run(m.opts.Context)
 		}(newg)
 	}

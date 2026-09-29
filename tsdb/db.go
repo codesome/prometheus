@@ -291,6 +291,9 @@ type Options struct {
 	FsSizeFunc FsSizeFunc
 
 	// EnableFastStartup enables scraping in parallel with WAL replay but with queries still disabled.
+	// If the background replay fails, the DB keeps accepting appends but stays unreadable, and it
+	// never compacts, applies retention or truncates the WAL. Callers must check
+	// Head().WALReplayError after Head().WaitForWALReplay and close the DB on failure.
 	EnableFastStartup bool
 }
 
@@ -330,6 +333,7 @@ type DB struct {
 	compactc chan struct{}
 	donec    chan struct{}
 	stopc    chan struct{}
+	closeMtx sync.Mutex
 
 	// cmtx ensures that compactions and deletions don't run simultaneously.
 	cmtx sync.Mutex
@@ -1222,7 +1226,20 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 		}
 	}
 
-	if initErr := db.head.Init(minValidTime); initErr != nil {
+	var initErr error
+	if headOpts.EnableFastStartup {
+		initErr = db.head.InitFastStartup(minValidTime)
+	} else {
+		initErr = db.head.Init(minValidTime)
+	}
+
+	if initErr != nil {
+		if db.head.fastReplay {
+			// The background path did not complete its handoff. A partially
+			// replayed shadow map is not a usable Head, even if WAL repair
+			// could repair the underlying file.
+			return nil, fmt.Errorf("initialize fast startup: %w", initErr)
+		}
 		db.head.metrics.walCorruptionsTotal.Inc()
 		if e, ok := errors.AsType[*errLoadWbl](initErr); ok {
 			db.logger.Warn("Encountered WBL read error, attempting repair", "err", initErr)
@@ -1236,6 +1253,20 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 				return nil, fmt.Errorf("repair corrupted WAL: %w", err)
 			}
 			db.logger.Info("Successfully repaired WAL")
+		}
+		// Metadata in the recovered prefix may still belong to an alias whose
+		// samples will expire. Persist its surviving identity after repair,
+		// which removes records in the previously active WAL suffix.
+		var metadataSeries []*memSeries
+		for _, stripe := range db.head.series.series {
+			for _, s := range stripe {
+				if s.needsMetadataWAL {
+					metadataSeries = append(metadataSeries, s)
+				}
+			}
+		}
+		if err := db.head.logReplayMetadata(metadataSeries); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1281,6 +1312,26 @@ func (db *DB) BlockMetas() []BlockMeta {
 
 func (db *DB) run(ctx context.Context) {
 	defer close(db.donec)
+	// Retention and compaction wait for replay. Live chunks can still be
+	// mmapped under the usual series locks, bounding ingestion's heap usage
+	// during long replays without touching historical chunks or truncating WAL.
+	replayTicker := time.NewTicker(db.opts.BlockReloadInterval)
+replay:
+	for {
+		select {
+		case <-db.head.WaitForWALReplay():
+			replayTicker.Stop()
+			if db.head.WALReplayError() != nil {
+				return
+			}
+			break replay
+		case <-replayTicker.C:
+			db.head.mmapHeadChunks()
+		case <-db.stopc:
+			replayTicker.Stop()
+			return
+		}
+	}
 
 	backoff := time.Duration(0)
 
@@ -1377,6 +1428,9 @@ func (db *DB) AppenderV2(ctx context.Context) storage.AppenderV2 {
 //
 // 4) Before: OOO disabled, Now: OOO disabled => no-op.
 func (db *DB) ApplyConfig(conf *config.Config) error {
+	if conf.StorageConfig.TSDBConfig != nil && conf.StorageConfig.TSDBConfig.OutOfOrderTimeWindow > 0 && db.head.WALReplayError() != nil {
+		return errors.New("cannot enable out-of-order ingestion before WAL replay completes successfully")
+	}
 	oooTimeWindow := int64(0)
 	if conf.StorageConfig.TSDBConfig != nil {
 		// Validate encoding config before updating the head encoding so that
@@ -1439,7 +1493,9 @@ func (db *DB) ApplyConfig(conf *config.Config) error {
 	}
 
 	db.opts.OutOfOrderTimeWindow = oooTimeWindow
-	db.head.ApplyConfig(conf, wblog)
+	if err := db.head.ApplyConfig(conf, wblog); err != nil {
+		return err
+	}
 
 	if !db.oooWasEnabled.Load() {
 		db.oooWasEnabled.Store(oooTimeWindow > 0)
@@ -1532,6 +1588,9 @@ func (db *DB) waitingForCompactionDelay() bool {
 // Old blocks are only deleted on reloadBlocks based on the new block's parent information.
 // See DB.reloadBlocks documentation for further information.
 func (db *DB) Compact(ctx context.Context) (returnErr error) {
+	if err := db.head.WALReplayError(); err != nil {
+		return err
+	}
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 	defer func() {
@@ -1627,6 +1686,9 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 
 // CompactHead compacts the given RangeHead.
 func (db *DB) CompactHead(head *RangeHead) error {
+	if err := db.head.WALReplayError(); err != nil {
+		return err
+	}
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
@@ -1642,6 +1704,9 @@ func (db *DB) CompactHead(head *RangeHead) error {
 
 // CompactOOOHead compacts the OOO Head.
 func (db *DB) CompactOOOHead(ctx context.Context) error {
+	if err := db.head.WALReplayError(); err != nil {
+		return err
+	}
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
@@ -1860,6 +1925,9 @@ func (db *DB) compactHeadViewLocked(viewFactory headViewFactory, evict headSerie
 }
 
 func (db *DB) CompactStaleHead() (err error) {
+	if err := db.head.WALReplayError(); err != nil {
+		return err
+	}
 	db.cmtx.Lock()
 	defer func() {
 		db.cmtx.Unlock()
@@ -2492,9 +2560,11 @@ func (db *DB) Head() *Head {
 
 // Close the partition.
 func (db *DB) Close() error {
+	db.closeMtx.Lock()
+	defer db.closeMtx.Unlock()
 	// Allow close-after-close operation for simpler use (e.g. tests).
 	select {
-	case <-db.donec:
+	case <-db.stopc:
 		return nil
 	default:
 	}
@@ -2515,12 +2585,13 @@ func (db *DB) Close() error {
 		g.Go(pb.Close)
 	}
 
-	errs := []error{
-		g.Wait(),
-		db.locker.Release(),
-	}
+	errs := []error{g.Wait()}
 	if db.head != nil {
 		errs = append(errs, db.head.Close())
+	}
+	if db.locker != nil {
+		// Keep the directory locked until all Head/WAL writes have stopped.
+		errs = append(errs, db.locker.Release())
 	}
 	return errors.Join(errs...)
 }
@@ -2555,6 +2626,9 @@ func (db *DB) ForceHeadMMap() {
 // Snapshot writes the current data to the directory. If withHead is set to true it
 // will create a new block containing all data that's currently in the memory buffer/WAL.
 func (db *DB) Snapshot(dir string, withHead bool) error {
+	if err := db.head.WALReplayError(); err != nil {
+		return err
+	}
 	if dir == db.dir {
 		return errors.New("cannot snapshot into base directory")
 	}
@@ -2592,6 +2666,9 @@ func (db *DB) Snapshot(dir string, withHead bool) error {
 
 // Querier returns a new querier over the data partition for the given time range.
 func (db *DB) Querier(mint, maxt int64) (_ storage.Querier, err error) {
+	if err := db.head.WALReplayError(); err != nil {
+		return nil, err
+	}
 	var blocks []BlockReader
 
 	db.mtx.RLock()
@@ -2759,6 +2836,9 @@ func (db *DB) floatChunkEncoding() chunkenc.Encoding {
 
 // ChunkQuerier returns a new chunk querier over the data partition for the given time range.
 func (db *DB) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
+	if err := db.head.WALReplayError(); err != nil {
+		return nil, err
+	}
 	blockQueriers, err := db.blockChunkQuerierForRange(mint, maxt)
 	if err != nil {
 		return nil, err
@@ -2767,7 +2847,7 @@ func (db *DB) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
 }
 
 func (db *DB) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
-	return db.head.exemplars.ExemplarQuerier(ctx)
+	return db.head.ExemplarQuerier(ctx)
 }
 
 func rangeForTimestamp(t, width int64) (maxt int64) {
@@ -2776,6 +2856,9 @@ func rangeForTimestamp(t, width int64) (maxt int64) {
 
 // Delete implements deletion of metrics. It only has atomicity guarantees on a per-block basis.
 func (db *DB) Delete(ctx context.Context, mint, maxt int64, ms ...*labels.Matcher) error {
+	if err := db.head.WALReplayError(); err != nil {
+		return err
+	}
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
