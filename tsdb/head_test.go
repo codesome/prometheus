@@ -37,6 +37,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
@@ -46,6 +47,7 @@ import (
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
@@ -8026,6 +8028,61 @@ func TestHeadAppender_AppendSTZeroSample(t *testing.T) {
 		require.Zero(t, h.NumSeries(), "the rejected sample must not protect the collectable series")
 		require.Zero(t, prom_testutil.ToFloat64(h.metrics.pendingCommitUnderflow))
 	})
+}
+
+// TestHeadAppender_MetadataPendingCommit verifies that a queued metadata update
+// reserves its series until the appender commits or rolls back.
+func TestHeadAppender_MetadataPendingCommit(t *testing.T) {
+	lset := labels.FromStrings("__name__", "m")
+	meta := metadata.Metadata{Type: model.MetricTypeCounter, Unit: "seconds", Help: "Duration"}
+	for _, tc := range []struct {
+		name   string
+		update func(h *Head, ref storage.SeriesRef) (commit, rollback func() error)
+	}{
+		{name: "v1", update: func(h *Head, ref storage.SeriesRef) (func() error, func() error) {
+			app := h.Appender(t.Context())
+			_, err := app.UpdateMetadata(ref, lset, meta)
+			require.NoError(t, err)
+			return app.Commit, app.Rollback
+		}},
+		{name: "v2", update: func(h *Head, ref storage.SeriesRef) (func() error, func() error) {
+			app := h.AppenderV2(t.Context())
+			_, err := app.Append(ref, lset, 0, 200, 2, nil, nil, storage.AOptions{Metadata: meta})
+			require.NoError(t, err)
+			return app.Commit, app.Rollback
+		}},
+	} {
+		for _, commit := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/commit=%t", tc.name, commit), func(t *testing.T) {
+				opts := newTestHeadDefaultOptions(DefaultBlockDuration, false)
+				opts.EnableMetadataWALRecords = true
+				h, _ := newTestHeadWithOptions(t, compression.None, opts)
+				app := h.Appender(t.Context())
+				ref, err := app.Append(0, lset, 100, 1)
+				require.NoError(t, err)
+				require.NoError(t, app.Commit())
+				series := h.series.getByID(chunks.HeadSeriesRef(ref))
+				series.Lock()
+				series.needsMetadataWAL = true
+				series.Unlock()
+
+				commitFn, rollbackFn := tc.update(h, ref)
+				series.Lock()
+				require.NotZero(t, series.pendingCommitCount(), "a queued metadata update must reserve the series")
+				series.Unlock()
+				if commit {
+					require.NoError(t, commitFn())
+				} else {
+					require.NoError(t, rollbackFn())
+				}
+				series.Lock()
+				defer series.Unlock()
+				require.Zero(t, series.pendingCommitCount())
+				require.Zero(t, prom_testutil.ToFloat64(h.metrics.pendingCommitUnderflow))
+				require.Equal(t, !commit, series.needsMetadataWAL, "committed metadata supersedes replayed metadata")
+			})
+		}
+	}
 }
 
 // TestHeadAppender_PendingCommitUnderflowIsReportedNotFatal verifies that releasing

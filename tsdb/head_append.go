@@ -1088,6 +1088,9 @@ func (a *headAppender) UpdateMetadata(ref storage.SeriesRef, lset labels.Labels,
 
 	s.Lock()
 	hasNewMetadata := s.meta == nil || *s.meta != meta
+	if hasNewMetadata {
+		s.markPendingCommit()
+	}
 	s.Unlock()
 
 	if hasNewMetadata {
@@ -1750,12 +1753,15 @@ func (a *headAppenderBase) commitFloatHistograms(b *appendBatch, acc *appenderCo
 // It iterates over the metadata slice and updates the corresponding series
 // with the new metadata information. The series is locked during the update
 // to ensure thread safety.
-func commitMetadata(b *appendBatch) {
+func (a *headAppenderBase) commitMetadata(b *appendBatch) {
 	var series *memSeries
 	for i, m := range b.metadata {
 		series = b.metadataSeries[i]
 		series.Lock()
 		series.meta = &metadata.Metadata{Type: record.ToMetricType(m.Type), Unit: m.Unit, Help: m.Help}
+		// The record logged by this appender supersedes replayed metadata.
+		series.needsMetadataWAL = false
+		a.releasePendingCommit(series)
 		series.Unlock()
 	}
 }
@@ -1769,8 +1775,8 @@ func (a *headAppenderBase) releaseCreatedSeriesReservations() {
 }
 
 // releasePendingCommit releases one of the series' pending-sample reservations.
-// Reservations are taken once per queued sample and once per series created by
-// this appender. Decrementing without one would underflow into the packed flag
+// Reservations are taken once per queued sample or metadata update, and once per
+// series created by this appender. Decrementing without one would underflow into the packed flag
 // bits, so the accounting error is reported instead.
 //
 // Must be called with the series lock held.
@@ -1854,7 +1860,7 @@ func (a *headAppenderBase) Commit() (err error) {
 		a.commitFloats(b, acc)
 		a.commitHistograms(b, acc)
 		a.commitFloatHistograms(b, acc)
-		commitMetadata(b)
+		a.commitMetadata(b)
 	}
 	// Release the reservations that protected newly indexed series before their first sample was queued.
 	a.releaseCreatedSeriesReservations()
@@ -2365,6 +2371,11 @@ func (a *headAppenderBase) Rollback() (err error) {
 			series = b.floatHistogramSeries[i]
 			series.Lock()
 			series.cleanupAppendIDsBelow(a.cleanupAppendIDsBelow)
+			a.releasePendingCommit(series)
+			series.Unlock()
+		}
+		for _, series := range b.metadataSeries {
+			series.Lock()
 			a.releasePendingCommit(series)
 			series.Unlock()
 		}
